@@ -235,6 +235,7 @@ pub fn format_default_context(
         }
     }
 
+    // Separator between context groups (ripgrep uses -- for both intra-file and inter-file)
     Ok(parts.join("\n--\n"))
 }
 

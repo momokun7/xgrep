@@ -23,11 +23,17 @@ impl IndexReader {
 
         #[cfg(unix)]
         {
-            unsafe {
+            let ret = unsafe {
                 libc::madvise(
                     mmap.as_ptr() as *mut libc::c_void,
                     mmap.len(),
                     libc::MADV_WILLNEED,
+                )
+            };
+            if ret != 0 {
+                eprintln!(
+                    "xgrep: madvise warning: {}",
+                    std::io::Error::last_os_error()
                 );
             }
         }
