@@ -117,6 +117,7 @@ fn run() -> Result<()> {
             }
             let start = std::time::Instant::now();
             index::builder::build_index(&cwd, &idx)?;
+            index::updater::save_meta(&cwd, &idx)?;
             let elapsed = start.elapsed();
             let meta = std::fs::metadata(&idx)?;
             eprintln!(
@@ -162,17 +163,14 @@ fn run() -> Result<()> {
                     search::search_files(&cwd, &files, &pattern, cli.case_insensitive)?
                 }
             } else {
-                // インデックス検索
+                // インデックス検索（自動更新付き）
                 let local_idx = PathBuf::from(".xgrep/index");
                 let idx = if local_idx.exists() {
+                    index::updater::ensure_fresh_index(&cwd, &local_idx)?;
                     local_idx
                 } else {
                     let cache_idx = index_path(false)?;
-                    if !cache_idx.exists() {
-                        eprintln!("[indexing...]");
-                        index::builder::build_index(&cwd, &cache_idx)?;
-                        eprintln!("[done]");
-                    }
+                    index::updater::ensure_fresh_index(&cwd, &cache_idx)?;
                     cache_idx
                 };
                 let reader = index::reader::IndexReader::open(&idx)?;
