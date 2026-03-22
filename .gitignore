@@ -1,3 +1,8 @@
+# AI指示書・設定
+CLAUDE.md
+.claude/
+
+# データセット・ベンチマーク
 bench/linux-src/
 rust/target/
 zig/zig-out/
