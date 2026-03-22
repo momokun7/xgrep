@@ -116,7 +116,8 @@ fn run() -> Result<()> {
                 std::fs::create_dir_all(".xgrep")?;
             }
             let start = std::time::Instant::now();
-            index::builder::build_index(&cwd, &idx)?;
+            let cache = index::builder::cache_path_for(&idx);
+            index::builder::build_index_with_cache(&cwd, &idx, Some(&cache))?;
             index::updater::save_meta(&cwd, &idx)?;
             let elapsed = start.elapsed();
             let meta = std::fs::metadata(&idx)?;
