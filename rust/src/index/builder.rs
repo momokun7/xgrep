@@ -31,7 +31,7 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
         file_paths.push(entry.path().to_path_buf());
     }
 
-    // Phase 2: ファイル読み込み & trigram抽出 (rayon並列)
+    // Phase 2: チャンク処理でファイル読み込み & trigram抽出 (メモリ削減)
     struct FileData {
         relative_path: String,
         mtime: u64,
@@ -40,48 +40,54 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
         trigrams: Vec<[u8; 3]>,
     }
 
-    let file_data: Vec<FileData> = file_paths
-        .par_iter()
-        .filter_map(|path| {
-            let content = fs::read(path).ok()?;
-
-            // バイナリファイルスキップ (NULバイト検出)
-            if memchr::memchr(0, &content).is_some() {
-                return None;
-            }
-
-            let relative = path.strip_prefix(root).ok()?.to_string_lossy().to_string();
-            let meta = fs::metadata(path).ok()?;
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let size = meta.len();
-            let hash = xxhash_rust::xxh64::xxh64(&content, 0);
-            let trigrams = trigram::extract_trigrams(&content);
-
-            Some(FileData {
-                relative_path: relative,
-                mtime,
-                size,
-                content_hash: hash,
-                trigrams,
-            })
-        })
-        .collect();
-
-    // Phase 3: trigram -> file_id マッピング構築 (逐次)
-    let mut files: Vec<(String, u64, u64, u64)> = Vec::with_capacity(file_data.len());
+    let mut files: Vec<(String, u64, u64, u64)> = Vec::new();
     let mut trigram_to_files: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
 
-    for fd in file_data {
-        let file_id = files.len() as u32;
-        files.push((fd.relative_path, fd.mtime, fd.size, fd.content_hash));
-        for t in fd.trigrams {
-            trigram_to_files.entry(t).or_default().push(file_id);
+    const CHUNK_SIZE: usize = 1000;
+
+    for chunk in file_paths.chunks(CHUNK_SIZE) {
+        // チャンク内を rayon で並列処理
+        let chunk_data: Vec<FileData> = chunk
+            .par_iter()
+            .filter_map(|path| {
+                let content = fs::read(path).ok()?;
+
+                // バイナリファイルスキップ (NULバイト検出)
+                if memchr::memchr(0, &content).is_some() {
+                    return None;
+                }
+
+                let relative = path.strip_prefix(root).ok()?.to_string_lossy().to_string();
+                let meta = fs::metadata(path).ok()?;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let size = meta.len();
+                let hash = xxhash_rust::xxh64::xxh64(&content, 0);
+                let trigrams = trigram::extract_trigrams(&content);
+
+                Some(FileData {
+                    relative_path: relative,
+                    mtime,
+                    size,
+                    content_hash: hash,
+                    trigrams,
+                })
+            })
+            .collect();
+
+        // チャンク結果を共有ステートにマージ (逐次)
+        for fd in chunk_data {
+            let file_id = files.len() as u32;
+            files.push((fd.relative_path, fd.mtime, fd.size, fd.content_hash));
+            for t in fd.trigrams {
+                trigram_to_files.entry(t).or_default().push(file_id);
+            }
         }
+        // chunk_data はここで drop され、trigram Vec とファイル内容が解放される
     }
 
     // posting list のメモリを最小化
@@ -107,9 +113,7 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
         trigram_count: sorted_trigrams.len() as u32,
         file_count: files.len() as u32,
     };
-    writer.write_all(unsafe {
-        std::slice::from_raw_parts(&header as *const Header as *const u8, Header::SIZE)
-    })?;
+    writer.write_all(&header.to_bytes())?;
 
     // Trigram Table のプレースホルダー（後で seek して上書き）
     let trigram_table_size = sorted_trigrams.len() * TrigramEntry::SIZE;
