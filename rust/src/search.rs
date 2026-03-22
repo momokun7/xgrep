@@ -28,9 +28,38 @@ pub fn search(
     let trigrams = trigram::extract_trigrams(pattern_bytes);
 
     let candidate_ids: Vec<u32> = if case_insensitive {
-        // case-insensitive: trigramインデックスは大文字小文字を区別して構築されているため
-        // 正確なフィルタリングができない。全ファイルスキャンにフォールバック
-        (0..reader.file_count()).collect()
+        if trigrams.is_empty() {
+            // パターンが3文字未満: 全ファイルスキャン（不可避）
+            (0..reader.file_count()).collect()
+        } else {
+            // Zoekt方式: 各trigramのケースバリアントを列挙してunion → trigram間でintersect
+            let mut trigram_candidates: Vec<Vec<u32>> = Vec::new();
+            let mut any_empty = false;
+
+            for t in &trigrams {
+                let variants = case_variants(*t);
+                let mut union_set = std::collections::BTreeSet::new();
+                for v in &variants {
+                    for fid in reader.lookup_trigram(*v) {
+                        union_set.insert(fid);
+                    }
+                }
+                if union_set.is_empty() {
+                    any_empty = true;
+                    break;
+                }
+                trigram_candidates.push(union_set.into_iter().collect());
+            }
+
+            if any_empty {
+                // バリアント全てが空のtrigramがある場合は全スキャンにフォールバック
+                (0..reader.file_count()).collect()
+            } else {
+                let refs: Vec<&[u32]> =
+                    trigram_candidates.iter().map(|v| v.as_slice()).collect();
+                intersect_postings(&refs)
+            }
+        }
     } else if trigrams.is_empty() {
         if pattern_bytes.len() == 2 {
             // 2文字パターン: プレフィックスに一致する全trigramのunionで候補を絞る
@@ -334,6 +363,38 @@ pub fn search_files_regex(
 
     results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
     Ok(results)
+}
+
+/// trigramの各バイトについてASCII文字であれば大文字/小文字の両バリアントを生成する。
+/// 最大8バリアント（3バイト全てがASCII文字の場合）。
+fn case_variants(trigram: [u8; 3]) -> Vec<[u8; 3]> {
+    let cases: [Vec<u8>; 3] = [
+        if trigram[0].is_ascii_alphabetic() {
+            vec![trigram[0].to_ascii_lowercase(), trigram[0].to_ascii_uppercase()]
+        } else {
+            vec![trigram[0]]
+        },
+        if trigram[1].is_ascii_alphabetic() {
+            vec![trigram[1].to_ascii_lowercase(), trigram[1].to_ascii_uppercase()]
+        } else {
+            vec![trigram[1]]
+        },
+        if trigram[2].is_ascii_alphabetic() {
+            vec![trigram[2].to_ascii_lowercase(), trigram[2].to_ascii_uppercase()]
+        } else {
+            vec![trigram[2]]
+        },
+    ];
+
+    let mut variants = Vec::with_capacity(cases[0].len() * cases[1].len() * cases[2].len());
+    for &b0 in &cases[0] {
+        for &b1 in &cases[1] {
+            for &b2 in &cases[2] {
+                variants.push([b0, b1, b2]);
+            }
+        }
+    }
+    variants
 }
 
 pub fn intersect_postings(lists: &[&[u32]]) -> Vec<u32> {
@@ -774,5 +835,58 @@ mod tests {
         let files = vec![PathBuf::from("a.rs")];
         let result = search_files_regex(root, &files, "[invalid", false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_case_variants() {
+        let variants = case_variants(*b"hel");
+        assert_eq!(variants.len(), 8);
+        assert!(variants.contains(b"hel"));
+        assert!(variants.contains(b"HEL"));
+        assert!(variants.contains(b"Hel"));
+        assert!(variants.contains(b"hEL"));
+    }
+
+    #[test]
+    fn test_case_variants_non_letter() {
+        // 数字や記号はバリアントを生成しない
+        let variants = case_variants(*b"h1!");
+        assert_eq!(variants.len(), 2); // h/H のみ
+        assert!(variants.contains(b"h1!"));
+        assert!(variants.contains(b"H1!"));
+    }
+
+    #[test]
+    fn test_case_variants_all_non_letter() {
+        let variants = case_variants(*b"123");
+        assert_eq!(variants.len(), 1);
+        assert!(variants.contains(b"123"));
+    }
+
+    #[test]
+    fn test_search_case_insensitive_uses_index() {
+        // case-insensitive検索がインデックスを使って候補を絞れることを確認
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // 多数のファイルを作成し、パターンを含むのは1つだけ
+        for i in 0..20 {
+            fs::write(
+                root.join(format!("file{}.rs", i)),
+                format!("content number {}", i),
+            )
+            .unwrap();
+        }
+        fs::write(
+            root.join("target.rs"),
+            "fn HandleAuth() {}\nfn other() {}",
+        )
+        .unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        let results = search(&reader, root, "handleauth", true).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].line.contains("HandleAuth"));
     }
 }
