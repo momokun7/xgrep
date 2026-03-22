@@ -19,3 +19,8 @@ rayon = "1"
 libc = "0.2"
 regex = "1"
 tempfile = "3"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -3,6 +3,9 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::env;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use xgrep::index;
 use xgrep::search;
 use xgrep::output;
