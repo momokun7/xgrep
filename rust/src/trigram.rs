@@ -49,4 +49,46 @@ mod tests {
         let t = *b"abc";
         assert_eq!(decode(encode(t)), t);
     }
+
+    #[test]
+    fn test_extract_empty() {
+        assert!(extract_trigrams(b"").is_empty());
+    }
+
+    #[test]
+    fn test_extract_single_byte() {
+        assert!(extract_trigrams(b"a").is_empty());
+    }
+
+    #[test]
+    fn test_extract_exactly_3_bytes() {
+        let result = extract_trigrams(b"abc");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], *b"abc");
+    }
+
+    #[test]
+    fn test_extract_trigrams_sorted() {
+        let result = extract_trigrams(b"zab");
+        // Should be sorted: "abz" would not exist, "zab" is the only trigram
+        assert_eq!(result, vec![*b"zab"]);
+    }
+
+    #[test]
+    fn test_extract_utf8_bytes() {
+        // UTF-8 multibyte: trigrams are byte-level
+        let data = "あいう".as_bytes(); // 9 bytes (3 chars * 3 bytes each)
+        let result = extract_trigrams(data);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_encode_zero() {
+        assert_eq!(encode([0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn test_encode_max() {
+        assert_eq!(encode([0xFF, 0xFF, 0xFF]), 0x00FFFFFF);
+    }
 }
