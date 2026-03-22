@@ -170,4 +170,42 @@ mod tests {
         }
         assert!(is_git_repo(dir));
     }
+
+    #[test]
+    fn test_parse_duration_zero() {
+        let result = parse_duration("0h").unwrap();
+        assert_eq!(result, Some("0 hours ago".to_string()));
+    }
+
+    #[test]
+    fn test_parse_duration_large_number() {
+        let result = parse_duration("999d").unwrap();
+        assert_eq!(result, Some("999 days ago".to_string()));
+    }
+
+    #[test]
+    fn test_parse_duration_empty() {
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_no_number() {
+        assert!(parse_duration("h").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_commits() {
+        assert!(parse_duration("abc.commits").is_err());
+    }
+
+    #[test]
+    fn test_is_git_repo_nonexistent_dir() {
+        assert!(!is_git_repo(std::path::Path::new("/nonexistent/path")));
+    }
+
+    #[test]
+    fn test_is_git_repo_non_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_git_repo(dir.path()));
+    }
 }

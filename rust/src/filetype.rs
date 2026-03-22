@@ -35,4 +35,24 @@ mod tests {
         assert_eq!(extensions_for_type("py"), Some(vec!["py", "pyi"]));
         assert_eq!(extensions_for_type("unknown"), None);
     }
+
+    #[test]
+    fn test_extensions_all_types() {
+        // Verify all documented types return Some
+        let types = ["rust", "rs", "python", "py", "javascript", "js",
+                     "typescript", "ts", "go", "ruby", "rb", "java",
+                     "c", "cpp", "cc", "shell", "sh", "json",
+                     "yaml", "yml", "markdown", "md", "html", "css",
+                     "sql", "toml", "xml"];
+        for t in types {
+            assert!(extensions_for_type(t).is_some(), "type '{}' should be supported", t);
+        }
+    }
+
+    #[test]
+    fn test_extensions_none_for_unknown() {
+        assert_eq!(extensions_for_type("fortran"), None);
+        assert_eq!(extensions_for_type(""), None);
+        assert_eq!(extensions_for_type("RUST"), None); // case sensitive
+    }
 }

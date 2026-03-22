@@ -127,4 +127,48 @@ mod tests {
         encode_varint(&mut buf, 16384);
         assert_eq!(buf.len(), 3);
     }
+
+    #[test]
+    fn test_varint_zero() {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 0);
+        assert_eq!(buf, vec![0]);
+        let (val, bytes) = decode_varint(&buf);
+        assert_eq!(val, 0);
+        assert_eq!(bytes, 1);
+    }
+
+    #[test]
+    fn test_varint_max_u32() {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, u32::MAX);
+        let (val, bytes) = decode_varint(&buf);
+        assert_eq!(val, u32::MAX);
+        assert_eq!(bytes, buf.len());
+    }
+
+    #[test]
+    fn test_varint_boundary_127() {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 127);
+        assert_eq!(buf.len(), 1); // fits in 1 byte
+        let (val, _) = decode_varint(&buf);
+        assert_eq!(val, 127);
+    }
+
+    #[test]
+    fn test_varint_boundary_128() {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 128);
+        assert_eq!(buf.len(), 2); // needs 2 bytes
+        let (val, _) = decode_varint(&buf);
+        assert_eq!(val, 128);
+    }
+
+    #[test]
+    fn test_decode_varint_empty() {
+        let (val, bytes) = decode_varint(&[]);
+        assert_eq!(val, 0);
+        assert_eq!(bytes, 0);
+    }
 }

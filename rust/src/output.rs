@@ -274,4 +274,56 @@ mod tests {
         assert!(output.contains("test.rs:3:match_line")); // match line uses :
         assert!(output.contains("test.rs-4-line4")); // context line uses -
     }
+
+    #[test]
+    fn test_format_default_empty() {
+        let output = format_default(&[]);
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_format_llm_empty() {
+        let dir = tempdir().unwrap();
+        let output = format_llm(&[], dir.path(), 3).unwrap();
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_format_llm_no_extension() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Makefile"), "all:\n\techo hello\n\techo done").unwrap();
+        let results = vec![SearchResult {
+            file: "Makefile".to_string(),
+            line_number: 2,
+            line: "\techo hello".to_string(),
+        }];
+        let output = format_llm(&results, root, 1).unwrap();
+        // No extension = empty language
+        assert!(output.contains("```\n")); // no language after ```
+        assert!(output.contains("echo hello"));
+    }
+
+    #[test]
+    fn test_format_llm_context_zero() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("test.rs"), "line1\nline2\nline3\nline4\nline5").unwrap();
+        let results = vec![SearchResult {
+            file: "test.rs".to_string(),
+            line_number: 3,
+            line: "line3".to_string(),
+        }];
+        let output = format_llm(&results, root, 0).unwrap();
+        assert!(output.contains("line3"));
+        assert!(!output.contains("line2")); // no context
+        assert!(!output.contains("line4"));
+    }
+
+    #[test]
+    fn test_format_default_context_empty() {
+        let dir = tempdir().unwrap();
+        let output = format_default_context(&[], dir.path(), 3).unwrap();
+        assert_eq!(output, "");
+    }
 }
