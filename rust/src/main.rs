@@ -164,21 +164,83 @@ fn run() -> Result<()> {
                     search::search_files(&cwd, &files, &pattern, cli.case_insensitive)?
                 }
             } else {
-                // インデックス検索（自動更新付き）
+                // インデックス検索（ハイブリッド: インデックス+変更ファイル直接スキャン）
                 let local_idx = PathBuf::from(".xgrep/index");
                 let idx = if local_idx.exists() {
-                    index::updater::ensure_fresh_index(&cwd, &local_idx)?;
                     local_idx
                 } else {
-                    let cache_idx = index_path(false)?;
-                    index::updater::ensure_fresh_index(&cwd, &cache_idx)?;
-                    cache_idx
+                    index_path(false)?
                 };
-                let reader = index::reader::IndexReader::open(&idx)?;
-                if cli.regex {
-                    search::search_regex(&reader, &cwd, &pattern, cli.case_insensitive)?
-                } else {
-                    search::search(&reader, &cwd, &pattern, cli.case_insensitive)?
+
+                let status = index::updater::check_index_status(&cwd, &idx)?;
+
+                match status {
+                    index::updater::IndexStatus::Fresh => {
+                        let reader = index::reader::IndexReader::open(&idx)?;
+                        if cli.regex {
+                            search::search_regex(&reader, &cwd, &pattern, cli.case_insensitive)?
+                        } else {
+                            search::search(&reader, &cwd, &pattern, cli.case_insensitive)?
+                        }
+                    }
+                    index::updater::IndexStatus::Stale { changed_files } => {
+                        let reader = index::reader::IndexReader::open(&idx)?;
+
+                        // インデックスから検索（変更ファイルの結果は古い可能性あり）
+                        let mut index_results = if cli.regex {
+                            search::search_regex(&reader, &cwd, &pattern, cli.case_insensitive)?
+                        } else {
+                            search::search(&reader, &cwd, &pattern, cli.case_insensitive)?
+                        };
+
+                        // 変更ファイルの結果を除外（古いデータの可能性があるため）
+                        let changed_set: std::collections::HashSet<String> = changed_files
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect();
+                        index_results.retain(|r| !changed_set.contains(&r.file));
+
+                        // 変更ファイルを直接スキャン
+                        let direct_results = if cli.regex {
+                            search::search_files_regex(
+                                &cwd,
+                                &changed_files,
+                                &pattern,
+                                cli.case_insensitive,
+                            )?
+                        } else {
+                            search::search_files(
+                                &cwd,
+                                &changed_files,
+                                &pattern,
+                                cli.case_insensitive,
+                            )?
+                        };
+
+                        // マージしてソート
+                        index_results.extend(direct_results);
+                        index_results.sort_by(|a, b| {
+                            a.file
+                                .cmp(&b.file)
+                                .then(a.line_number.cmp(&b.line_number))
+                        });
+                        index_results
+                    }
+                    index::updater::IndexStatus::NeedsFullBuild => {
+                        // インデックスなし、フルビルド
+                        eprintln!("[indexing...]");
+                        let cache = index::builder::cache_path_for(&idx);
+                        index::builder::build_index_with_cache(&cwd, &idx, Some(&cache))?;
+                        index::updater::save_meta(&cwd, &idx)?;
+                        eprintln!("[done]");
+
+                        let reader = index::reader::IndexReader::open(&idx)?;
+                        if cli.regex {
+                            search::search_regex(&reader, &cwd, &pattern, cli.case_insensitive)?
+                        } else {
+                            search::search(&reader, &cwd, &pattern, cli.case_insensitive)?
+                        }
+                    }
                 }
             };
 
