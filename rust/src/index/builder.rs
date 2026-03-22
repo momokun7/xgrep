@@ -153,6 +153,11 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
                 if memchr::memchr(0, &content).is_some() {
                     return None;
                 }
+                // Pass 1との整合性を検証: ファイルが変更されていたらスキップ
+                let hash = xxhash_rust::xxh64::xxh64(&content, 0);
+                if hash != files[file_id].content_hash {
+                    return None;
+                }
                 let trigrams = trigram::extract_trigrams(&content);
                 Some((file_id as u32, trigrams))
             })

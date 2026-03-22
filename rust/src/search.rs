@@ -745,6 +745,28 @@ mod tests {
     }
 
     #[test]
+    fn test_search_case_insensitive_mixed_case_content() {
+        // 異なるケースの同一内容が複数ファイルにあるとき、-iで全てヒットすること
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("upper.txt"), "HELLO WORLD").unwrap();
+        fs::write(root.join("lower.txt"), "hello world").unwrap();
+        fs::write(root.join("mixed.txt"), "HeLLo WoRLd").unwrap();
+        fs::write(root.join("none.txt"), "goodbye earth").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let results = search(&reader, root, "hello world", true).unwrap();
+        // upper.txt, lower.txt, mixed.txt の3ファイルがヒット
+        assert_eq!(results.len(), 3);
+        let mut files: Vec<&str> = results.iter().map(|r| r.file.as_str()).collect();
+        files.sort();
+        assert!(files.iter().any(|f| f.contains("upper.txt")));
+        assert!(files.iter().any(|f| f.contains("lower.txt")));
+        assert!(files.iter().any(|f| f.contains("mixed.txt")));
+    }
+
+    #[test]
     fn test_search_files_regex_invalid() {
         let dir = tempdir().unwrap();
         let root = dir.path();

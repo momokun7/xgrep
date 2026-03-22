@@ -1,10 +1,10 @@
 use std::fs::File;
 use std::path::Path;
 
-use anyhow::{Result, bail};
-use memmap2::Mmap;
+use anyhow::{bail, Result};
 #[cfg(unix)]
 use libc;
+use memmap2::Mmap;
 
 use crate::index::format::*;
 
@@ -45,7 +45,16 @@ impl IndexReader {
         }
 
         let trigram_table_start = Header::SIZE;
-        let posting_lists_start = trigram_table_start + (header.trigram_count as usize) * TrigramEntry::SIZE;
+        let posting_lists_start =
+            trigram_table_start + (header.trigram_count as usize) * TrigramEntry::SIZE;
+
+        // trigram tableの終端がmmap範囲内か検証
+        if posting_lists_start > mmap.len() {
+            bail!(
+                "Index file is truncated or corrupt (trigram table exceeds file size: need {} bytes, got {})",
+                posting_lists_start, mmap.len()
+            );
+        }
 
         // Calculate total posting list bytes from trigram entries
         let mut posting_lists_total_bytes = 0usize;
@@ -63,7 +72,21 @@ impl IndexReader {
         let file_table_start = posting_lists_start + posting_lists_total_bytes;
         let string_pool_start = file_table_start + (header.file_count as usize) * FileEntry::SIZE;
 
-        Ok(Self { mmap, cached_header: header, posting_lists_start, file_table_start, string_pool_start })
+        // 全体のオフセットがmmap範囲内か検証
+        if string_pool_start > mmap.len() {
+            bail!(
+                "Index file is truncated or corrupt (expected at least {} bytes, got {})",
+                string_pool_start, mmap.len()
+            );
+        }
+
+        Ok(Self {
+            mmap,
+            cached_header: header,
+            posting_lists_start,
+            file_table_start,
+            string_pool_start,
+        })
     }
 
     pub fn header(&self) -> Header {
@@ -76,7 +99,9 @@ impl IndexReader {
 
     pub fn lookup_trigram(&self, target: [u8; 3]) -> Vec<u32> {
         let count = self.cached_header.trigram_count as usize;
-        if count == 0 { return vec![]; }
+        if count == 0 {
+            return vec![];
+        }
 
         let trigram_table_start = Header::SIZE;
         let mut lo = 0usize;
@@ -85,6 +110,9 @@ impl IndexReader {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let offset = trigram_table_start + mid * TrigramEntry::SIZE;
+            if offset + TrigramEntry::SIZE > self.mmap.len() {
+                return vec![];
+            }
             let entry: TrigramEntry = unsafe {
                 std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const TrigramEntry)
             };
@@ -94,8 +122,11 @@ impl IndexReader {
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
                     let pl_start = self.posting_lists_start + entry.posting_offset as usize;
-                    let pl_byte_len = entry.posting_len as usize;
-                    let data = &self.mmap[pl_start..pl_start + pl_byte_len];
+                    let pl_end = pl_start + entry.posting_len as usize;
+                    if pl_end > self.mmap.len() {
+                        return vec![];
+                    }
+                    let data = &self.mmap[pl_start..pl_end];
                     return Self::decode_posting_list(data);
                 }
             }
@@ -104,16 +135,27 @@ impl IndexReader {
     }
 
     fn decode_posting_list(data: &[u8]) -> Vec<u32> {
-        let mut pos = 0;
-        let (count, bytes_read) = decode_varint(&data[pos..]);
-        pos += bytes_read;
-
-        let mut result = Vec::with_capacity(count as usize);
+        if data.is_empty() {
+            return vec![];
+        }
+        let (count, mut pos) = decode_varint(data);
+        let count = count as usize;
+        // Sanity check: countがデータ長を超える場合は破損データ
+        if count > data.len() {
+            return vec![];
+        }
+        let mut result = Vec::with_capacity(count.min(1024));
         let mut prev: u32 = 0;
         for _ in 0..count {
+            if pos >= data.len() {
+                break; // データが途中で切れている
+            }
             let (delta, bytes_read) = decode_varint(&data[pos..]);
+            if bytes_read == 0 {
+                break; // 進めない場合は無限ループ防止
+            }
             pos += bytes_read;
-            prev += delta;
+            prev = prev.saturating_add(delta);
             result.push(prev);
         }
         result
@@ -123,7 +165,9 @@ impl IndexReader {
     /// trigram tableはソート済みなのでbinary searchで範囲を特定する。
     pub fn lookup_trigram_prefix(&self, prefix: [u8; 2]) -> Vec<u32> {
         let count = self.cached_header.trigram_count as usize;
-        if count == 0 { return vec![]; }
+        if count == 0 {
+            return vec![];
+        }
 
         let trigram_table_start = Header::SIZE;
 
@@ -167,7 +211,9 @@ impl IndexReader {
             lo
         };
 
-        if lo_idx >= hi_idx { return vec![]; }
+        if lo_idx >= hi_idx {
+            return vec![];
+        }
 
         let mut seen = std::collections::BTreeSet::new();
         for i in lo_idx..hi_idx {
@@ -176,7 +222,9 @@ impl IndexReader {
                 std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const TrigramEntry)
             };
             // sanity check: prefixが一致するエントリのみ処理
-            if entry.trigram[0] != prefix[0] || entry.trigram[1] != prefix[1] { continue; }
+            if entry.trigram[0] != prefix[0] || entry.trigram[1] != prefix[1] {
+                continue;
+            }
             let pl_start = self.posting_lists_start + entry.posting_offset as usize;
             let pl_byte_len = entry.posting_len as usize;
             let data = &self.mmap[pl_start..pl_start + pl_byte_len];
@@ -188,11 +236,19 @@ impl IndexReader {
     }
 
     pub fn file_path(&self, file_id: u32) -> &str {
+        if file_id >= self.cached_header.file_count {
+            return "<invalid file_id>";
+        }
         let offset = self.file_table_start + file_id as usize * FileEntry::SIZE;
-        let entry: FileEntry = unsafe {
-            std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const FileEntry)
-        };
+        if offset + FileEntry::SIZE > self.mmap.len() {
+            return "<invalid file_id>";
+        }
+        let entry: FileEntry =
+            unsafe { std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const FileEntry) };
         let str_start = self.string_pool_start + entry.path_offset as usize;
+        if str_start >= self.mmap.len() {
+            return "<invalid>";
+        }
         let remaining = &self.mmap[str_start..];
         let len = memchr::memchr(0, remaining).unwrap_or(remaining.len());
         std::str::from_utf8(&remaining[..len]).unwrap_or("<invalid>")
@@ -293,5 +349,46 @@ mod tests {
         let paths: Vec<&str> = vec![p0, p1];
         assert!(paths.iter().any(|p| p.ends_with(".txt")));
         assert!(paths.iter().any(|p| p.ends_with(".rs")));
+    }
+
+    #[test]
+    fn test_open_truncated_index() {
+        // headerは正常だがtrigram_countが巨大で実データが不足しているケース
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("truncated.xgrep");
+        let mut data = vec![0u8; 20]; // Header(16) + 4バイトだけ
+        data[0..4].copy_from_slice(b"XGRP");
+        data[4..8].copy_from_slice(&1u32.to_ne_bytes()); // version = 1
+        data[8..12].copy_from_slice(&9999u32.to_ne_bytes()); // trigram_count = 9999 (巨大)
+        data[12..16].copy_from_slice(&0u32.to_ne_bytes()); // file_count = 0
+        fs::write(&path, &data).unwrap();
+        let result = IndexReader::open(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_file_path_invalid_id() {
+        let (_dir, index_path) = build_test_index();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // file_count以上のIDを渡した場合
+        let path = reader.file_path(9999);
+        assert_eq!(path, "<invalid file_id>");
+    }
+
+    #[test]
+    fn test_decode_posting_list_empty() {
+        let result = IndexReader::decode_posting_list(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_decode_posting_list_malformed() {
+        // countが100だがデータが2バイトしかない
+        let mut data = Vec::new();
+        crate::index::format::encode_varint(&mut data, 100);
+        // delta用のデータは無い
+        let result = IndexReader::decode_posting_list(&data);
+        // 無限ループせず、空 or 部分結果を返すこと
+        assert!(result.len() < 100);
     }
 }
