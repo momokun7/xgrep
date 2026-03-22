@@ -39,13 +39,41 @@ mod tests {
     #[test]
     fn test_extensions_all_types() {
         // Verify all documented types return Some
-        let types = ["rust", "rs", "python", "py", "javascript", "js",
-                     "typescript", "ts", "go", "ruby", "rb", "java",
-                     "c", "cpp", "cc", "shell", "sh", "json",
-                     "yaml", "yml", "markdown", "md", "html", "css",
-                     "sql", "toml", "xml"];
+        let types = [
+            "rust",
+            "rs",
+            "python",
+            "py",
+            "javascript",
+            "js",
+            "typescript",
+            "ts",
+            "go",
+            "ruby",
+            "rb",
+            "java",
+            "c",
+            "cpp",
+            "cc",
+            "shell",
+            "sh",
+            "json",
+            "yaml",
+            "yml",
+            "markdown",
+            "md",
+            "html",
+            "css",
+            "sql",
+            "toml",
+            "xml",
+        ];
         for t in types {
-            assert!(extensions_for_type(t).is_some(), "type '{}' should be supported", t);
+            assert!(
+                extensions_for_type(t).is_some(),
+                "type '{}' should be supported",
+                t
+            );
         }
     }
 

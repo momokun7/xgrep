@@ -4,7 +4,7 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 
@@ -117,6 +117,17 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
     // ============================================================
     // テンポラリファイル作成 (posting data用)
     // ============================================================
+    if files.len() > u32::MAX as usize {
+        bail!("too many files: {} (maximum {})", files.len(), u32::MAX);
+    }
+    if sorted_trigrams.len() > u32::MAX as usize {
+        bail!(
+            "too many unique trigrams: {} (maximum {})",
+            sorted_trigrams.len(),
+            u32::MAX
+        );
+    }
+
     if total_pairs == 0 {
         // trigramが1つもない場合はmmapなしで直接書き出し
         return write_index_no_postings(index_path, &sorted_trigrams, &files);
@@ -138,6 +149,9 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
     // ============================================================
     // Pass 2: ファイル再読み込み、file_idをmmapに配置
     // ============================================================
+    // SAFETY: temp_mmap_ptr is derived from temp_mmap which lives for the duration of this scope.
+    // All writes are sequential within each chunk (no parallel writes to the same slot).
+    // AtomicU32 ensures each slot is written exactly once across chunks.
     let temp_mmap_ptr = temp_mmap.as_mut_ptr();
     let temp_mmap_len = temp_mmap.len();
 
