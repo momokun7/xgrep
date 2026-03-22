@@ -5,7 +5,7 @@ pub const VERSION: u32 = 1;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
-    pub magic: [u8; 4],    // 4
+    pub magic: [u8; 4],     // 4
     pub version: u32,       // 4
     pub trigram_count: u32, // 4
     pub file_count: u32,    // 4
@@ -92,6 +92,10 @@ pub fn decode_varint(data: &[u8]) -> (u32, usize) {
     let mut result: u32 = 0;
     let mut shift: u32 = 0;
     for (i, &byte) in data.iter().enumerate() {
+        if shift >= 35 {
+            // Overflow: u32は最大5バイト (5*7=35bit)。これ以上はmalformed
+            return (result, i + 1);
+        }
         result |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
             return (result, i + 1);
@@ -197,5 +201,23 @@ mod tests {
         let (val, bytes) = decode_varint(&[]);
         assert_eq!(val, 0);
         assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn test_decode_varint_overflow_all_continuation_bits() {
+        // 全バイトにcontinuation bitが設定されている不正データ
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let (_, bytes_read) = decode_varint(&data);
+        // 5バイト目(shift=35)でoverflow検出して6バイト目を返す
+        assert!(bytes_read > 0);
+        assert!(bytes_read <= 6);
+    }
+
+    #[test]
+    fn test_decode_varint_exactly_5_continuation_bytes() {
+        // 5バイト全てcontinuation bit付き: shift=35でoverflow
+        let data = [0x80, 0x80, 0x80, 0x80, 0x80];
+        let (_, bytes_read) = decode_varint(&data);
+        assert!(bytes_read > 0);
     }
 }
