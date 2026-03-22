@@ -272,6 +272,88 @@ mod tests {
     }
 
     #[test]
+    fn test_build_empty_directory() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // No files at all
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+        let data = fs::read(&index_path).unwrap();
+        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        assert_eq!(header.file_count, 0);
+        assert_eq!(header.trigram_count, 0);
+    }
+
+    #[test]
+    fn test_build_skips_binary_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // Binary file (contains NUL byte)
+        fs::write(root.join("binary.bin"), b"hello\x00world").unwrap();
+        fs::write(root.join("text.txt"), "hello world").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+        let data = fs::read(&index_path).unwrap();
+        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        assert_eq!(header.file_count, 1); // only text.txt
+    }
+
+    #[test]
+    fn test_build_empty_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("empty.txt"), "").unwrap();
+        fs::write(root.join("real.txt"), "hello world").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+        let data = fs::read(&index_path).unwrap();
+        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        // Empty file has no trigrams but is still indexed
+        assert_eq!(header.file_count, 2);
+    }
+
+    #[test]
+    fn test_build_file_shorter_than_3_bytes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("tiny.txt"), "ab").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+        let data = fs::read(&index_path).unwrap();
+        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        assert_eq!(header.file_count, 1);
+        // File has no trigrams (< 3 bytes)
+        assert_eq!(header.trigram_count, 0);
+    }
+
+    #[test]
+    fn test_build_nested_directories() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::write(root.join("a/b/c/deep.txt"), "deep file content").unwrap();
+        fs::write(root.join("top.txt"), "top level").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+        let data = fs::read(&index_path).unwrap();
+        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        assert_eq!(header.file_count, 2);
+    }
+
+    #[test]
+    fn test_build_utf8_content() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("japanese.txt"), "これは日本語のテストです").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+        let data = fs::read(&index_path).unwrap();
+        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        assert_eq!(header.file_count, 1);
+        assert!(header.trigram_count > 0);
+    }
+
+    #[test]
     fn test_build_skips_dotgit() {
         let dir = tempdir().unwrap();
         let root = dir.path();
