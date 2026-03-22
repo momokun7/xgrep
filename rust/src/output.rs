@@ -3,6 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
+use std::io::Write as IoWrite;
+use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 use crate::search::SearchResult;
 
@@ -36,6 +38,73 @@ pub fn format_default(results: &[SearchResult]) -> String {
         .map(|r| format!("{}:{}:{}", r.file, r.line_number, r.line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// カラー出力（termcolor使用）
+pub fn print_results_color(results: &[SearchResult], pattern: &str) {
+    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+
+    for r in results {
+        // file path in magenta
+        stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Magenta)))
+            .ok();
+        write!(stdout, "{}", r.file).ok();
+
+        // separator
+        stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)))
+            .ok();
+        write!(stdout, ":").ok();
+
+        // line number in green
+        stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Green)))
+            .ok();
+        write!(stdout, "{}", r.line_number).ok();
+
+        // separator
+        stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)))
+            .ok();
+        write!(stdout, ":").ok();
+
+        // line content with match highlighted in red bold
+        stdout.reset().ok();
+        let line = &r.line;
+        if !pattern.is_empty() {
+            if let Some(pos) = line.find(pattern) {
+                write!(stdout, "{}", &line[..pos]).ok();
+                stdout
+                    .set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))
+                    .ok();
+                write!(stdout, "{}", &line[pos..pos + pattern.len()]).ok();
+                stdout.reset().ok();
+                write!(stdout, "{}", &line[pos + pattern.len()..]).ok();
+            } else {
+                write!(stdout, "{}", line).ok();
+            }
+        } else {
+            write!(stdout, "{}", line).ok();
+        }
+        writeln!(stdout).ok();
+    }
+    stdout.reset().ok();
+}
+
+/// JSON形式で出力
+pub fn format_json(results: &[SearchResult]) -> String {
+    let json_results: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "file": r.file,
+                "line_number": r.line_number,
+                "line": r.line
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&json_results).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// LLM向けMarkdownコードブロック形式で出力（コンテキスト行付き）
@@ -168,14 +237,72 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_format_default() {
+    fn test_format_json() {
         let results = vec![
             SearchResult {
                 file: "src/main.rs".to_string(),
                 line_number: 42,
-                line: "    fn handle_auth() {}".to_string(),
+                line: "fn handle_auth() {}".to_string(),
             },
         ];
+        let json = format_json(&results);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed[0]["file"], "src/main.rs");
+        assert_eq!(parsed[0]["line_number"], 42);
+        assert_eq!(parsed[0]["line"], "fn handle_auth() {}");
+    }
+
+    #[test]
+    fn test_format_json_empty() {
+        let json = format_json(&[]);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_format_json_multiple() {
+        let results = vec![
+            SearchResult {
+                file: "a.rs".to_string(),
+                line_number: 1,
+                line: "foo".to_string(),
+            },
+            SearchResult {
+                file: "b.rs".to_string(),
+                line_number: 2,
+                line: "bar".to_string(),
+            },
+        ];
+        let json = format_json(&results);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert_eq!(parsed[1]["file"], "b.rs");
+    }
+
+    #[test]
+    fn test_print_results_color_no_panic() {
+        // カラー出力がパニックしないことを確認
+        let results = vec![
+            SearchResult {
+                file: "src/main.rs".to_string(),
+                line_number: 5,
+                line: "fn hello_world() {}".to_string(),
+            },
+        ];
+        // Should not panic
+        print_results_color(&results, "hello");
+        print_results_color(&results, "notfound");
+        print_results_color(&results, "");
+        print_results_color(&[], "pattern");
+    }
+
+    #[test]
+    fn test_format_default() {
+        let results = vec![SearchResult {
+            file: "src/main.rs".to_string(),
+            line_number: 42,
+            line: "    fn handle_auth() {}".to_string(),
+        }];
         let output = format_default(&results);
         assert_eq!(output, "src/main.rs:42:    fn handle_auth() {}");
     }
