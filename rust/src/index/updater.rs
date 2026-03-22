@@ -43,6 +43,36 @@ fn current_commit_hash(root: &Path) -> Option<String> {
     }
 }
 
+/// `git status --porcelain` の1行からファイルパスを抽出する
+///
+/// フォーマット: "XY filename" or "XY \"filename with spaces\"" or "XY old -> new"
+fn parse_status_path(line: &str) -> Option<String> {
+    if line.len() < 4 {
+        return None;
+    }
+    let path_part = &line[3..];
+
+    // リネームの場合: "old -> new" → 新しい名前を使う
+    let path = if let Some(arrow_pos) = path_part.find(" -> ") {
+        &path_part[arrow_pos + 4..]
+    } else {
+        path_part
+    };
+
+    // クォートされたパスを処理（特殊文字を含むファイル名はgitがクォートする）
+    let path = if path.starts_with('"') && path.ends_with('"') {
+        &path[1..path.len() - 1]
+    } else {
+        path
+    };
+
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
 /// 2つのコミット間の変更ファイル + 未コミットの変更ファイルを取得
 fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
     let mut files = std::collections::HashSet::new();
@@ -72,16 +102,8 @@ fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
         .current_dir(root)
         .output()?;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let line = line.trim();
-        if line.len() > 3 {
-            // フォーマット: "XY filename" or "XY old -> new"
-            let path = &line[3..];
-            let path = if let Some(arrow) = path.find(" -> ") {
-                &path[arrow + 4..] // リネームの場合は新しい名前を使う
-            } else {
-                path
-            };
-            files.insert(path.to_string());
+        if let Some(path) = parse_status_path(line) {
+            files.insert(path);
         }
     }
 
@@ -284,5 +306,76 @@ mod tests {
         let dir = tempdir().unwrap();
         let index_path = dir.path().join("nonexistent.xgrep");
         assert!(IndexMeta::load(&index_path).is_none());
+    }
+
+    #[test]
+    fn test_ensure_fresh_index_rebuilds_on_uncommitted_changes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        fs::write(root.join("hello.txt"), "hello world").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+
+        let index_path = root.join("test.xgrep");
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        let mtime1 = fs::metadata(&index_path).unwrap().modified().unwrap();
+
+        // 未コミットの変更を加える（同じコミット、ダーティな作業ツリー）
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        fs::write(root.join("hello.txt"), "changed content").unwrap();
+
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        let mtime2 = fs::metadata(&index_path).unwrap().modified().unwrap();
+        assert_ne!(mtime1, mtime2); // 未コミットの変更によりインデックスが再構築された
+    }
+
+    #[test]
+    fn test_ensure_fresh_index_rebuilds_on_new_untracked_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        fs::write(root.join("hello.txt"), "hello world").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+
+        let index_path = root.join("test.xgrep");
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        let mtime1 = fs::metadata(&index_path).unwrap().modified().unwrap();
+
+        // 新しい未追跡ファイルを追加
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        fs::write(root.join("new_file.txt"), "new content").unwrap();
+
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        let mtime2 = fs::metadata(&index_path).unwrap().modified().unwrap();
+        assert_ne!(mtime1, mtime2); // 新しい未追跡ファイルによりインデックスが再構築された
+    }
+
+    #[test]
+    fn test_parse_status_path_simple() {
+        assert_eq!(parse_status_path(" M hello.txt"), Some("hello.txt".to_string()));
+    }
+
+    #[test]
+    fn test_parse_status_path_rename() {
+        assert_eq!(parse_status_path("R  old.txt -> new.txt"), Some("new.txt".to_string()));
+    }
+
+    #[test]
+    fn test_parse_status_path_quoted() {
+        assert_eq!(
+            parse_status_path(" M \"file with spaces.txt\""),
+            Some("file with spaces.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_status_path_short() {
+        assert_eq!(parse_status_path("M"), None);
     }
 }
