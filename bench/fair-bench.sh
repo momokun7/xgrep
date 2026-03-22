@@ -28,7 +28,7 @@ RG="rg"
 # Datasets
 DS_LARGE="$BENCH_DIR/linux-src"
 DS_MEDIUM="$BENCH_DIR/ripgrep-src"
-DS_SMALL="$SCRIPT_DIR/../rust"
+DS_SMALL="$SCRIPT_DIR/../rust/src"
 
 # Zoekt index dirs (isolated per dataset)
 ZOEKT_IDX_DIR_LARGE="$BENCH_DIR/.zoekt-idx-large"
@@ -246,6 +246,8 @@ xgrep_build_out="$RESULTS_DIR/xgrep_build_time.txt"
 /usr/bin/time -l bash -c "cd '$DS_LARGE' && '$XGREP' init" > "$xgrep_build_out" 2>&1
 xgrep_build_wall=$(grep "real" "$xgrep_build_out" | awk '{print $1}')
 xgrep_build_rss=$(grep "maximum resident" "$xgrep_build_out" | awk '{print $1}')
+xgrep_build_footprint=$(grep "peak memory footprint" "$xgrep_build_out" | awk '{print $1}')
+xgrep_build_footprint=${xgrep_build_footprint:-$xgrep_build_rss}
 xgrep_idx_size=$(du -sh "$XGREP_CACHE" 2>/dev/null | awk '{print $1}')
 xgrep_idx_bytes=$(dir_size_bytes "$XGREP_CACHE")
 source_bytes=$(dir_size_bytes "$DS_LARGE")
@@ -264,10 +266,10 @@ zoekt_idx_bytes=$(dir_size_bytes "$ZOEKT_IDX_DIR_LARGE")
 zoekt_overhead=$(echo "scale=2; $zoekt_idx_bytes * 100 / $source_bytes" | bc)
 
 {
-  echo "| Tool | Wall Time | Peak RSS | Index Size | Overhead (idx/src) |"
-  echo "|------|-----------|----------|------------|--------------------|"
-  echo "| xgrep | ${xgrep_build_wall}s | $(human_bytes "$xgrep_build_rss") | $xgrep_idx_size | ${xgrep_overhead}% |"
-  echo "| zoekt | ${zoekt_build_wall}s | $(human_bytes "$zoekt_build_rss") | $zoekt_idx_size | ${zoekt_overhead}% |"
+  echo "| Tool | Wall Time | Peak RSS | Peak Footprint | Index Size | Overhead (idx/src) |"
+  echo "|------|-----------|----------|----------------|------------|--------------------|"
+  echo "| xgrep | ${xgrep_build_wall}s | $(human_bytes "$xgrep_build_rss") | $(human_bytes "$xgrep_build_footprint") | $xgrep_idx_size | ${xgrep_overhead}% |"
+  echo "| zoekt | ${zoekt_build_wall}s | $(human_bytes "$zoekt_build_rss") | N/A | $zoekt_idx_size | ${zoekt_overhead}% |"
   echo ""
   echo "Source size: $(du -sh "$DS_LARGE" | awk '{print $1}')"
   echo ""
@@ -681,12 +683,13 @@ for f in files:
   echo ""
   echo "### Caveats"
   echo ""
-  echo "- Section 4 benchmarks use hyperfine with the default shell; each invocation has equal shell startup overhead (~3ms)"
-  echo "- xgrep and ripgrep run with cwd set to the target directory via pushd/popd; no bash -c wrapper is used"
+  echo "- Large dataset: hyperfine with default shell (equal ~3ms overhead per tool). Medium/Small: hyperfine -N (no shell) with 100 runs for sub-10ms precision"
+  echo "- xgrep and ripgrep run with cwd set to the target directory via pushd/popd"
   echo "- zoekt is designed as a server (zoekt-webserver); CLI mode adds process startup overhead. Server mode would be significantly faster"
   echo "- xgrep requires \`cd\` into the target directory; index is tied to cwd"
   echo "- ripgrep requires no setup; index-based tools have amortized cost (see Section 6)"
   echo "- File system cache state affects cold start measurements; \`sync\` is called but page cache is not purged (requires sudo)"
+  echo "- Peak RSS includes OS page cache (file I/O). Peak Footprint (macOS only) reflects actual application memory allocation"
   echo "- All measurements on a single machine; results may vary by hardware"
   echo "- zoekt only benchmarked on large dataset (it targets large-scale code search)"
   echo ""
