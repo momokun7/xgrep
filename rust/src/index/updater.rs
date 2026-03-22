@@ -481,4 +481,108 @@ mod tests {
     fn test_parse_status_path_short() {
         assert_eq!(parse_status_path("M"), None);
     }
+
+    #[test]
+    fn test_check_index_status_fresh() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
+        fs::write(root.join("hello.txt"), "hello world").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+
+        let index_path = root.join("test.xgrep");
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        let status = check_index_status(root, &index_path).unwrap();
+        assert!(matches!(status, IndexStatus::Fresh));
+    }
+
+    #[test]
+    fn test_check_index_status_stale() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
+        fs::write(root.join("hello.txt"), "hello world").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+
+        let index_path = root.join("test.xgrep");
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        // ファイルを変更
+        fs::write(root.join("hello.txt"), "changed").unwrap();
+
+        let status = check_index_status(root, &index_path).unwrap();
+        match status {
+            IndexStatus::Stale { changed_files } => {
+                assert!(!changed_files.is_empty());
+            }
+            other => panic!("expected Stale, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_index_status_no_index() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let index_path = root.join("nonexistent.xgrep");
+
+        let status = check_index_status(root, &index_path).unwrap();
+        assert!(matches!(status, IndexStatus::NeedsFullBuild));
+    }
+
+    #[test]
+    fn test_check_index_status_stale_new_untracked_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
+        fs::write(root.join("hello.txt"), "hello world").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+
+        let index_path = root.join("test.xgrep");
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        // 新しい未追跡ファイルを追加
+        fs::write(root.join("new_file.txt"), "new content").unwrap();
+
+        let status = check_index_status(root, &index_path).unwrap();
+        match status {
+            IndexStatus::Stale { changed_files } => {
+                assert!(changed_files.iter().any(|p| p.to_string_lossy().contains("new_file.txt")));
+            }
+            other => panic!("expected Stale, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_index_status_stale_after_commit() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
+        fs::write(root.join("hello.txt"), "hello world").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+
+        let index_path = root.join("test.xgrep");
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        // 新しいコミット
+        fs::write(root.join("new_file.txt"), "new content").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
+        Command::new("git").args(["commit", "-m", "add file"]).current_dir(root).output().unwrap();
+
+        let status = check_index_status(root, &index_path).unwrap();
+        match status {
+            IndexStatus::Stale { changed_files } => {
+                assert!(!changed_files.is_empty());
+            }
+            other => panic!("expected Stale, got {:?}", other),
+        }
+    }
 }
