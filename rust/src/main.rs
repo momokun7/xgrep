@@ -96,6 +96,12 @@ fn index_path(local: bool) -> Result<PathBuf> {
 }
 
 fn main() {
+    // Broken pipe (SIGPIPE) を無視する。`xgrep | head` 等でパイプが閉じられた場合にパニックしない。
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     if let Err(e) = run() {
         eprintln!("error: {}", e);
         std::process::exit(2);
