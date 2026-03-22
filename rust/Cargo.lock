@@ -868,6 +868,7 @@ dependencies = [
  "mimalloc",
  "rayon",
  "regex",
+ "regex-syntax",
  "serde_json",
  "tempfile",
  "xxhash-rust",
