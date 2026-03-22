@@ -1,0 +1,52 @@
+use std::collections::BTreeSet;
+
+/// バイト列からtrigramを抽出する（重複除去・ソート済み）
+pub fn extract_trigrams(data: &[u8]) -> Vec<[u8; 3]> {
+    if data.len() < 3 {
+        return vec![];
+    }
+    let mut seen = BTreeSet::new();
+    for window in data.windows(3) {
+        seen.insert([window[0], window[1], window[2]]);
+    }
+    seen.into_iter().collect()
+}
+
+/// trigram ([u8; 3]) を u32 にエンコード（上位1バイトは0）
+pub fn encode(trigram: [u8; 3]) -> u32 {
+    (trigram[0] as u32) << 16 | (trigram[1] as u32) << 8 | trigram[2] as u32
+}
+
+/// u32 を [u8; 3] にデコード
+pub fn decode(value: u32) -> [u8; 3] {
+    [(value >> 16) as u8, (value >> 8) as u8, value as u8]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_trigrams() {
+        let trigrams = extract_trigrams(b"hello");
+        assert_eq!(trigrams, vec![*b"ell", *b"hel", *b"llo"]);
+    }
+
+    #[test]
+    fn test_extract_short_input() {
+        assert_eq!(extract_trigrams(b"ab").len(), 0);
+        assert_eq!(extract_trigrams(b"abc"), vec![*b"abc"]);
+    }
+
+    #[test]
+    fn test_extract_dedup() {
+        let trigrams = extract_trigrams(b"aaaa");
+        assert_eq!(trigrams, vec![*b"aaa"]);
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let t = *b"abc";
+        assert_eq!(decode(encode(t)), t);
+    }
+}
