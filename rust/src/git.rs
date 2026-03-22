@@ -1,7 +1,7 @@
+use anyhow::{bail, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use anyhow::{Result, bail};
 
 /// gitリポジトリかどうかを判定
 pub fn is_git_repo(root: &Path) -> bool {
@@ -64,7 +64,12 @@ pub fn since_files(root: &Path, duration: &str) -> Result<Vec<PathBuf>> {
 
     let output = if let Some(since_str) = parse_duration(duration)? {
         Command::new("git")
-            .args(["log", &format!("--since={since_str}"), "--name-only", "--pretty=format:"])
+            .args([
+                "log",
+                &format!("--since={since_str}"),
+                "--name-only",
+                "--pretty=format:",
+            ])
             .current_dir(root)
             .output()?
     } else {
@@ -101,19 +106,24 @@ fn parse_duration(duration: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let (num_str, unit) = if duration.ends_with('h') {
-        (&duration[..duration.len()-1], "hour")
-    } else if duration.ends_with('m') {
-        (&duration[..duration.len()-1], "minute")
-    } else if duration.ends_with('d') {
-        (&duration[..duration.len()-1], "day")
-    } else if duration.ends_with('w') {
-        (&duration[..duration.len()-1], "week")
+    let (num_str, unit) = if let Some(stripped) = duration.strip_suffix('h') {
+        (stripped, "hour")
+    } else if let Some(stripped) = duration.strip_suffix('m') {
+        (stripped, "minute")
+    } else if let Some(stripped) = duration.strip_suffix('d') {
+        (stripped, "day")
+    } else if let Some(stripped) = duration.strip_suffix('w') {
+        (stripped, "week")
     } else {
-        bail!("invalid duration format: {}. Use Nh, Nm, Nd, Nw, or N.commits", duration);
+        bail!(
+            "invalid duration format: {}. Use Nh, Nm, Nd, Nw, or N.commits",
+            duration
+        );
     };
 
-    let n: u32 = num_str.parse().map_err(|_| anyhow::anyhow!("invalid number: {}", num_str))?;
+    let n: u32 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid number: {}", num_str))?;
     let plural = if n == 1 { "" } else { "s" };
     Ok(Some(format!("{} {}{} ago", n, unit, plural)))
 }
