@@ -3,6 +3,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+/// インデックスの鮮度チェック結果
+#[derive(Debug)]
+pub enum IndexStatus {
+    /// インデックスは最新、変更なし
+    Fresh,
+    /// インデックスは存在するが一部ファイルが変更済み。インデックス検索+変更ファイル直接スキャンで対応
+    Stale { changed_files: Vec<PathBuf> },
+    /// インデックスが存在しない、フルビルドが必要
+    NeedsFullBuild,
+}
+
 /// インデックスと一緒に保存するメタデータ
 #[derive(Debug)]
 struct IndexMeta {
@@ -96,14 +107,29 @@ fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
         }
     }
 
-    // 未コミットの変更（staged + unstaged）
+    // 未コミットの変更（staged + unstaged、追跡済みファイルのみ）
+    // -uno でuntracked filesを除外し、大規模リポジトリでのハングを防止
     let output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "-uno"])
         .current_dir(root)
         .output()?;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if let Some(path) = parse_status_path(line) {
             files.insert(path);
+        }
+    }
+
+    // 未追跡ファイル（.gitignoreを尊重した高速な列挙）
+    // git status --porcelain の代わりに ls-files --others を使うことで
+    // node_modules等の大量のuntracked filesがある場合でも高速に動作する
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(root)
+        .output()?;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            files.insert(line.to_string());
         }
     }
 
@@ -116,6 +142,70 @@ fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
 pub fn save_meta(root: &Path, index_path: &Path) -> Result<()> {
     let hash = current_commit_hash(root);
     IndexMeta::save(index_path, hash.as_deref())
+}
+
+/// インデックスの鮮度をチェックし、変更ファイルリストを返す（リビルドしない）
+pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus> {
+    if !index_path.exists() {
+        return Ok(IndexStatus::NeedsFullBuild);
+    }
+
+    let meta = IndexMeta::load(index_path);
+    let current_hash = current_commit_hash(root);
+
+    let mut changed = std::collections::HashSet::new();
+
+    match (&meta, &current_hash) {
+        (Some(m), Some(curr)) => {
+            // コミット済み変更をチェック
+            if m.commit_hash.as_deref() != Some(curr.as_str()) {
+                let old_hash = m.commit_hash.as_deref().unwrap_or("");
+                if let Ok(files) = changed_files_since(root, old_hash) {
+                    for f in files {
+                        changed.insert(PathBuf::from(f));
+                    }
+                }
+            }
+
+            // 未コミット変更（staged + unstaged、untracked除外で高速化）
+            let output = std::process::Command::new("git")
+                .args(["status", "--porcelain", "-uno"])
+                .current_dir(root)
+                .output()?;
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some(path) = parse_status_path(line) {
+                    changed.insert(PathBuf::from(path));
+                }
+            }
+
+            // 未追跡ファイル（インデックスに含まれていない新規ファイル）
+            let output = std::process::Command::new("git")
+                .args(["ls-files", "--others", "--exclude-standard"])
+                .current_dir(root)
+                .output()?;
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    changed.insert(PathBuf::from(line));
+                }
+            }
+        }
+        _ => {
+            // 非Gitリポジトリ or メタデータなし: 変更判定不可
+            return Ok(IndexStatus::NeedsFullBuild);
+        }
+    }
+
+    if changed.is_empty() {
+        Ok(IndexStatus::Fresh)
+    } else if changed.len() > 500 {
+        // 変更が多すぎる場合はリビルドの方が効率的
+        Ok(IndexStatus::NeedsFullBuild)
+    } else {
+        let mut files: Vec<PathBuf> = changed.into_iter().collect();
+        files.sort();
+        Ok(IndexStatus::Stale { changed_files: files })
+    }
 }
 
 /// キャッシュ付きでインデックスをビルドする（増分更新）
@@ -142,12 +232,19 @@ pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
     match (&meta, &current_hash) {
         (Some(m), Some(curr)) if m.commit_hash.as_deref() == Some(curr.as_str()) => {
             // 同じコミット。未コミットの変更があるかチェック
+            // -uno で追跡済みファイルの変更を確認（untracked除外で高速化）
             let output = std::process::Command::new("git")
-                .args(["status", "--porcelain"])
+                .args(["status", "--porcelain", "-uno"])
                 .current_dir(root)
                 .output()?;
-            let status = String::from_utf8_lossy(&output.stdout);
-            if status.trim().is_empty() {
+            let tracked_changes = String::from_utf8_lossy(&output.stdout);
+            // 未追跡ファイルも確認（.gitignoreを尊重）
+            let output = std::process::Command::new("git")
+                .args(["ls-files", "--others", "--exclude-standard"])
+                .current_dir(root)
+                .output()?;
+            let untracked = String::from_utf8_lossy(&output.stdout);
+            if tracked_changes.trim().is_empty() && untracked.trim().is_empty() {
                 // 変更なし、インデックスは最新
                 return Ok(());
             }
