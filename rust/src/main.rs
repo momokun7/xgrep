@@ -65,9 +65,6 @@ struct Cli {
     #[arg(long = "json")]
     json_output: bool,
 
-    /// Disable color output
-    #[arg(long)]
-    no_color: bool,
 }
 
 #[derive(Subcommand)]
@@ -246,9 +243,6 @@ fn run() -> Result<()> {
                     _ => {
                         if let Some(ctx) = cli.context {
                             output::format_default_context(&results, &cwd, ctx)?
-                        } else if !cli.no_color {
-                            output::print_results_color(&results, &pattern);
-                            return Ok(());
                         } else {
                             output::format_default(&results)
                         }
