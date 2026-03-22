@@ -104,9 +104,9 @@ dir_size_bytes() {
   du -sk "$1" 2>/dev/null | awk '{print $1 * 1024}'
 }
 
-# Count files (excluding hidden dirs)
+# Count files (excluding hidden dirs and build artifacts)
 file_count() {
-  find "$1" -type f -not -path '*/\.*' 2>/dev/null | wc -l | tr -d ' '
+  find "$1" -type f -not -path '*/\.*' -not -path '*/target/*' -not -path '*/node_modules/*' 2>/dev/null | wc -l | tr -d ' '
 }
 
 # Extract max RSS from /usr/bin/time -l output (macOS format)
@@ -336,7 +336,7 @@ log "Section 4: Warm search latency"
 {
   echo "## Section 4: Warm Search Latency"
   echo ""
-  echo "hyperfine: --warmup 5 --runs 20 (default shell, cwd=target dir)"
+  echo "Large: hyperfine --warmup 5 --runs 20 (default shell). Medium/Small: hyperfine --warmup 10 --runs 100 -N (no shell, high precision)"
   echo ""
 } >> "$REPORT"
 
@@ -422,8 +422,9 @@ for query in "${QUERIES_MEDIUM[@]}"; do
   json_file="$RESULTS_DIR/hyperfine_medium_${query// /_}.json"
 
   hyperfine \
-    --warmup 5 \
-    --runs 20 \
+    --warmup 10 \
+    --runs 100 \
+    -N \
     --export-json "$json_file" \
     --command-name "xgrep" \
     "'$XGREP' '$query'" \
@@ -474,8 +475,9 @@ for query in "${QUERIES_SMALL[@]}"; do
   json_file="$RESULTS_DIR/hyperfine_small_${query// /_}.json"
 
   hyperfine \
-    --warmup 5 \
-    --runs 20 \
+    --warmup 10 \
+    --runs 100 \
+    -N \
     --export-json "$json_file" \
     --command-name "xgrep" \
     "'$XGREP' '$query'" \
@@ -658,8 +660,9 @@ for f in files:
     rg_t = times.get('ripgrep', 0)
     zo = times.get('zoekt', 0)
 
-    if rg_t > 0:
-        ratio = f'{xg/rg_t:.2f}x'
+    if rg_t > 0 and xg > 0:
+        speedup = rg_t / xg
+        ratio = f'{speedup:.1f}x faster'
     else:
         ratio = 'N/A'
 
