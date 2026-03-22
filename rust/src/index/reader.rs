@@ -119,6 +119,74 @@ impl IndexReader {
         result
     }
 
+    /// 2バイトプレフィックスに一致する全trigramのposting listをunionして返す。
+    /// trigram tableはソート済みなのでbinary searchで範囲を特定する。
+    pub fn lookup_trigram_prefix(&self, prefix: [u8; 2]) -> Vec<u32> {
+        let count = self.cached_header.trigram_count as usize;
+        if count == 0 { return vec![]; }
+
+        let trigram_table_start = Header::SIZE;
+
+        // lower bound: prefix[0], prefix[1], 0x00
+        let lo_target = [prefix[0], prefix[1], 0u8];
+        let lo_idx = {
+            let mut lo = 0usize;
+            let mut hi = count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let offset = trigram_table_start + mid * TrigramEntry::SIZE;
+                let entry: TrigramEntry = unsafe {
+                    std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const TrigramEntry)
+                };
+                if entry.trigram < lo_target {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+
+        // upper bound: prefix[0], prefix[1], 0xFF (exclusive upper bound is next entry after 0xFF)
+        let hi_target = [prefix[0], prefix[1], 0xFFu8];
+        let hi_idx = {
+            let mut lo = lo_idx;
+            let mut hi = count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let offset = trigram_table_start + mid * TrigramEntry::SIZE;
+                let entry: TrigramEntry = unsafe {
+                    std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const TrigramEntry)
+                };
+                if entry.trigram <= hi_target {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+
+        if lo_idx >= hi_idx { return vec![]; }
+
+        let mut seen = std::collections::BTreeSet::new();
+        for i in lo_idx..hi_idx {
+            let offset = trigram_table_start + i * TrigramEntry::SIZE;
+            let entry: TrigramEntry = unsafe {
+                std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const TrigramEntry)
+            };
+            // sanity check: prefixが一致するエントリのみ処理
+            if entry.trigram[0] != prefix[0] || entry.trigram[1] != prefix[1] { continue; }
+            let pl_start = self.posting_lists_start + entry.posting_offset as usize;
+            let pl_byte_len = entry.posting_len as usize;
+            let data = &self.mmap[pl_start..pl_start + pl_byte_len];
+            for fid in Self::decode_posting_list(data) {
+                seen.insert(fid);
+            }
+        }
+        seen.into_iter().collect()
+    }
+
     pub fn file_path(&self, file_id: u32) -> &str {
         let offset = self.file_table_start + file_id as usize * FileEntry::SIZE;
         let entry: FileEntry = unsafe {
