@@ -1,16 +1,16 @@
-use clap::{Parser, Subcommand};
 use anyhow::Result;
-use std::path::PathBuf;
+use clap::{Parser, Subcommand};
 use std::env;
+use std::path::PathBuf;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use xgrep::index;
-use xgrep::search;
-use xgrep::output;
-use xgrep::git;
 use xgrep::filetype;
+use xgrep::git;
+use xgrep::index;
+use xgrep::output;
+use xgrep::search;
 
 #[derive(Parser)]
 #[command(name = "xgrep", about = "Ultra-fast indexed code search")]
@@ -48,6 +48,30 @@ struct Cli {
     /// Filter by file type (e.g., rs, py, js)
     #[arg(long = "type", short = 't')]
     file_type: Option<String>,
+
+    /// Show line numbers (default: on)
+    #[arg(short = 'n')]
+    line_numbers: bool,
+
+    /// Only print count of matching lines per file
+    #[arg(short = 'c')]
+    count: bool,
+
+    /// Only print file names with matches
+    #[arg(short = 'l')]
+    files_only: bool,
+
+    /// Maximum number of results
+    #[arg(long)]
+    max_count: Option<usize>,
+
+    /// Output as JSON
+    #[arg(long = "json")]
+    json_output: bool,
+
+    /// Disable color output
+    #[arg(long)]
+    no_color: bool,
 }
 
 #[derive(Subcommand)]
@@ -147,12 +171,15 @@ fn main() -> Result<()> {
             // ファイルタイプフィルタ適用
             let results = if let Some(ref ft) = cli.file_type {
                 if let Some(exts) = filetype::extensions_for_type(ft) {
-                    results.into_iter().filter(|r| {
-                        std::path::Path::new(&r.file)
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .map_or(false, |e| exts.contains(&e))
-                    }).collect()
+                    results
+                        .into_iter()
+                        .filter(|r| {
+                            std::path::Path::new(&r.file)
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .is_some_and(|e| exts.contains(&e))
+                        })
+                        .collect()
                 } else {
                     eprintln!("warning: unknown file type '{}', showing all results", ft);
                     results
@@ -161,7 +188,38 @@ fn main() -> Result<()> {
                 results
             };
 
-            if !results.is_empty() {
+            // max_count適用
+            let results = if let Some(max) = cli.max_count {
+                results.into_iter().take(max).collect::<Vec<_>>()
+            } else {
+                results
+            };
+
+            if results.is_empty() {
+                std::process::exit(1);
+            }
+
+            if cli.count {
+                // ファイルごとのマッチ数を表示
+                let mut counts: std::collections::BTreeMap<&str, usize> =
+                    std::collections::BTreeMap::new();
+                for r in &results {
+                    *counts.entry(&r.file).or_insert(0) += 1;
+                }
+                for (file, count) in counts {
+                    println!("{}:{}", file, count);
+                }
+            } else if cli.files_only {
+                // マッチしたファイル名のみ表示
+                let mut seen = std::collections::BTreeSet::new();
+                for r in &results {
+                    if seen.insert(&r.file) {
+                        println!("{}", r.file);
+                    }
+                }
+            } else if cli.json_output {
+                println!("{}", output::format_json(&results));
+            } else {
                 let output_str = match cli.format.as_str() {
                     "llm" => {
                         let ctx = cli.context.unwrap_or(3);
@@ -170,6 +228,9 @@ fn main() -> Result<()> {
                     _ => {
                         if let Some(ctx) = cli.context {
                             output::format_default_context(&results, &cwd, ctx)?
+                        } else if !cli.no_color {
+                            output::print_results_color(&results, &pattern);
+                            return Ok(());
                         } else {
                             output::format_default(&results)
                         }
