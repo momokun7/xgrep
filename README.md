@@ -189,7 +189,6 @@ Benchmark results vary by hardware. Key factors: CPU (single-thread speed for se
 - Symbolic links are not followed (only regular files are indexed)
 - Index must be rebuilt when files change (no automatic incremental updates yet)
 - Index build uses ~160MB peak memory (footprint) for large codebases
-- No color output
 - Regex literal extraction is basic (simple heuristic, not full regex analysis)
 - Not yet published on crates.io
 
