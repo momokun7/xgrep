@@ -118,12 +118,18 @@ pub fn save_meta(root: &Path, index_path: &Path) -> Result<()> {
     IndexMeta::save(index_path, hash.as_deref())
 }
 
+/// キャッシュ付きでインデックスをビルドする（増分更新）
+fn build_with_cache(root: &Path, index_path: &Path) -> Result<()> {
+    let cache_path = crate::index::builder::cache_path_for(index_path);
+    crate::index::builder::build_index_with_cache(root, index_path, Some(&cache_path))
+}
+
 /// インデックスが最新かチェックし、必要に応じて再構築する
 pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
     if !index_path.exists() {
-        // インデックスが存在しない場合はフルビルド
+        // インデックスが存在しない場合はフルビルド（キャッシュ作成付き）
         eprintln!("[indexing...]");
-        crate::index::builder::build_index(root, index_path)?;
+        build_with_cache(root, index_path)?;
         save_meta(root, index_path)?;
         eprintln!("[done]");
         return Ok(());
@@ -145,9 +151,9 @@ pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
                 // 変更なし、インデックスは最新
                 return Ok(());
             }
-            // 未コミットの変更あり、再構築
+            // 未コミットの変更あり、キャッシュ付き増分再構築
             eprintln!("[updating index...]");
-            crate::index::builder::build_index(root, index_path)?;
+            build_with_cache(root, index_path)?;
             IndexMeta::save(index_path, Some(curr))?;
             eprintln!("[done]");
         }
@@ -162,16 +168,16 @@ pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
                 return Ok(());
             }
 
-            // 変更があるのでフルリビルド
+            // 変更があるのでキャッシュ付き増分リビルド
             eprintln!("[updating index ({} files changed)...]", changed.len());
-            crate::index::builder::build_index(root, index_path)?;
+            build_with_cache(root, index_path)?;
             IndexMeta::save(index_path, Some(curr))?;
             eprintln!("[done]");
         }
         _ => {
-            // 非Gitリポジトリ or メタデータなし、再構築
+            // 非Gitリポジトリ or メタデータなし、キャッシュ付き再構築
             eprintln!("[updating index...]");
-            crate::index::builder::build_index(root, index_path)?;
+            build_with_cache(root, index_path)?;
             save_meta(root, index_path)?;
             eprintln!("[done]");
         }
@@ -222,7 +228,7 @@ mod tests {
         let root = dir.path();
         init_git_repo(root);
         // インデックスファイルをgitignoreに追加（git statusで検出されないようにする）
-        fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n").unwrap();
+        fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
         Command::new("git")
             .args(["add", "."])

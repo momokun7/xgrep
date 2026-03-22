@@ -17,16 +17,13 @@ echo ""
 echo "--- シナリオ1: 関数の使用箇所を探す ---"
 echo ""
 echo "[xgrep]"
-time $XGREP "useState" --type ts 2>/dev/null | head -5
-echo "  ..."
+time $XGREP "useState" --type ts --max-count 5 2>/dev/null
 echo ""
 echo "[ripgrep]"
-time rg "useState" --type ts . 2>/dev/null | head -5
-echo "  ..."
+time rg "useState" --type ts . --max-count 5 2>/dev/null
 echo ""
 echo "[grep]"
-time grep -rn "useState" --include="*.ts" --include="*.tsx" . 2>/dev/null | head -5
-echo "  ..."
+time grep -rn "useState" --include="*.ts" --include="*.tsx" . -m 5 2>/dev/null
 echo ""
 
 # シナリオ2: AIにコンテキストを渡す

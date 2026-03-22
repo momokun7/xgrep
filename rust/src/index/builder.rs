@@ -11,7 +11,101 @@ use rayon::prelude::*;
 use crate::index::format::*;
 use crate::trigram;
 
+// ============================================================
+// Trigram Cache: ファイルごとのtrigramをキャッシュし、増分更新を高速化
+// ============================================================
+
+/// キャッシュされたファイルのtrigram情報
+struct CachedFile {
+    mtime: u64,
+    content_hash: u64,
+    trigrams: Vec<[u8; 3]>,
+}
+
+/// ファイルパス→trigram情報のキャッシュ
+pub struct TrigramCache {
+    entries: HashMap<String, CachedFile>,
+}
+
+impl TrigramCache {
+    /// キャッシュファイルを読み込む。存在しない or 破損している場合は空キャッシュを返す。
+    pub fn load(path: &Path) -> Self {
+        let data = match fs::read(path) {
+            Ok(d) => d,
+            Err(_) => return Self { entries: HashMap::new() },
+        };
+        let mut entries = HashMap::new();
+        let mut pos = 0;
+        if data.len() < 4 {
+            return Self { entries };
+        }
+        let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        for _ in 0..count {
+            if pos + 2 > data.len() { break; }
+            let path_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if pos + path_len > data.len() { break; }
+            let path_str = match std::str::from_utf8(&data[pos..pos + path_len]) {
+                Ok(s) => s.to_string(),
+                Err(_) => break,
+            };
+            pos += path_len;
+            if pos + 20 > data.len() { break; }
+            let mtime = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let content_hash = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let trigram_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + trigram_count * 3 > data.len() { break; }
+            let mut trigrams = Vec::with_capacity(trigram_count);
+            for _ in 0..trigram_count {
+                trigrams.push([data[pos], data[pos + 1], data[pos + 2]]);
+                pos += 3;
+            }
+            entries.insert(path_str, CachedFile { mtime, content_hash, trigrams });
+        }
+        Self { entries }
+    }
+
+    /// キャッシュをファイルに保存する
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for (path_str, cf) in &self.entries {
+            let path_bytes = path_str.as_bytes();
+            buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(path_bytes);
+            buf.extend_from_slice(&cf.mtime.to_le_bytes());
+            buf.extend_from_slice(&cf.content_hash.to_le_bytes());
+            buf.extend_from_slice(&(cf.trigrams.len() as u32).to_le_bytes());
+            for t in &cf.trigrams {
+                buf.extend_from_slice(t);
+            }
+        }
+        fs::write(path, &buf)?;
+        Ok(())
+    }
+
+}
+
+/// キャッシュファイルのパスを返す
+pub fn cache_path_for(index_path: &Path) -> PathBuf {
+    index_path.with_extension("cache")
+}
+
 pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
+    build_index_with_cache(root, index_path, None)
+}
+
+pub fn build_index_with_cache(root: &Path, index_path: &Path, cache_path: Option<&Path>) -> Result<()> {
+    let mut cache = cache_path
+        .map(TrigramCache::load)
+        .unwrap_or(TrigramCache { entries: HashMap::new() });
+    let mut cache_hits = 0usize;
+    let mut cache_misses = 0usize;
     // ============================================================
     // Pass 1: ファイルパス収集、メタデータ取得、trigram出現数カウント
     // ============================================================
@@ -35,6 +129,7 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
     }
 
     let mut files: Vec<FileInfo> = Vec::new();
+    let mut file_trigrams: Vec<Vec<[u8; 3]>> = Vec::new();
     let mut trigram_count: HashMap<[u8; 3], u32> = HashMap::new();
     let mut total_pairs: usize = 0;
 
@@ -47,15 +142,12 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
             size: u64,
             content_hash: u64,
             trigrams: Vec<[u8; 3]>,
+            from_cache: bool,
         }
 
         let chunk_data: Vec<ChunkResult> = chunk
             .par_iter()
             .filter_map(|path| {
-                let content = fs::read(path).ok()?;
-                if memchr::memchr(0, &content).is_some() {
-                    return None;
-                }
                 let relative = path.strip_prefix(root).ok()?.to_string_lossy().to_string();
                 let meta = fs::metadata(path).ok()?;
                 let mtime = meta
@@ -65,6 +157,26 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let size = meta.len();
+
+                // キャッシュヒット判定: パス+mtimeが一致すればファイル読み込みをスキップ
+                if let Some(cached) = cache.entries.get(&relative) {
+                    if cached.mtime == mtime {
+                        return Some(ChunkResult {
+                            relative_path: relative,
+                            mtime,
+                            size,
+                            content_hash: cached.content_hash,
+                            trigrams: cached.trigrams.clone(),
+                            from_cache: true,
+                        });
+                    }
+                }
+
+                // キャッシュミス: ファイルを読み込んでtrigramを抽出
+                let content = fs::read(path).ok()?;
+                if memchr::memchr(0, &content).is_some() {
+                    return None;
+                }
                 let hash = xxhash_rust::xxh64::xxh64(&content, 0);
                 let trigrams = trigram::extract_trigrams(&content);
                 Some(ChunkResult {
@@ -73,11 +185,17 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
                     size,
                     content_hash: hash,
                     trigrams,
+                    from_cache: false,
                 })
             })
             .collect();
 
         for cr in chunk_data {
+            if cr.from_cache {
+                cache_hits += 1;
+            } else {
+                cache_misses += 1;
+            }
             files.push(FileInfo {
                 relative_path: cr.relative_path,
                 mtime: cr.mtime,
@@ -88,6 +206,7 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
                 *trigram_count.entry(t).or_insert(0) += 1;
                 total_pairs += 1;
             }
+            file_trigrams.push(cr.trigrams);
         }
     }
 
@@ -130,7 +249,11 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
 
     if total_pairs == 0 {
         // trigramが1つもない場合はmmapなしで直接書き出し
-        return write_index_no_postings(index_path, &sorted_trigrams, &files);
+        let result = write_index_no_postings(index_path, &sorted_trigrams, &files);
+        if result.is_ok() {
+            save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
+        }
+        return result;
     }
 
     let temp_dir = tempfile::tempdir()?;
@@ -147,49 +270,27 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
     let mut temp_mmap = unsafe { memmap2::MmapMut::map_mut(&temp_file)? };
 
     // ============================================================
-    // Pass 2: ファイル再読み込み、file_idをmmapに配置
+    // Pass 2: Pass 1で収集済みのtrigramを使ってfile_idをmmapに配置
     // ============================================================
     // SAFETY: temp_mmap_ptr is derived from temp_mmap which lives for the duration of this scope.
-    // All writes are sequential within each chunk (no parallel writes to the same slot).
-    // AtomicU32 ensures each slot is written exactly once across chunks.
+    // All writes are sequential within each file (single-threaded loop).
+    // AtomicU32 ensures each slot is written exactly once.
     let temp_mmap_ptr = temp_mmap.as_mut_ptr();
     let temp_mmap_len = temp_mmap.len();
 
-    let file_count = files.len();
-    let file_indices: Vec<usize> = (0..file_count).collect();
-
-    for chunk in file_indices.chunks(CHUNK_SIZE) {
-        let chunk_trigrams: Vec<(u32, Vec<[u8; 3]>)> = chunk
-            .par_iter()
-            .filter_map(|&file_id| {
-                let full_path = root.join(&files[file_id].relative_path);
-                let content = fs::read(&full_path).ok()?;
-                if memchr::memchr(0, &content).is_some() {
-                    return None;
-                }
-                // Pass 1との整合性を検証: ファイルが変更されていたらスキップ
-                let hash = xxhash_rust::xxh64::xxh64(&content, 0);
-                if hash != files[file_id].content_hash {
-                    return None;
-                }
-                let trigrams = trigram::extract_trigrams(&content);
-                Some((file_id as u32, trigrams))
-            })
-            .collect();
-
-        for (file_id, trigrams) in chunk_trigrams {
-            for t in &trigrams {
-                if let Some(&idx) = trigram_to_index.get(t) {
-                    let pos = write_positions[idx].fetch_add(1, Ordering::Relaxed) as usize;
-                    if pos * 4 + 4 <= temp_mmap_len {
-                        let bytes = file_id.to_ne_bytes();
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                bytes.as_ptr(),
-                                temp_mmap_ptr.add(pos * 4),
-                                4,
-                            );
-                        }
+    for (file_id, trigrams) in file_trigrams.iter().enumerate() {
+        let file_id = file_id as u32;
+        for t in trigrams {
+            if let Some(&idx) = trigram_to_index.get(t) {
+                let pos = write_positions[idx].fetch_add(1, Ordering::Relaxed) as usize;
+                if pos * 4 + 4 <= temp_mmap_len {
+                    let bytes = file_id.to_ne_bytes();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            temp_mmap_ptr.add(pos * 4),
+                            4,
+                        );
                     }
                 }
             }
@@ -293,6 +394,39 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
     }
     trig_writer.flush()?;
 
+    // キャッシュを更新して保存
+    save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
+
+    if cache_hits > 0 {
+        eprintln!("[cache: {} hits, {} misses]", cache_hits, cache_misses);
+    }
+
+    Ok(())
+}
+
+/// キャッシュを更新して保存する
+fn save_cache(
+    cache: &mut TrigramCache,
+    files: &[FileInfo],
+    file_trigrams: &[Vec<[u8; 3]>],
+    cache_path: Option<&Path>,
+) -> Result<()> {
+    if let Some(cp) = cache_path {
+        // 現在のファイル一覧でキャッシュを更新（削除されたファイルを除外）
+        let mut new_entries = HashMap::with_capacity(files.len());
+        for (i, fi) in files.iter().enumerate() {
+            new_entries.insert(
+                fi.relative_path.clone(),
+                CachedFile {
+                    mtime: fi.mtime,
+                    content_hash: fi.content_hash,
+                    trigrams: file_trigrams[i].clone(),
+                },
+            );
+        }
+        cache.entries = new_entries;
+        cache.save(cp)?;
+    }
     Ok(())
 }
 
@@ -513,5 +647,185 @@ mod tests {
         let data = fs::read(&index_path).unwrap();
         let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
         assert_eq!(header.file_count, 1);
+    }
+
+    #[test]
+    fn test_trigram_cache_save_load_roundtrip() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("test.cache");
+
+        let mut cache = TrigramCache { entries: HashMap::new() };
+        cache.entries.insert(
+            "hello.txt".to_string(),
+            CachedFile {
+                mtime: 12345,
+                content_hash: 99999,
+                trigrams: vec![*b"hel", *b"ell", *b"llo"],
+            },
+        );
+        cache.entries.insert(
+            "foo.rs".to_string(),
+            CachedFile {
+                mtime: 67890,
+                content_hash: 11111,
+                trigrams: vec![*b"fn ", *b"n m", *b" ma"],
+            },
+        );
+        cache.save(&cache_path).unwrap();
+
+        let loaded = TrigramCache::load(&cache_path);
+        assert_eq!(loaded.entries.len(), 2);
+
+        let hello = loaded.entries.get("hello.txt").unwrap();
+        assert_eq!(hello.mtime, 12345);
+        assert_eq!(hello.content_hash, 99999);
+        assert_eq!(hello.trigrams, vec![*b"hel", *b"ell", *b"llo"]);
+
+        let foo = loaded.entries.get("foo.rs").unwrap();
+        assert_eq!(foo.mtime, 67890);
+        assert_eq!(foo.content_hash, 11111);
+        assert_eq!(foo.trigrams, vec![*b"fn ", *b"n m", *b" ma"]);
+    }
+
+    #[test]
+    fn test_trigram_cache_load_missing_file() {
+        let cache = TrigramCache::load(Path::new("/nonexistent/path/test.cache"));
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn test_trigram_cache_load_corrupt_data() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("bad.cache");
+        fs::write(&cache_path, b"xx").unwrap(); // 4バイト未満
+        let cache = TrigramCache::load(&cache_path);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn test_build_with_cache_creates_cache_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("hello.txt"), "hello world").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        let cache_path = cache_path_for(&index_path);
+        build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
+
+        assert!(index_path.exists());
+        assert!(cache_path.exists());
+
+        // キャッシュにエントリが含まれていることを検証
+        let cache = TrigramCache::load(&cache_path);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key("hello.txt"));
+    }
+
+    #[test]
+    fn test_build_with_cache_incremental_produces_same_index() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world foo bar").unwrap();
+        fs::write(root.join("b.txt"), "another file content here").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        let cache_path = cache_path_for(&index_path);
+
+        // 初回ビルド（キャッシュなし）
+        build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
+        let index_data_1 = fs::read(&index_path).unwrap();
+
+        // 2回目ビルド（キャッシュあり、ファイル変更なし）
+        build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
+        let index_data_2 = fs::read(&index_path).unwrap();
+
+        // インデックスの内容が同じであることを検証
+        assert_eq!(index_data_1, index_data_2);
+    }
+
+    #[test]
+    fn test_build_with_cache_after_file_change() {
+        use crate::index::reader::IndexReader;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+        fs::write(root.join("b.txt"), "unchanged content here").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        let cache_path = cache_path_for(&index_path);
+
+        // 初回ビルド
+        build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
+
+        let reader1 = IndexReader::open(&index_path).unwrap();
+        assert_eq!(reader1.file_count(), 2);
+
+        // a.txtを変更
+        // mtimeを確実に変更するため少し待つ
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("a.txt"), "modified content xyz").unwrap();
+
+        // 増分ビルド（b.txtはキャッシュヒット、a.txtは再読み込み）
+        build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
+
+        let reader2 = IndexReader::open(&index_path).unwrap();
+        assert_eq!(reader2.file_count(), 2);
+
+        // "xyz"のtrigramが見つかることを検証
+        let posting = reader2.lookup_trigram(*b"xyz");
+        assert!(!posting.is_empty(), "changed file content should be indexed");
+    }
+
+    #[test]
+    fn test_build_with_cache_file_added() {
+        use crate::index::reader::IndexReader;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        let cache_path = cache_path_for(&index_path);
+
+        build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
+        let reader1 = IndexReader::open(&index_path).unwrap();
+        assert_eq!(reader1.file_count(), 1);
+
+        // 新しいファイルを追加
+        fs::write(root.join("b.txt"), "new file zqx").unwrap();
+
+        build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
+        let reader2 = IndexReader::open(&index_path).unwrap();
+        assert_eq!(reader2.file_count(), 2);
+    }
+
+    #[test]
+    fn test_build_with_cache_file_deleted() {
+        use crate::index::reader::IndexReader;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+        fs::write(root.join("b.txt"), "goodbye world").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        let cache_path = cache_path_for(&index_path);
+
+        build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
+        let reader1 = IndexReader::open(&index_path).unwrap();
+        assert_eq!(reader1.file_count(), 2);
+
+        // b.txtを削除
+        fs::remove_file(root.join("b.txt")).unwrap();
+
+        build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
+        let reader2 = IndexReader::open(&index_path).unwrap();
+        assert_eq!(reader2.file_count(), 1);
+
+        // キャッシュからも削除されていることを検証
+        let cache = TrigramCache::load(&cache_path);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(!cache.entries.contains_key("b.txt"));
     }
 }
