@@ -242,6 +242,49 @@ mod tests {
     }
 
     #[test]
+    fn test_open_empty_index() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // Build empty index
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        assert_eq!(reader.file_count(), 0);
+        assert_eq!(reader.header().trigram_count, 0);
+        // Lookup should return empty
+        let posting = reader.lookup_trigram(*b"abc");
+        assert!(posting.is_empty());
+    }
+
+    #[test]
+    fn test_open_invalid_magic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.xgrep");
+        fs::write(&path, b"BADMxxxxxxxxxxxxxxxx").unwrap();
+        assert!(IndexReader::open(&path).is_err());
+    }
+
+    #[test]
+    fn test_open_file_too_small() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tiny.xgrep");
+        fs::write(&path, b"XGR").unwrap(); // only 3 bytes, need 16
+        assert!(IndexReader::open(&path).is_err());
+    }
+
+    #[test]
+    fn test_open_invalid_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("badver.xgrep");
+        let mut data = vec![0u8; 16];
+        data[0..4].copy_from_slice(b"XGRP");
+        // version = 99 (invalid)
+        data[4..8].copy_from_slice(&99u32.to_ne_bytes());
+        fs::write(&path, &data).unwrap();
+        assert!(IndexReader::open(&path).is_err());
+    }
+
+    #[test]
     fn test_file_path() {
         let (_dir, index_path) = build_test_index();
         let reader = IndexReader::open(&index_path).unwrap();
