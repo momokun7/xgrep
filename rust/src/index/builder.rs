@@ -171,12 +171,7 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
             size: *size,
             content_hash: *hash,
         };
-        unsafe {
-            writer.write_all(std::slice::from_raw_parts(
-                &entry as *const FileEntry as *const u8,
-                FileEntry::SIZE,
-            ))?;
-        }
+        writer.write_all(&entry.to_bytes())?;
     }
 
     // String Pool 書き出し
@@ -189,12 +184,7 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
 
     let mut trig_writer = BufWriter::with_capacity(64 * 1024, file);
     for entry in &trigram_entries {
-        unsafe {
-            trig_writer.write_all(std::slice::from_raw_parts(
-                entry as *const TrigramEntry as *const u8,
-                TrigramEntry::SIZE,
-            ))?;
-        }
+        trig_writer.write_all(&entry.to_bytes())?;
     }
     trig_writer.flush()?;
 

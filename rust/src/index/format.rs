@@ -35,14 +35,41 @@ pub struct FileEntry {
 
 impl Header {
     pub const SIZE: usize = std::mem::size_of::<Self>();
+
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&self.magic);
+        bytes[4..8].copy_from_slice(&self.version.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&self.trigram_count.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&self.file_count.to_ne_bytes());
+        bytes
+    }
 }
 
 impl TrigramEntry {
     pub const SIZE: usize = std::mem::size_of::<Self>();
+
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..3].copy_from_slice(&self.trigram);
+        bytes[3] = self._padding;
+        bytes[4..12].copy_from_slice(&self.posting_offset.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&self.posting_len.to_ne_bytes());
+        bytes
+    }
 }
 
 impl FileEntry {
     pub const SIZE: usize = std::mem::size_of::<Self>();
+
+    pub fn to_bytes(&self) -> [u8; 28] {
+        let mut bytes = [0u8; 28];
+        bytes[0..4].copy_from_slice(&self.path_offset.to_ne_bytes());
+        bytes[4..12].copy_from_slice(&self.mtime.to_ne_bytes());
+        bytes[12..20].copy_from_slice(&self.size.to_ne_bytes());
+        bytes[20..28].copy_from_slice(&self.content_hash.to_ne_bytes());
+        bytes
+    }
 }
 
 /// Encode u32 as LEB128 varint

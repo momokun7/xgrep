@@ -55,7 +55,10 @@ pub fn search(reader: &IndexReader, root: &Path, pattern: &str, case_insensitive
 
             let content = match fs::read(&full_path_str) {
                 Ok(c) => c,
-                Err(_) => return vec![],
+                Err(e) => {
+                    eprintln!("xgrep: {}: {}", full_path_str, e);
+                    return vec![];
+                }
             };
 
             let mut file_results = Vec::new();
@@ -113,7 +116,10 @@ pub fn search_files(root: &Path, files: &[PathBuf], pattern: &str, case_insensit
             let full_path = root.join(rel_path);
             let content = match fs::read(&full_path) {
                 Ok(c) => c,
-                Err(_) => return vec![],
+                Err(e) => {
+                    eprintln!("xgrep: {}: {}", full_path.display(), e);
+                    return vec![];
+                }
             };
 
             let rel_str = rel_path.to_string_lossy().to_string();
@@ -196,10 +202,14 @@ pub fn search_regex(reader: &IndexReader, root: &Path, pattern: &str, case_insen
         .flat_map(|&file_id| {
             let rel_path = reader.file_path(file_id);
             let full_path = format!("{}/{}", root.display(), rel_path);
-            let content = match std::fs::read_to_string(&full_path) {
+            let content_bytes = match std::fs::read(&full_path) {
                 Ok(c) => c,
-                Err(_) => return vec![],
+                Err(e) => {
+                    eprintln!("xgrep: {}: {}", full_path, e);
+                    return vec![];
+                }
             };
+            let content = String::from_utf8_lossy(&content_bytes);
 
             let mut file_results = Vec::new();
             for (i, line) in content.lines().enumerate() {
@@ -256,10 +266,14 @@ pub fn search_files_regex(root: &Path, files: &[PathBuf], pattern: &str, case_in
         .par_iter()
         .flat_map(|rel_path| {
             let full_path = root.join(rel_path);
-            let content = match std::fs::read_to_string(&full_path) {
+            let content_bytes = match std::fs::read(&full_path) {
                 Ok(c) => c,
-                Err(_) => return vec![],
+                Err(e) => {
+                    eprintln!("xgrep: {}: {}", full_path.display(), e);
+                    return vec![];
+                }
             };
+            let content = String::from_utf8_lossy(&content_bytes);
             let rel_str = rel_path.to_string_lossy().to_string();
             let mut file_results = Vec::new();
             for (i, line) in content.lines().enumerate() {
@@ -653,5 +667,25 @@ mod tests {
     fn test_intersect_postings_empty_input() {
         let result = intersect_postings(&[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_search_files_regex() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn handle_auth() {}\nfn handle_user() {}").unwrap();
+        let files = vec![PathBuf::from("a.rs")];
+        let results = search_files_regex(root, &files, "handle_\\w+", false).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_files_regex_invalid() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "hello").unwrap();
+        let files = vec![PathBuf::from("a.rs")];
+        let result = search_files_regex(root, &files, "[invalid", false);
+        assert!(result.is_err());
     }
 }
