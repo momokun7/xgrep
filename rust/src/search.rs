@@ -1,5 +1,6 @@
 use crate::index::reader::IndexReader;
 use crate::trigram;
+use crate::trigram_query;
 use anyhow::Result;
 use memchr::memmem;
 use rayon::prelude::*;
@@ -236,29 +237,15 @@ pub fn search_regex(
         .case_insensitive(case_insensitive)
         .build()?;
 
-    // Extract literal portions from regex for trigram lookup
-    // Simple heuristic: find longest literal substring in the pattern
-    let literals = extract_literals(pattern);
-
-    let candidate_ids: Vec<u32> = if literals.len() >= 3 {
-        // Use trigram index with literals
-        let trigrams = trigram::extract_trigrams(literals.as_bytes());
-        if trigrams.is_empty() {
-            (0..reader.file_count()).collect()
-        } else {
-            let posting_lists: Vec<Vec<u32>> =
-                trigrams.iter().map(|t| reader.lookup_trigram(*t)).collect();
-            // If any posting list is empty, fall back to full scan
-            if posting_lists.iter().any(|p| p.is_empty()) {
-                (0..reader.file_count()).collect()
-            } else {
-                let refs: Vec<&[u32]> = posting_lists.iter().map(|v| v.as_slice()).collect();
-                intersect_postings(&refs)
-            }
-        }
+    // Use trigram query for candidate filtering (Zoekt-style AST-based approach)
+    let candidate_ids = if case_insensitive {
+        // Case-insensitive: parse query, then expand each trigram into case variants
+        let query = trigram_query::regex_to_query(pattern);
+        let query = expand_case_variants_query(query);
+        query.evaluate(reader)
     } else {
-        // No usable literals, full file scan
-        (0..reader.file_count()).collect()
+        let query = trigram_query::regex_to_query(pattern);
+        query.evaluate(reader)
     };
 
     // Verify with regex on candidate files
@@ -296,6 +283,7 @@ pub fn search_regex(
 
 /// Extract literal substrings from a regex pattern (simple heuristic)
 /// Finds the longest run of non-special characters (must be >= 2 chars to be useful)
+#[cfg(test)]
 fn extract_literals(pattern: &str) -> String {
     let special = [
         '[', ']', '(', ')', '{', '}', '.', '*', '+', '?', '|', '^', '$', '\\',
@@ -363,6 +351,32 @@ pub fn search_files_regex(
 
     results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
     Ok(results)
+}
+
+/// TrigramQueryツリー内の各Trigramノードをケースバリアントに展開する
+fn expand_case_variants_query(query: trigram_query::TrigramQuery) -> trigram_query::TrigramQuery {
+    match query {
+        trigram_query::TrigramQuery::Trigram(t) => {
+            let variants = case_variants(t);
+            if variants.len() == 1 {
+                trigram_query::TrigramQuery::Trigram(variants[0])
+            } else {
+                trigram_query::TrigramQuery::Or(
+                    variants
+                        .into_iter()
+                        .map(trigram_query::TrigramQuery::Trigram)
+                        .collect(),
+                )
+            }
+        }
+        trigram_query::TrigramQuery::And(qs) => trigram_query::TrigramQuery::And(
+            qs.into_iter().map(expand_case_variants_query).collect(),
+        ),
+        trigram_query::TrigramQuery::Or(qs) => trigram_query::TrigramQuery::Or(
+            qs.into_iter().map(expand_case_variants_query).collect(),
+        ),
+        other => other,
+    }
 }
 
 /// trigramの各バイトについてASCII文字であれば大文字/小文字の両バリアントを生成する。
