@@ -11,6 +11,7 @@ env:
 
 jobs:
   test:
+    name: Test (${{ matrix.os }})
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -30,9 +31,92 @@ jobs:
       - name: Build release
         working-directory: rust
         run: cargo build --release
+      - name: Smoke test
+        working-directory: rust
+        run: |
+          echo "hello world" > /tmp/test_xgrep.txt
+          cd /tmp
+          ./target/release/xgrep 2>/dev/null || true
+          cd -
+          # Verify binary runs
+          ./target/release/xgrep --help
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - name: Clippy
         working-directory: rust
         run: cargo clippy -- -D warnings
       - name: Format check
         working-directory: rust
         run: cargo fmt -- --check
+
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Audit dependencies
+        working-directory: rust
+        run: cargo audit
+      - name: Check for unsafe code count
+        working-directory: rust
+        run: |
+          UNSAFE_COUNT=$(grep -rn "unsafe" src/ --include="*.rs" | grep -v "// SAFETY" | grep -v "#\[cfg" | grep -v "test" | wc -l | tr -d ' ')
+          echo "Unsafe blocks (excluding tests): $UNSAFE_COUNT"
+          if [ "$UNSAFE_COUNT" -gt 20 ]; then
+            echo "WARNING: High number of unsafe blocks ($UNSAFE_COUNT). Review needed."
+            exit 1
+          fi
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t xgrep-bench .
+      - name: Run Docker tests
+        run: docker run --rm --cpus=2 --memory=512m xgrep-bench
+
+  release:
+    name: Release build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [test, lint, security]
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: xgrep-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: xgrep-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build release
+        working-directory: rust
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: rust/target/${{ matrix.target }}/release/xgrep
