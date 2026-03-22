@@ -1,0 +1,23 @@
+[package]
+name = "xgrep"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "xgrep"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+memchr = "2"
+ignore = "0.4"
+anyhow = "1"
+dirs-next = "2"
+rayon = "1"
+libc = "0.2"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
