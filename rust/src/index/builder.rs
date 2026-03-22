@@ -28,7 +28,7 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
         .build()
     {
         let entry = entry?;
-        if entry.file_type().map_or(true, |ft| !ft.is_file()) {
+        if entry.file_type().is_none_or(|ft| !ft.is_file()) {
             continue;
         }
         file_paths.push(entry.path().to_path_buf());
@@ -379,11 +379,7 @@ mod tests {
         // Create files
         fs::write(root.join("real.txt"), "hello world").unwrap();
         fs::create_dir(root.join("ignored_dir")).unwrap();
-        fs::write(
-            root.join("ignored_dir/secret.txt"),
-            "should be ignored",
-        )
-        .unwrap();
+        fs::write(root.join("ignored_dir/secret.txt"), "should be ignored").unwrap();
         fs::write(root.join("debug.log"), "should be ignored").unwrap();
 
         // Need to init git repo for .gitignore to work

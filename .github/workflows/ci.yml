@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build
+        working-directory: rust
+        run: cargo build
+      - name: Test
+        working-directory: rust
+        run: cargo test
+      - name: Build release
+        working-directory: rust
+        run: cargo build --release
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy -- -D warnings
+      - name: Format check
+        working-directory: rust
+        run: cargo fmt -- --check
