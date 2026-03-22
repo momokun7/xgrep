@@ -3,8 +3,6 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
-use std::io::Write as IoWrite;
-use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 use crate::search::SearchResult;
 
@@ -38,66 +36,6 @@ pub fn format_default(results: &[SearchResult]) -> String {
         .map(|r| format!("{}:{}:{}", r.file, r.line_number, r.line))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// カラー出力（termcolor使用）
-pub fn print_results_color(results: &[SearchResult], pattern: &str) {
-    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-
-    for r in results {
-        // file path in magenta
-        stdout
-            .set_color(ColorSpec::new().set_fg(Some(Color::Magenta)))
-            .ok();
-        write!(stdout, "{}", r.file).ok();
-
-        // separator
-        stdout
-            .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)))
-            .ok();
-        write!(stdout, ":").ok();
-
-        // line number in green
-        stdout
-            .set_color(ColorSpec::new().set_fg(Some(Color::Green)))
-            .ok();
-        write!(stdout, "{}", r.line_number).ok();
-
-        // separator
-        stdout
-            .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)))
-            .ok();
-        write!(stdout, ":").ok();
-
-        // line content with match highlighted in red bold
-        stdout.reset().ok();
-        let line = &r.line;
-        if !pattern.is_empty() {
-            let match_pos = line.find(pattern).or_else(|| {
-                // Case-insensitive fallback
-                let lower_line = line.to_lowercase();
-                let lower_pattern = pattern.to_lowercase();
-                lower_line.find(&lower_pattern)
-            });
-
-            if let Some(pos) = match_pos {
-                let match_len = pattern.len();
-                write!(stdout, "{}", &line[..pos]).ok();
-                stdout
-                    .set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))
-                    .ok();
-                write!(stdout, "{}", &line[pos..pos + match_len]).ok();
-                stdout.reset().ok();
-                write!(stdout, "{}", &line[pos + match_len..]).ok();
-            } else {
-                write!(stdout, "{}", line).ok();
-            }
-        } else {
-            write!(stdout, "{}", line).ok();
-        }
-        writeln!(stdout).ok();
-    }
-    stdout.reset().ok();
 }
 
 /// JSON形式で出力
@@ -286,23 +224,6 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 2);
         assert_eq!(parsed[1]["file"], "b.rs");
-    }
-
-    #[test]
-    fn test_print_results_color_no_panic() {
-        // カラー出力がパニックしないことを確認
-        let results = vec![
-            SearchResult {
-                file: "src/main.rs".to_string(),
-                line_number: 5,
-                line: "fn hello_world() {}".to_string(),
-            },
-        ];
-        // Should not panic
-        print_results_color(&results, "hello");
-        print_results_color(&results, "notfound");
-        print_results_color(&results, "");
-        print_results_color(&[], "pattern");
     }
 
     #[test]
