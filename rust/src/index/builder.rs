@@ -1,19 +1,18 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 
 use crate::index::format::*;
 use crate::trigram;
 
 pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
-    // Phase 1: ファイル走査 & trigram抽出
-    let mut files: Vec<(String, u64, u64, u64)> = Vec::new(); // (relative_path, mtime, size, hash)
-    let mut trigram_to_files: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
-
+    // Phase 1: ファイルパス収集 (逐次、高速)
+    let mut file_paths: Vec<PathBuf> = Vec::new();
     for entry in WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
@@ -29,34 +28,58 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
         if entry.file_type().map_or(true, |ft| !ft.is_file()) {
             continue;
         }
-        let path = entry.path();
-        let relative = path.strip_prefix(root)?.to_string_lossy().to_string();
+        file_paths.push(entry.path().to_path_buf());
+    }
 
-        let content = match fs::read(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+    // Phase 2: ファイル読み込み & trigram抽出 (rayon並列)
+    struct FileData {
+        relative_path: String,
+        mtime: u64,
+        size: u64,
+        content_hash: u64,
+        trigrams: Vec<[u8; 3]>,
+    }
 
-        // バイナリファイルスキップ (NULバイト検出)
-        if memchr::memchr(0, &content).is_some() {
-            continue;
-        }
+    let file_data: Vec<FileData> = file_paths
+        .par_iter()
+        .filter_map(|path| {
+            let content = fs::read(path).ok()?;
 
-        let meta = entry.metadata()?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let size = meta.len();
-        let hash = xxhash_rust::xxh64::xxh64(&content, 0);
+            // バイナリファイルスキップ (NULバイト検出)
+            if memchr::memchr(0, &content).is_some() {
+                return None;
+            }
 
+            let relative = path.strip_prefix(root).ok()?.to_string_lossy().to_string();
+            let meta = fs::metadata(path).ok()?;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let size = meta.len();
+            let hash = xxhash_rust::xxh64::xxh64(&content, 0);
+            let trigrams = trigram::extract_trigrams(&content);
+
+            Some(FileData {
+                relative_path: relative,
+                mtime,
+                size,
+                content_hash: hash,
+                trigrams,
+            })
+        })
+        .collect();
+
+    // Phase 3: trigram -> file_id マッピング構築 (逐次)
+    let mut files: Vec<(String, u64, u64, u64)> = Vec::with_capacity(file_data.len());
+    let mut trigram_to_files: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
+
+    for fd in file_data {
         let file_id = files.len() as u32;
-        files.push((relative, mtime, size, hash));
-
-        let trigrams = trigram::extract_trigrams(&content);
-        for t in trigrams {
+        files.push((fd.relative_path, fd.mtime, fd.size, fd.content_hash));
+        for t in fd.trigrams {
             trigram_to_files.entry(t).or_default().push(file_id);
         }
     }
