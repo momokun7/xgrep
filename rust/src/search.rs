@@ -27,7 +27,11 @@ pub fn search(
     let pattern_bytes = search_pattern.as_bytes();
     let trigrams = trigram::extract_trigrams(pattern_bytes);
 
-    let candidate_ids: Vec<u32> = if trigrams.is_empty() {
+    let candidate_ids: Vec<u32> = if case_insensitive {
+        // case-insensitive: trigramインデックスは大文字小文字を区別して構築されているため
+        // 正確なフィルタリングができない。全ファイルスキャンにフォールバック
+        (0..reader.file_count()).collect()
+    } else if trigrams.is_empty() {
         if pattern_bytes.len() == 2 {
             // 2文字パターン: プレフィックスに一致する全trigramのunionで候補を絞る
             let prefix = [pattern_bytes[0], pattern_bytes[1]];
@@ -45,25 +49,20 @@ pub fn search(
     } else {
         let posting_lists: Vec<Vec<u32>> =
             trigrams.iter().map(|t| reader.lookup_trigram(*t)).collect();
-        // case-insensitive時、lowercase trigramでポスティングが空なら全ファイルスキャンにフォールバック
-        if case_insensitive && posting_lists.iter().any(|l| l.is_empty()) {
-            (0..reader.file_count()).collect()
-        } else {
-            let refs: Vec<&[u32]> = posting_lists.iter().map(|v| v.as_slice()).collect();
-            intersect_postings(&refs)
-        }
+        let refs: Vec<&[u32]> = posting_lists.iter().map(|v| v.as_slice()).collect();
+        intersect_postings(&refs)
     };
 
     let mut results: Vec<SearchResult> = candidate_ids
         .par_iter()
         .flat_map(|&file_id| {
             let rel_path = reader.file_path(file_id);
-            let full_path_str = format!("{}/{}", root.display(), rel_path);
+            let full_path = root.join(rel_path);
 
-            let content = match fs::read(&full_path_str) {
+            let content = match fs::read(&full_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("xgrep: {}: {}", full_path_str, e);
+                    eprintln!("xgrep: {}: {}", full_path.display(), e);
                     return vec![];
                 }
             };
@@ -238,11 +237,11 @@ pub fn search_regex(
         .par_iter()
         .flat_map(|&file_id| {
             let rel_path = reader.file_path(file_id);
-            let full_path = format!("{}/{}", root.display(), rel_path);
+            let full_path = root.join(rel_path);
             let content_bytes = match std::fs::read(&full_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("xgrep: {}: {}", full_path, e);
+                    eprintln!("xgrep: {}: {}", full_path.display(), e);
                     return vec![];
                 }
             };

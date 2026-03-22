@@ -73,14 +73,22 @@ pub fn print_results_color(results: &[SearchResult], pattern: &str) {
         stdout.reset().ok();
         let line = &r.line;
         if !pattern.is_empty() {
-            if let Some(pos) = line.find(pattern) {
+            let match_pos = line.find(pattern).or_else(|| {
+                // Case-insensitive fallback
+                let lower_line = line.to_lowercase();
+                let lower_pattern = pattern.to_lowercase();
+                lower_line.find(&lower_pattern)
+            });
+
+            if let Some(pos) = match_pos {
+                let match_len = pattern.len();
                 write!(stdout, "{}", &line[..pos]).ok();
                 stdout
                     .set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))
                     .ok();
-                write!(stdout, "{}", &line[pos..pos + pattern.len()]).ok();
+                write!(stdout, "{}", &line[pos..pos + match_len]).ok();
                 stdout.reset().ok();
-                write!(stdout, "{}", &line[pos + pattern.len()..]).ok();
+                write!(stdout, "{}", &line[pos + match_len..]).ok();
             } else {
                 write!(stdout, "{}", line).ok();
             }

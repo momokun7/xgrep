@@ -49,10 +49,6 @@ struct Cli {
     #[arg(long = "type", short = 't')]
     file_type: Option<String>,
 
-    /// Show line numbers (default: on)
-    #[arg(short = 'n')]
-    line_numbers: bool,
-
     /// Only print count of matching lines per file
     #[arg(short = 'c')]
     count: bool,
@@ -99,7 +95,14 @@ fn index_path(local: bool) -> Result<PathBuf> {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {}", e);
+        std::process::exit(2);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let cwd = env::current_dir()?;
 
@@ -121,6 +124,15 @@ fn main() -> Result<()> {
             );
         }
         None => {
+            if cli.json_output && cli.format != "default" {
+                eprintln!("error: --json cannot be combined with --format");
+                std::process::exit(2);
+            }
+            if (cli.count as u8 + cli.files_only as u8 + cli.json_output as u8) > 1 {
+                eprintln!("error: -c, -l, and --json are mutually exclusive");
+                std::process::exit(2);
+            }
+
             let pattern = cli.pattern.unwrap_or_else(|| {
                 eprintln!("Usage: xgrep <pattern> or xgrep init");
                 std::process::exit(1);
