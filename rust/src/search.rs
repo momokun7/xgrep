@@ -19,8 +19,20 @@ pub fn search(reader: &IndexReader, root: &Path, pattern: &str, case_insensitive
     let trigrams = trigram::extract_trigrams(pattern_bytes);
 
     let candidate_ids: Vec<u32> = if trigrams.is_empty() {
-        // 3文字未満 → 全ファイルスキャン
-        (0..reader.file_count()).collect()
+        if pattern_bytes.len() == 2 {
+            // 2文字パターン: プレフィックスに一致する全trigramのunionで候補を絞る
+            let prefix = [pattern_bytes[0], pattern_bytes[1]];
+            let candidates = reader.lookup_trigram_prefix(prefix);
+            // 候補が空（プレフィックスに一致するtrigramが存在しない）なら全スキャン
+            if candidates.is_empty() {
+                (0..reader.file_count()).collect()
+            } else {
+                candidates
+            }
+        } else {
+            // 0-1文字パターン: 全ファイルスキャン
+            (0..reader.file_count()).collect()
+        }
     } else {
         let posting_lists: Vec<Vec<u32>> = trigrams
             .iter()
@@ -362,6 +374,43 @@ mod tests {
         let reader = IndexReader::open(&index_path).unwrap();
         let results = search(&reader, root, "ok", false).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_2char_prefix_optimization() {
+        // 2文字パターン "fn" はtrigramプレフィックス検索で候補を絞れることを確認
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // "fn" を含むファイルと含まないファイルを用意
+        fs::write(root.join("has_fn.rs"), "fn hello() {}\nfn world() {}").unwrap();
+        fs::write(root.join("no_match.txt"), "xyz abc def ghi jkl").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        let results = search(&reader, root, "fn", false).unwrap();
+        // "fn" を含む行が2行ヒットすること
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.file.contains("has_fn.rs")));
+    }
+
+    #[test]
+    fn test_lookup_trigram_prefix_returns_subset() {
+        // lookup_trigram_prefix が全ファイル数より少ない候補を返すことを確認
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn hello() {}").unwrap();
+        fs::write(root.join("b.txt"), "xyz abc").unwrap();
+        fs::write(root.join("c.txt"), "qrs tuv").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        // "fn" プレフィックスにヒットする候補はa.rsのみのはず
+        let candidates = reader.lookup_trigram_prefix(*b"fn");
+        assert!(!candidates.is_empty());
+        // 全ファイル数(3)より少ないこと（プレフィックスで絞り込めていること）
+        assert!(candidates.len() < reader.file_count() as usize);
     }
 
     #[test]
