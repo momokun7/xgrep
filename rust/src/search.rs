@@ -479,4 +479,179 @@ mod tests {
         let results = search_regex(&reader, root, "handleauth", true).unwrap();
         assert_eq!(results.len(), 1);
     }
+
+    #[test]
+    fn test_search_empty_pattern() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // Empty pattern should match every line (same as grep "")
+        let results = search(&reader, root, "", false).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_pattern_longer_than_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hi").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let results = search(&reader, root, "this is much longer than the file content", false).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_search_multiple_matches_same_line() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "foo bar foo baz foo").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // Should return the line once (not 3 times)
+        let results = search(&reader, root, "foo", false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].line_number, 1);
+    }
+
+    #[test]
+    fn test_search_multiline_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "line1\nline2\nline3\nline4\nline5").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let results = search(&reader, root, "line3", false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].line_number, 3);
+    }
+
+    #[test]
+    fn test_search_special_characters() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "price is $100.00\nanother line").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // Fixed string search: $ and . are literal
+        let results = search(&reader, root, "$100.00", false).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_regex_invalid_pattern() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // Invalid regex should return error
+        let result = search_regex(&reader, root, "[invalid", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_search_regex_empty_match() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello\nworld").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // .* matches everything
+        let results = search_regex(&reader, root, ".*", false).unwrap();
+        assert_eq!(results.len(), 2); // both lines match
+    }
+
+    #[test]
+    fn test_search_deleted_file_after_index() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+        fs::write(root.join("b.txt"), "hello earth").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        // Delete a file after indexing
+        fs::remove_file(root.join("a.txt")).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // Should still work, just skip the deleted file
+        let results = search(&reader, root, "hello", false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].file.contains("b.txt"));
+    }
+
+    #[test]
+    fn test_search_utf8_pattern() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "this has some Japanese: テスト\nand more: テスト2").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let results = search(&reader, root, "テスト", false).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_case_insensitive_fallback_all_uppercase() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "THIS IS UPPERCASE\nlowercase here").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // All-uppercase pattern with -i: trigrams may not be in index
+        // Should fallback to full scan and still find the match
+        let results = search(&reader, root, "THIS IS UPPERCASE", true).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_files_nonexistent_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![PathBuf::from("nonexistent.txt")];
+        // Should not panic, just return empty
+        let results = search_files(root, &files, "hello", false).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_search_files_empty_list() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let files: Vec<PathBuf> = vec![];
+        let results = search_files(root, &files, "hello", false).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_intersect_postings_all_same() {
+        let a = vec![1, 2, 3, 4, 5];
+        let b = vec![1, 2, 3, 4, 5];
+        let result = intersect_postings(&[&a, &b]);
+        assert_eq!(result, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_intersect_postings_no_overlap() {
+        let a = vec![1, 3, 5];
+        let b = vec![2, 4, 6];
+        let result = intersect_postings(&[&a, &b]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_intersect_postings_empty_input() {
+        let result = intersect_postings(&[]);
+        assert!(result.is_empty());
+    }
 }
