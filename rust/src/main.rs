@@ -169,7 +169,7 @@ fn run() -> Result<()> {
                 let output_str = match cli.format.as_str() {
                     "llm" => {
                         let ctx = cli.context.unwrap_or(3);
-                        output::format_llm(&results, &cwd, ctx)?
+                        output::format_llm(&results, &cwd, ctx, None)?
                     }
                     _ => {
                         if let Some(ctx) = cli.context {
