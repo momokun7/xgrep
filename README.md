@@ -103,6 +103,31 @@ fn handle_auth(req: Request) -> Response {
 ```
 ````
 
+### Regex Performance Notes
+
+xgrep extracts trigram literals from regex patterns to narrow search candidates before full regex matching. This works well for patterns with literal substrings but falls back to full scan for purely abstract patterns.
+
+**Fast (trigram-optimized):**
+
+| Pattern | Why | Trigrams extracted |
+|---------|-----|--------------------|
+| `handle_\w+` | Literal prefix "handle_" | `han`, `and`, `ndl`, `dle`, `le_` |
+| `fn\s+main` | Literal parts "fn" and "main" | `mai`, `ain` |
+| `error.*timeout` | Literals "error" and "timeout" | Both sets |
+
+**Slow (full scan fallback):**
+
+| Pattern | Why |
+|---------|-----|
+| `.*` | No literals |
+| `[a-z]+` | Only character classes |
+| `\d{3}-\d{4}` | No literal strings |
+| `.+error` | Leading `.+` prevents extraction |
+
+For patterns that fall back to full scan, xgrep will show a warning: `warning: regex cannot be optimized with trigram index (full scan)`.
+
+**Tip:** Include at least 3 literal characters in your regex for best performance. `handle_\w+` is much faster than `\w+_auth`.
+
 ### Git Integration
 
 ```bash
