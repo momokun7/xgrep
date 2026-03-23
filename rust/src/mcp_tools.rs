@@ -38,6 +38,10 @@ pub fn tools_list() -> Vec<Value> {
                     "context_lines": {
                         "type": "integer",
                         "description": "Number of context lines around each match (default: 3)"
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "description": "Maximum output tokens (default: 4000 for MCP, unlimited for CLI)"
                     }
                 },
                 "required": ["pattern"]
@@ -99,6 +103,11 @@ pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
         .get("context_lines")
         .and_then(|v| v.as_u64())
         .unwrap_or(3) as usize;
+    let max_tokens = params
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(4000);
 
     let opts = SearchOptions {
         case_insensitive: params
@@ -129,8 +138,16 @@ pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
                 files.dedup();
                 files.len()
             };
-            let header = format!("Found {} matches in {} files\n\n", results.len(), file_count);
-            match output::format_llm(&results, xg.root(), context_lines, None) {
+            let total = results.len();
+            let header = if total == max_results {
+                format!(
+                    "Found {}+ matches in {} files (limited to {})\n\n",
+                    total, file_count, max_results
+                )
+            } else {
+                format!("Found {} matches in {} files\n\n", total, file_count)
+            };
+            match output::format_llm(&results, xg.root(), context_lines, Some(max_tokens)) {
                 Ok(body) => (format!("{}{}", header, body), false),
                 Err(e) => (format!("Format error: {}", e), true),
             }
@@ -346,6 +363,58 @@ mod tests {
         let (output, is_error) = handle_search(&xg, &params);
         assert!(is_error);
         assert!(output.contains("Missing required parameter: pattern"));
+    }
+
+    #[test]
+    fn test_handle_search_with_max_tokens() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // git init
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        fs::write(root.join(".gitignore"), ".xgrep/\n").unwrap();
+        // Create file with many matches
+        let content: String = (1..=30)
+            .map(|i| format!("fn handler_{i}() {{}}\n"))
+            .collect();
+        fs::write(root.join("a.rs"), &content).unwrap();
+
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+
+        // Very low token limit should truncate
+        let params = serde_json::json!({"pattern": "handler", "max_tokens": 100});
+        let (text, is_error) = handle_search(&xg, &params);
+        assert!(!is_error);
+        assert!(text.contains("handler"));
+        // With 100 tokens, output should be truncated
+        assert!(text.contains("truncated") || text.len() < 1000);
     }
 
     #[test]
