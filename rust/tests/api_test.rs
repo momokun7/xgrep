@@ -129,6 +129,27 @@ fn test_search_result_debug_clone() {
 }
 
 #[test]
+fn test_search_path_pattern() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src/auth")).unwrap();
+    fs::create_dir_all(root.join("src/db")).unwrap();
+    fs::write(root.join("src/auth/handler.rs"), "fn handle_auth() {}").unwrap();
+    fs::write(root.join("src/db/query.rs"), "fn handle_query() {}").unwrap();
+
+    let xg = Xgrep::open(root).unwrap();
+    xg.build_index().unwrap();
+
+    let opts = SearchOptions {
+        path_pattern: Some("auth".to_string()),
+        ..Default::default()
+    };
+    let results = xg.search("handle", &opts).unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].file.contains("auth"));
+}
+
+#[test]
 fn test_accessors() {
     let dir = tempdir().unwrap();
     let root = dir.path();
