@@ -54,7 +54,12 @@ pub fn format_json(results: &[SearchResult]) -> String {
 }
 
 /// LLM向けMarkdownコードブロック形式で出力（コンテキスト行付き）
-pub fn format_llm(results: &[SearchResult], root: &Path, context_lines: usize) -> Result<String> {
+pub fn format_llm(
+    results: &[SearchResult],
+    root: &Path,
+    context_lines: usize,
+    max_tokens: Option<usize>,
+) -> Result<String> {
     if results.is_empty() {
         return Ok(String::new());
     }
@@ -67,6 +72,8 @@ pub fn format_llm(results: &[SearchResult], root: &Path, context_lines: usize) -
 
     let mut output = String::new();
     let mut first_block = true;
+    let mut files_shown = 0;
+    let total_files = by_file.len();
 
     for (file, line_numbers) in &by_file {
         let full_path = root.join(file);
@@ -115,6 +122,27 @@ pub fn format_llm(results: &[SearchResult], root: &Path, context_lines: usize) -
                 }
             }
             output.push_str("```\n");
+        }
+
+        files_shown += 1;
+
+        // Check token limit after each file
+        if let Some(max) = max_tokens {
+            if output.len() / 4 >= max {
+                let remaining_files = total_files - files_shown;
+                let remaining_matches: usize = by_file
+                    .iter()
+                    .skip(files_shown)
+                    .map(|(_, lines)| lines.len())
+                    .sum();
+                if remaining_files > 0 || remaining_matches > 0 {
+                    output.push_str(&format!(
+                        "\n... (truncated, {} more matches in {} more files)\n",
+                        remaining_matches, remaining_files
+                    ));
+                }
+                break;
+            }
         }
     }
 
@@ -282,7 +310,7 @@ mod tests {
             line_number: 3,
             line: "fn hello() {}".to_string(),
         }];
-        let output = format_llm(&results, root, 2).unwrap();
+        let output = format_llm(&results, root, 2, None).unwrap();
         assert!(output.contains("## test.rs:"));
         assert!(output.contains("```rust"));
         assert!(output.contains("fn hello() {}"));
@@ -307,7 +335,7 @@ mod tests {
                 line: "l5".to_string(),
             },
         ];
-        let output = format_llm(&results, root, 1).unwrap();
+        let output = format_llm(&results, root, 1, None).unwrap();
         let block_count = output.matches("```rust").count();
         assert_eq!(block_count, 1); // merged into one block
     }
@@ -341,7 +369,7 @@ mod tests {
     #[test]
     fn test_format_llm_empty() {
         let dir = tempdir().unwrap();
-        let output = format_llm(&[], dir.path(), 3).unwrap();
+        let output = format_llm(&[], dir.path(), 3, None).unwrap();
         assert_eq!(output, "");
     }
 
@@ -355,7 +383,7 @@ mod tests {
             line_number: 2,
             line: "\techo hello".to_string(),
         }];
-        let output = format_llm(&results, root, 1).unwrap();
+        let output = format_llm(&results, root, 1, None).unwrap();
         // No extension = empty language
         assert!(output.contains("```\n")); // no language after ```
         assert!(output.contains("echo hello"));
@@ -371,7 +399,7 @@ mod tests {
             line_number: 3,
             line: "line3".to_string(),
         }];
-        let output = format_llm(&results, root, 0).unwrap();
+        let output = format_llm(&results, root, 0, None).unwrap();
         assert!(output.contains("line3"));
         assert!(!output.contains("line2")); // no context
         assert!(!output.contains("line4"));
@@ -382,5 +410,50 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = format_default_context(&[], dir.path(), 3).unwrap();
         assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_format_llm_max_tokens() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // Create multiple files so truncation can kick in between files
+        let content: String = (1..=20).map(|i| format!("line number {}\n", i)).collect();
+        fs::write(root.join("a.rs"), &content).unwrap();
+        fs::write(root.join("b.rs"), &content).unwrap();
+        fs::write(root.join("c.rs"), &content).unwrap();
+
+        let mut results: Vec<SearchResult> = Vec::new();
+        for file in &["a.rs", "b.rs", "c.rs"] {
+            for i in (2..=10).step_by(2) {
+                results.push(SearchResult {
+                    file: file.to_string(),
+                    line_number: i,
+                    line: format!("line number {}", i),
+                });
+            }
+        }
+
+        // With very low token limit, should truncate after first file
+        let output = format_llm(&results, root, 1, Some(50)).unwrap();
+        assert!(output.contains("truncated"));
+        assert!(output.contains("more matches"));
+        assert!(output.contains("more files"));
+    }
+
+    #[test]
+    fn test_format_llm_no_token_limit() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "line1\nline2\nline3").unwrap();
+
+        let results = vec![SearchResult {
+            file: "a.rs".to_string(),
+            line_number: 2,
+            line: "line2".to_string(),
+        }];
+
+        let output = format_llm(&results, root, 1, None).unwrap();
+        assert!(!output.contains("truncated"));
+        assert!(output.contains("line2"));
     }
 }
