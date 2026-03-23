@@ -204,7 +204,9 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
     } else {
         let mut files: Vec<PathBuf> = changed.into_iter().collect();
         files.sort();
-        Ok(IndexStatus::Stale { changed_files: files })
+        Ok(IndexStatus::Stale {
+            changed_files: files,
+        })
     }
 }
 
@@ -417,8 +419,16 @@ mod tests {
         let root = dir.path();
         init_git_repo(root);
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
 
         let index_path = root.join("test.xgrep");
         ensure_fresh_index(root, &index_path).unwrap();
@@ -441,8 +451,16 @@ mod tests {
         let root = dir.path();
         init_git_repo(root);
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
 
         let index_path = root.join("test.xgrep");
         ensure_fresh_index(root, &index_path).unwrap();
@@ -461,12 +479,18 @@ mod tests {
 
     #[test]
     fn test_parse_status_path_simple() {
-        assert_eq!(parse_status_path(" M hello.txt"), Some("hello.txt".to_string()));
+        assert_eq!(
+            parse_status_path(" M hello.txt"),
+            Some("hello.txt".to_string())
+        );
     }
 
     #[test]
     fn test_parse_status_path_rename() {
-        assert_eq!(parse_status_path("R  old.txt -> new.txt"), Some("new.txt".to_string()));
+        assert_eq!(
+            parse_status_path("R  old.txt -> new.txt"),
+            Some("new.txt".to_string())
+        );
     }
 
     #[test]
@@ -489,8 +513,16 @@ mod tests {
         init_git_repo(root);
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
 
         let index_path = root.join("test.xgrep");
         ensure_fresh_index(root, &index_path).unwrap();
@@ -506,8 +538,16 @@ mod tests {
         init_git_repo(root);
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
 
         let index_path = root.join("test.xgrep");
         ensure_fresh_index(root, &index_path).unwrap();
@@ -541,8 +581,16 @@ mod tests {
         init_git_repo(root);
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
 
         let index_path = root.join("test.xgrep");
         ensure_fresh_index(root, &index_path).unwrap();
@@ -553,7 +601,9 @@ mod tests {
         let status = check_index_status(root, &index_path).unwrap();
         match status {
             IndexStatus::Stale { changed_files } => {
-                assert!(changed_files.iter().any(|p| p.to_string_lossy().contains("new_file.txt")));
+                assert!(changed_files
+                    .iter()
+                    .any(|p| p.to_string_lossy().contains("new_file.txt")));
             }
             other => panic!("expected Stale, got {:?}", other),
         }
@@ -566,16 +616,32 @@ mod tests {
         init_git_repo(root);
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(root).output().unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
 
         let index_path = root.join("test.xgrep");
         ensure_fresh_index(root, &index_path).unwrap();
 
         // 新しいコミット
         fs::write(root.join("new_file.txt"), "new content").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(root).output().unwrap();
-        Command::new("git").args(["commit", "-m", "add file"]).current_dir(root).output().unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add file"])
+            .current_dir(root)
+            .output()
+            .unwrap();
 
         let status = check_index_status(root, &index_path).unwrap();
         match status {

@@ -173,11 +173,8 @@ impl Xgrep {
 
                 // マージしてソート、重複除去
                 index_results.extend(direct_results);
-                index_results.sort_by(|a, b| {
-                    a.file
-                        .cmp(&b.file)
-                        .then(a.line_number.cmp(&b.line_number))
-                });
+                index_results
+                    .sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
                 index_results.dedup_by(|a, b| a.file == b.file && a.line_number == b.line_number);
                 Ok(index_results)
             }

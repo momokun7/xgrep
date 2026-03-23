@@ -49,12 +49,19 @@ fn test_search_auto_builds_index() {
 fn test_search_regex_via_api() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-    fs::write(root.join("a.rs"), "fn handle_auth() {}\nfn handle_user() {}").unwrap();
+    fs::write(
+        root.join("a.rs"),
+        "fn handle_auth() {}\nfn handle_user() {}",
+    )
+    .unwrap();
 
     let xg = Xgrep::open(root).unwrap();
     xg.build_index().unwrap();
 
-    let opts = SearchOptions { regex: true, ..Default::default() };
+    let opts = SearchOptions {
+        regex: true,
+        ..Default::default()
+    };
     let results = xg.search("handle_\\w+", &opts).unwrap();
     assert_eq!(results.len(), 2);
 }
@@ -68,7 +75,10 @@ fn test_search_case_insensitive_via_api() {
     let xg = Xgrep::open(root).unwrap();
     xg.build_index().unwrap();
 
-    let opts = SearchOptions { case_insensitive: true, ..Default::default() };
+    let opts = SearchOptions {
+        case_insensitive: true,
+        ..Default::default()
+    };
     let results = xg.search("handleauth", &opts).unwrap();
     assert_eq!(results.len(), 1);
 }
@@ -83,7 +93,10 @@ fn test_search_file_type_filter() {
     let xg = Xgrep::open(root).unwrap();
     xg.build_index().unwrap();
 
-    let opts = SearchOptions { file_type: Some("rs".to_string()), ..Default::default() };
+    let opts = SearchOptions {
+        file_type: Some("rs".to_string()),
+        ..Default::default()
+    };
     let results = xg.search("hello", &opts).unwrap();
     assert_eq!(results.len(), 1);
     assert!(results[0].file.contains(".rs"));
@@ -98,7 +111,10 @@ fn test_search_max_count() {
     let xg = Xgrep::open(root).unwrap();
     xg.build_index().unwrap();
 
-    let opts = SearchOptions { max_count: Some(2), ..Default::default() };
+    let opts = SearchOptions {
+        max_count: Some(2),
+        ..Default::default()
+    };
     let results = xg.search("hello", &opts).unwrap();
     assert_eq!(results.len(), 2);
 }
@@ -112,7 +128,10 @@ fn test_search_changed_requires_git() {
     let xg = Xgrep::open(root).unwrap();
     xg.build_index().unwrap();
 
-    let opts = SearchOptions { changed_only: true, ..Default::default() };
+    let opts = SearchOptions {
+        changed_only: true,
+        ..Default::default()
+    };
     let result = xg.search("hello", &opts);
     assert!(result.is_err());
 }

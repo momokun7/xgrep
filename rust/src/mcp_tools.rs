@@ -276,10 +276,7 @@ mod tests {
         let tools = tools_list();
         assert_eq!(tools.len(), 4);
 
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"search"));
         assert!(names.contains(&"find_definitions"));
         assert!(names.contains(&"index_status"));
@@ -308,8 +305,16 @@ mod tests {
             .unwrap();
 
         fs::write(root.join(".gitignore"), ".xgrep/\n").unwrap();
-        fs::write(root.join("hello.rs"), "fn hello() {\n    println!(\"hello\");\n}\n\nstruct Foo {\n    x: i32,\n}\n").unwrap();
-        fs::write(root.join("world.py"), "def world():\n    print(\"world\")\n\nclass Bar:\n    pass\n").unwrap();
+        fs::write(
+            root.join("hello.rs"),
+            "fn hello() {\n    println!(\"hello\");\n}\n\nstruct Foo {\n    x: i32,\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("world.py"),
+            "def world():\n    print(\"world\")\n\nclass Bar:\n    pass\n",
+        )
+        .unwrap();
 
         std::process::Command::new("git")
             .args(["add", "."])

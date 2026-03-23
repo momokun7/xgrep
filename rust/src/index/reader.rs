@@ -82,7 +82,8 @@ impl IndexReader {
         if string_pool_start > mmap.len() {
             bail!(
                 "Index file is truncated or corrupt (expected at least {} bytes, got {})",
-                string_pool_start, mmap.len()
+                string_pool_start,
+                mmap.len()
             );
         }
 
