@@ -56,7 +56,6 @@ fn current_commit_hash(root: &Path) -> Option<String> {
 }
 
 /// ディレクトリ内の最新ファイルのmtimeを取得（UNIX epoch秒）
-#[allow(dead_code)]
 fn newest_file_mtime(root: &Path) -> Option<u64> {
     let mut newest = 0u64;
     for entry in WalkBuilder::new(root).build().flatten() {
