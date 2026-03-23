@@ -16,6 +16,9 @@
 pub mod filetype;
 pub mod git;
 pub mod index;
+pub mod mcp;
+pub mod mcp_server;
+pub mod mcp_tools;
 pub mod output;
 pub mod search;
 pub mod trigram;
@@ -38,6 +41,7 @@ pub struct SearchOptions {
     pub max_count: Option<usize>,
     pub changed_only: bool,
     pub since: Option<String>,
+    pub path_pattern: Option<String>,
 }
 
 /// 検索エンジンのメインエントリポイント。
@@ -105,6 +109,11 @@ impl Xgrep {
             } else {
                 eprintln!("warning: unknown file type '{}', showing all results", ft);
             }
+        }
+
+        // path_pattern filter
+        if let Some(ref pp) = opts.path_pattern {
+            results.retain(|r| r.file.contains(pp));
         }
 
         // max_count
