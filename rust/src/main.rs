@@ -69,6 +69,12 @@ enum Commands {
         #[arg(long)]
         local: bool,
     },
+    /// Start MCP server (stdio transport)
+    Serve {
+        /// Root directory to search (default: current directory)
+        #[arg(long)]
+        root: Option<String>,
+    },
 }
 
 fn main() {
@@ -103,6 +109,11 @@ fn run() -> Result<()> {
                 meta.len(),
                 start.elapsed().as_secs_f64()
             );
+        }
+        Some(Commands::Serve { root }) => {
+            let root_path = root.map(std::path::PathBuf::from).unwrap_or(cwd);
+            let xg = Xgrep::open(&root_path)?;
+            xgrep::mcp_server::start(xg);
         }
         None => {
             if cli.json_output && cli.format != "default" {
