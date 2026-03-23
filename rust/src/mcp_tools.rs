@@ -130,7 +130,7 @@ pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
                 files.len()
             };
             let header = format!("Found {} matches in {} files\n\n", results.len(), file_count);
-            match output::format_llm(&results, xg.root(), context_lines) {
+            match output::format_llm(&results, xg.root(), context_lines, None) {
                 Ok(body) => (format!("{}{}", header, body), false),
                 Err(e) => (format!("Format error: {}", e), true),
             }
@@ -176,7 +176,7 @@ pub fn handle_find_definitions(xg: &Xgrep, params: &Value) -> (String, bool) {
                 symbol,
                 file_count
             );
-            match output::format_llm(&results, xg.root(), 3) {
+            match output::format_llm(&results, xg.root(), 3, None) {
                 Ok(body) => (format!("{}{}", header, body), false),
                 Err(e) => (format!("Format error: {}", e), true),
             }
