@@ -8,6 +8,7 @@ use regex::RegexBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone)]
 pub struct SearchResult {
     pub file: String,
     pub line_number: usize,
