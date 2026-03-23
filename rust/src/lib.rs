@@ -1,3 +1,18 @@
+//! trigram逆引きインデックスによる高速コード検索エンジン。
+//!
+//! # Example
+//!
+//! ```no_run
+//! use xgrep::{Xgrep, SearchOptions};
+//!
+//! let xg = Xgrep::open(".").unwrap();
+//! xg.build_index().unwrap();
+//! let results = xg.search("fn main", &SearchOptions::default()).unwrap();
+//! for r in &results {
+//!     println!("{}:{}: {}", r.file, r.line_number, r.line);
+//! }
+//! ```
+
 pub mod filetype;
 pub mod git;
 pub mod index;
@@ -35,7 +50,7 @@ pub struct Xgrep {
 }
 
 impl Xgrep {
-    /// ディレクトリを開く。インデックスパスは自動解決（.xgrep/index → ~/.cache/xgrep/<hash>/index）
+    /// ディレクトリを開く。インデックスパスは自動解決（.xgrep/index → ~/.cache/xgrep/&lt;hash&gt;/index）
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = resolve_index_path(&root)?;
