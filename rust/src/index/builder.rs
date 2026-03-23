@@ -32,40 +32,60 @@ impl TrigramCache {
     pub fn load(path: &Path) -> Self {
         let data = match fs::read(path) {
             Ok(d) => d,
-            Err(_) => return Self { entries: HashMap::new() },
+            Err(_) => {
+                return Self {
+                    entries: HashMap::new(),
+                }
+            }
         };
         let mut entries = HashMap::new();
         let mut pos = 0;
         if data.len() < 4 {
             return Self { entries };
         }
-        let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
         for _ in 0..count {
-            if pos + 2 > data.len() { break; }
+            if pos + 2 > data.len() {
+                break;
+            }
             let path_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
-            if pos + path_len > data.len() { break; }
+            if pos + path_len > data.len() {
+                break;
+            }
             let path_str = match std::str::from_utf8(&data[pos..pos + path_len]) {
                 Ok(s) => s.to_string(),
                 Err(_) => break,
             };
             pos += path_len;
-            if pos + 20 > data.len() { break; }
+            if pos + 20 > data.len() {
+                break;
+            }
             let mtime = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
             let content_hash = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
             let trigram_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            if pos + trigram_count * 3 > data.len() { break; }
+            if pos + trigram_count * 3 > data.len() {
+                break;
+            }
             let mut trigrams = Vec::with_capacity(trigram_count);
             for _ in 0..trigram_count {
                 trigrams.push([data[pos], data[pos + 1], data[pos + 2]]);
                 pos += 3;
             }
-            entries.insert(path_str, CachedFile { mtime, content_hash, trigrams });
+            entries.insert(
+                path_str,
+                CachedFile {
+                    mtime,
+                    content_hash,
+                    trigrams,
+                },
+            );
         }
         Self { entries }
     }
@@ -88,7 +108,6 @@ impl TrigramCache {
         fs::write(path, &buf)?;
         Ok(())
     }
-
 }
 
 /// キャッシュファイルのパスを返す
@@ -100,10 +119,14 @@ pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
     build_index_with_cache(root, index_path, None)
 }
 
-pub fn build_index_with_cache(root: &Path, index_path: &Path, cache_path: Option<&Path>) -> Result<()> {
-    let mut cache = cache_path
-        .map(TrigramCache::load)
-        .unwrap_or(TrigramCache { entries: HashMap::new() });
+pub fn build_index_with_cache(
+    root: &Path,
+    index_path: &Path,
+    cache_path: Option<&Path>,
+) -> Result<()> {
+    let mut cache = cache_path.map(TrigramCache::load).unwrap_or(TrigramCache {
+        entries: HashMap::new(),
+    });
     let mut cache_hits = 0usize;
     let mut cache_misses = 0usize;
     // ============================================================
@@ -654,7 +677,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache_path = dir.path().join("test.cache");
 
-        let mut cache = TrigramCache { entries: HashMap::new() };
+        let mut cache = TrigramCache {
+            entries: HashMap::new(),
+        };
         cache.entries.insert(
             "hello.txt".to_string(),
             CachedFile {
@@ -774,7 +799,10 @@ mod tests {
 
         // "xyz"のtrigramが見つかることを検証
         let posting = reader2.lookup_trigram(*b"xyz");
-        assert!(!posting.is_empty(), "changed file content should be indexed");
+        assert!(
+            !posting.is_empty(),
+            "changed file content should be indexed"
+        );
     }
 
     #[test]

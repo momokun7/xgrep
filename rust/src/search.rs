@@ -57,8 +57,7 @@ pub fn search(
                 // バリアント全てが空のtrigramがある場合は全スキャンにフォールバック
                 (0..reader.file_count()).collect()
             } else {
-                let refs: Vec<&[u32]> =
-                    trigram_candidates.iter().map(|v| v.as_slice()).collect();
+                let refs: Vec<&[u32]> = trigram_candidates.iter().map(|v| v.as_slice()).collect();
                 intersect_postings(&refs)
             }
         }
@@ -385,17 +384,26 @@ fn expand_case_variants_query(query: trigram_query::TrigramQuery) -> trigram_que
 fn case_variants(trigram: [u8; 3]) -> Vec<[u8; 3]> {
     let cases: [Vec<u8>; 3] = [
         if trigram[0].is_ascii_alphabetic() {
-            vec![trigram[0].to_ascii_lowercase(), trigram[0].to_ascii_uppercase()]
+            vec![
+                trigram[0].to_ascii_lowercase(),
+                trigram[0].to_ascii_uppercase(),
+            ]
         } else {
             vec![trigram[0]]
         },
         if trigram[1].is_ascii_alphabetic() {
-            vec![trigram[1].to_ascii_lowercase(), trigram[1].to_ascii_uppercase()]
+            vec![
+                trigram[1].to_ascii_lowercase(),
+                trigram[1].to_ascii_uppercase(),
+            ]
         } else {
             vec![trigram[1]]
         },
         if trigram[2].is_ascii_alphabetic() {
-            vec![trigram[2].to_ascii_lowercase(), trigram[2].to_ascii_uppercase()]
+            vec![
+                trigram[2].to_ascii_lowercase(),
+                trigram[2].to_ascii_uppercase(),
+            ]
         } else {
             vec![trigram[2]]
         },
@@ -891,11 +899,7 @@ mod tests {
             )
             .unwrap();
         }
-        fs::write(
-            root.join("target.rs"),
-            "fn HandleAuth() {}\nfn other() {}",
-        )
-        .unwrap();
+        fs::write(root.join("target.rs"), "fn HandleAuth() {}\nfn other() {}").unwrap();
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();

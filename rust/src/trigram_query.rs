@@ -25,7 +25,7 @@ impl TrigramQuery {
                 for q in qs {
                     let q = q.simplify();
                     match q {
-                        TrigramQuery::All => {}                          // skip All in And
+                        TrigramQuery::All => {}                               // skip All in And
                         TrigramQuery::None => return TrigramQuery::None, // And with None = None
                         TrigramQuery::And(inner) => simplified.extend(inner), // flatten
                         other => simplified.push(other),
@@ -371,7 +371,8 @@ mod tests {
 
     #[test]
     fn test_simplify_or_with_all() {
-        let q = TrigramQuery::Or(vec![TrigramQuery::Trigram(*b"abc"), TrigramQuery::All]).simplify();
+        let q =
+            TrigramQuery::Or(vec![TrigramQuery::Trigram(*b"abc"), TrigramQuery::All]).simplify();
         assert!(matches!(q, TrigramQuery::All)); // Or with All = All
     }
 }

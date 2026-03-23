@@ -213,13 +213,11 @@ mod tests {
 
     #[test]
     fn test_format_json() {
-        let results = vec![
-            SearchResult {
-                file: "src/main.rs".to_string(),
-                line_number: 42,
-                line: "fn handle_auth() {}".to_string(),
-            },
-        ];
+        let results = vec![SearchResult {
+            file: "src/main.rs".to_string(),
+            line_number: 42,
+            line: "fn handle_auth() {}".to_string(),
+        }];
         let json = format_json(&results);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed[0]["file"], "src/main.rs");

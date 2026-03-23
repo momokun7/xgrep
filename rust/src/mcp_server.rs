@@ -37,7 +37,11 @@ pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
             Some(mcp::success_response(id, result))
         }
         "tools/call" => {
-            let tool_name = msg.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let tool_name = msg
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let arguments = msg
                 .params
                 .get("arguments")
@@ -174,10 +178,8 @@ mod tests {
     #[test]
     fn test_notification_returns_none() {
         let (_dir, xg) = setup_test_repo();
-        let msg = parse_message(
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-        )
-        .unwrap();
+        let msg =
+            parse_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).unwrap();
 
         let resp = handle_message(&xg, &msg);
         assert!(resp.is_none());
@@ -186,10 +188,9 @@ mod tests {
     #[test]
     fn test_unknown_method() {
         let (_dir, xg) = setup_test_repo();
-        let msg = parse_message(
-            r#"{"jsonrpc":"2.0","id":5,"method":"unknown/method","params":{}}"#,
-        )
-        .unwrap();
+        let msg =
+            parse_message(r#"{"jsonrpc":"2.0","id":5,"method":"unknown/method","params":{}}"#)
+                .unwrap();
 
         let resp = handle_message(&xg, &msg).unwrap();
         assert_eq!(resp["error"]["code"], -32601);
