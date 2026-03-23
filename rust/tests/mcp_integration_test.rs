@@ -121,7 +121,7 @@ fn test_mcp_build_index() {
     let status_text = responses[2]["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(status_text.contains("Index:"));
+    assert!(status_text.contains("Index path:"));
 }
 
 #[test]
