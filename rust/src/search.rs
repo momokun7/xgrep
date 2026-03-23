@@ -21,6 +21,14 @@ pub fn search(
     pattern: &str,
     case_insensitive: bool,
 ) -> Result<Vec<SearchResult>> {
+    let pattern_bytes = pattern.as_bytes();
+    if pattern_bytes.len() < 3 && !pattern_bytes.is_empty() {
+        eprintln!(
+            "xgrep: warning: pattern '{}' is shorter than 3 characters, index not used (full scan)",
+            pattern
+        );
+    }
+
     let search_pattern = if case_insensitive {
         pattern.to_lowercase()
     } else {
@@ -34,31 +42,39 @@ pub fn search(
             // パターンが3文字未満: 全ファイルスキャン（不可避）
             (0..reader.file_count()).collect()
         } else {
-            // Zoekt方式: 各trigramのケースバリアントを列挙してunion → trigram間でintersect
-            let mut trigram_candidates: Vec<Vec<u32>> = Vec::new();
-            let mut any_empty = false;
-
-            for t in &trigrams {
-                let variants = case_variants(*t);
-                let mut union_set = std::collections::BTreeSet::new();
-                for v in &variants {
-                    for fid in reader.lookup_trigram(*v) {
-                        union_set.insert(fid);
-                    }
-                }
-                if union_set.is_empty() {
-                    any_empty = true;
-                    break;
-                }
-                trigram_candidates.push(union_set.into_iter().collect());
-            }
-
-            if any_empty {
-                // バリアント全てが空のtrigramがある場合は全スキャンにフォールバック
+            // バリアント展開のコストを事前計算し、閾値超過なら全ファイルスキャンにフォールバック
+            let total_lookups: usize = trigrams.iter().map(|t| case_variants(*t).len()).sum();
+            if total_lookups > 64 {
+                // 全アルファベットの長いパターン等: posting list lookupが多すぎるため全スキャンが安い
                 (0..reader.file_count()).collect()
             } else {
-                let refs: Vec<&[u32]> = trigram_candidates.iter().map(|v| v.as_slice()).collect();
-                intersect_postings(&refs)
+                // Zoekt方式: 各trigramのケースバリアントを列挙してunion → trigram間でintersect
+                let mut trigram_candidates: Vec<Vec<u32>> = Vec::new();
+                let mut any_empty = false;
+
+                for t in &trigrams {
+                    let variants = case_variants(*t);
+                    let mut union_set = std::collections::BTreeSet::new();
+                    for v in &variants {
+                        for fid in reader.lookup_trigram(*v) {
+                            union_set.insert(fid);
+                        }
+                    }
+                    if union_set.is_empty() {
+                        any_empty = true;
+                        break;
+                    }
+                    trigram_candidates.push(union_set.into_iter().collect());
+                }
+
+                if any_empty {
+                    // バリアント全てが空のtrigramがある場合は全スキャンにフォールバック
+                    (0..reader.file_count()).collect()
+                } else {
+                    let refs: Vec<&[u32]> =
+                        trigram_candidates.iter().map(|v| v.as_slice()).collect();
+                    intersect_postings(&refs)
+                }
             }
         }
     } else if trigrams.is_empty() {
@@ -241,10 +257,22 @@ pub fn search_regex(
     let candidate_ids = if case_insensitive {
         // Case-insensitive: parse query, then expand each trigram into case variants
         let query = trigram_query::regex_to_query(pattern);
+        if query.is_all() {
+            eprintln!(
+                "xgrep: warning: regex '{}' cannot be optimized with trigram index (full scan)",
+                pattern
+            );
+        }
         let query = expand_case_variants_query(query);
         query.evaluate(reader)
     } else {
         let query = trigram_query::regex_to_query(pattern);
+        if query.is_all() {
+            eprintln!(
+                "xgrep: warning: regex '{}' cannot be optimized with trigram index (full scan)",
+                pattern
+            );
+        }
         query.evaluate(reader)
     };
 
@@ -907,5 +935,58 @@ mod tests {
         let results = search(&reader, root, "handleauth", true).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].line.contains("HandleAuth"));
+    }
+
+    #[test]
+    fn test_search_single_char_still_works() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "x marks the spot").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let results = search(&reader, root, "x", false).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_regex_dot_star_still_works() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // .* pattern can't use trigram index
+        let results = search_regex(&reader, root, ".*", false).unwrap();
+        assert!(results.len() >= 1);
+    }
+
+    #[test]
+    fn test_case_insensitive_long_pattern_fallback() {
+        // 長い全アルファベットパターンでバリアント展開が閾値を超える場合、
+        // フォールバックにより高速に完了することを確認
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("a.txt"),
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        )
+        .unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        // 長い全アルファベットパターン: フォールバックで高速に完了すべき
+        let start = std::time::Instant::now();
+        let results = search(&reader, root, "abcdefghijklmnop", true).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_secs() < 1,
+            "Case-insensitive search took too long: {:?}",
+            elapsed
+        );
+        assert_eq!(results.len(), 1);
     }
 }

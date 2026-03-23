@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use ignore::WalkBuilder;
 
 /// インデックスの鮮度チェック結果
 #[derive(Debug)]
@@ -49,6 +50,32 @@ fn current_commit_hash(root: &Path) -> Option<String> {
         .ok()?;
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// ディレクトリ内の最新ファイルのmtimeを取得（UNIX epoch秒）
+#[allow(dead_code)]
+fn newest_file_mtime(root: &Path) -> Option<u64> {
+    let mut newest = 0u64;
+    for entry in WalkBuilder::new(root).build().flatten() {
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    let secs = mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if secs > newest {
+                        newest = secs;
+                    }
+                }
+            }
+        }
+    }
+    if newest > 0 {
+        Some(newest)
     } else {
         None
     }
@@ -191,7 +218,18 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
             }
         }
         _ => {
-            // 非Gitリポジトリ or メタデータなし: 変更判定不可
+            // 非Gitリポジトリ or メタデータなし: mtimeベースで鮮度判定
+            let index_mtime = fs::metadata(index_path)?
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            if let Some(newest) = newest_file_mtime(root) {
+                if index_mtime >= newest {
+                    return Ok(IndexStatus::Fresh);
+                }
+            }
             return Ok(IndexStatus::NeedsFullBuild);
         }
     }
@@ -274,11 +312,25 @@ pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
             eprintln!("[done]");
         }
         _ => {
-            // 非Gitリポジトリ or メタデータなし、キャッシュ付き再構築
-            eprintln!("[updating index...]");
-            build_with_cache(root, index_path)?;
-            save_meta(root, index_path)?;
-            eprintln!("[done]");
+            // 非Gitリポジトリ or メタデータなし: mtimeベースで鮮度判定
+            let index_mtime = fs::metadata(index_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let needs_rebuild = match newest_file_mtime(root) {
+                Some(newest) => index_mtime < newest,
+                None => true,
+            };
+
+            if needs_rebuild {
+                eprintln!("[updating index...]");
+                build_with_cache(root, index_path)?;
+                save_meta(root, index_path)?;
+                eprintln!("[done]");
+            }
         }
     }
 
@@ -607,6 +659,56 @@ mod tests {
             }
             other => panic!("expected Stale, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_non_git_mtime_freshness() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        crate::index::builder::build_index(root, &index_path).unwrap();
+        save_meta(root, &index_path).unwrap();
+
+        // インデックスがビルド直後なのでFreshのはず
+        let status = check_index_status(root, &index_path).unwrap();
+        assert!(
+            matches!(status, IndexStatus::Fresh),
+            "expected Fresh, got {:?}",
+            status
+        );
+
+        // 少し待ってからファイルを変更
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(root.join("b.txt"), "world").unwrap();
+
+        // インデックスがNeedsFullBuildになるはず
+        let status = check_index_status(root, &index_path).unwrap();
+        assert!(
+            matches!(status, IndexStatus::NeedsFullBuild),
+            "expected NeedsFullBuild, got {:?}",
+            status
+        );
+    }
+
+    #[test]
+    fn test_non_git_ensure_fresh_skips_rebuild_when_fresh() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello").unwrap();
+
+        let index_path = root.join("test.xgrep");
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        let mtime1 = fs::metadata(&index_path).unwrap().modified().unwrap();
+
+        // 変更なしで再実行
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        ensure_fresh_index(root, &index_path).unwrap();
+
+        let mtime2 = fs::metadata(&index_path).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2); // リビルドされていない
     }
 
     #[test]
