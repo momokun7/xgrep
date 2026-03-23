@@ -1,16 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::env;
-use std::path::PathBuf;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use xgrep::filetype;
-use xgrep::git;
-use xgrep::index;
-use xgrep::output;
-use xgrep::search;
+use xgrep::{output, SearchOptions, Xgrep};
 
 #[derive(Parser)]
 #[command(name = "xgrep", about = "Ultra-fast indexed code search")]
@@ -64,7 +59,6 @@ struct Cli {
     /// Output as JSON
     #[arg(long = "json")]
     json_output: bool,
-
 }
 
 #[derive(Subcommand)]
@@ -77,23 +71,7 @@ enum Commands {
     },
 }
 
-fn index_path(local: bool) -> Result<PathBuf> {
-    if local {
-        Ok(PathBuf::from(".xgrep/index"))
-    } else {
-        let cwd = env::current_dir()?;
-        let hash = xxhash_rust::xxh64::xxh64(cwd.to_string_lossy().as_bytes(), 0);
-        let cache_dir = dirs_next::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("xgrep")
-            .join(format!("{:016x}", hash));
-        std::fs::create_dir_all(&cache_dir)?;
-        Ok(cache_dir.join("index"))
-    }
-}
-
 fn main() {
-    // Broken pipe (SIGPIPE) を無視する。`xgrep | head` 等でパイプが閉じられた場合にパニックしない。
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -111,21 +89,19 @@ fn run() -> Result<()> {
 
     match cli.command {
         Some(Commands::Init { local }) => {
-            let idx = index_path(local)?;
-            if local {
-                std::fs::create_dir_all(".xgrep")?;
-            }
+            let xg = if local {
+                Xgrep::open_local(&cwd)?
+            } else {
+                Xgrep::open(&cwd)?
+            };
             let start = std::time::Instant::now();
-            let cache = index::builder::cache_path_for(&idx);
-            index::builder::build_index_with_cache(&cwd, &idx, Some(&cache))?;
-            index::updater::save_meta(&cwd, &idx)?;
-            let elapsed = start.elapsed();
-            let meta = std::fs::metadata(&idx)?;
+            xg.build_index()?;
+            let meta = std::fs::metadata(xg.index_path())?;
             eprintln!(
                 "Index built: {} ({} bytes) in {:.2}s",
-                idx.display(),
+                xg.index_path().display(),
                 meta.len(),
-                elapsed.as_secs_f64()
+                start.elapsed().as_secs_f64()
             );
         }
         None => {
@@ -143,140 +119,23 @@ fn run() -> Result<()> {
                 std::process::exit(1);
             });
 
-            let results = if cli.changed || cli.since.is_some() {
-                // Git連携検索
-                if !git::is_git_repo(&cwd) {
-                    eprintln!("error: not a git repository");
-                    std::process::exit(1);
-                }
-                let mut files = Vec::new();
-                if cli.changed {
-                    files.extend(git::changed_files(&cwd)?);
-                }
-                if let Some(ref since) = cli.since {
-                    files.extend(git::since_files(&cwd, since)?);
-                }
-                files.sort();
-                files.dedup();
-                if cli.regex {
-                    search::search_files_regex(&cwd, &files, &pattern, cli.case_insensitive)?
-                } else {
-                    search::search_files(&cwd, &files, &pattern, cli.case_insensitive)?
-                }
-            } else {
-                // インデックス検索（ハイブリッド: インデックス+変更ファイル直接スキャン）
-                let local_idx = PathBuf::from(".xgrep/index");
-                let idx = if local_idx.exists() {
-                    local_idx
-                } else {
-                    index_path(false)?
-                };
-
-                let status = index::updater::check_index_status(&cwd, &idx)?;
-
-                match status {
-                    index::updater::IndexStatus::Fresh => {
-                        let reader = index::reader::IndexReader::open(&idx)?;
-                        if cli.regex {
-                            search::search_regex(&reader, &cwd, &pattern, cli.case_insensitive)?
-                        } else {
-                            search::search(&reader, &cwd, &pattern, cli.case_insensitive)?
-                        }
-                    }
-                    index::updater::IndexStatus::Stale { changed_files } => {
-                        let reader = index::reader::IndexReader::open(&idx)?;
-
-                        // インデックスから検索（変更ファイルの結果は古い可能性あり）
-                        let mut index_results = if cli.regex {
-                            search::search_regex(&reader, &cwd, &pattern, cli.case_insensitive)?
-                        } else {
-                            search::search(&reader, &cwd, &pattern, cli.case_insensitive)?
-                        };
-
-                        // 変更ファイルの結果を除外（古いデータの可能性があるため）
-                        let changed_set: std::collections::HashSet<String> = changed_files
-                            .iter()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .collect();
-                        index_results.retain(|r| !changed_set.contains(&r.file));
-
-                        // 変更ファイルを直接スキャン
-                        let direct_results = if cli.regex {
-                            search::search_files_regex(
-                                &cwd,
-                                &changed_files,
-                                &pattern,
-                                cli.case_insensitive,
-                            )?
-                        } else {
-                            search::search_files(
-                                &cwd,
-                                &changed_files,
-                                &pattern,
-                                cli.case_insensitive,
-                            )?
-                        };
-
-                        // マージしてソート
-                        index_results.extend(direct_results);
-                        index_results.sort_by(|a, b| {
-                            a.file
-                                .cmp(&b.file)
-                                .then(a.line_number.cmp(&b.line_number))
-                        });
-                        index_results
-                    }
-                    index::updater::IndexStatus::NeedsFullBuild => {
-                        // インデックスなし、フルビルド
-                        eprintln!("[indexing...]");
-                        let cache = index::builder::cache_path_for(&idx);
-                        index::builder::build_index_with_cache(&cwd, &idx, Some(&cache))?;
-                        index::updater::save_meta(&cwd, &idx)?;
-                        eprintln!("[done]");
-
-                        let reader = index::reader::IndexReader::open(&idx)?;
-                        if cli.regex {
-                            search::search_regex(&reader, &cwd, &pattern, cli.case_insensitive)?
-                        } else {
-                            search::search(&reader, &cwd, &pattern, cli.case_insensitive)?
-                        }
-                    }
-                }
+            let xg = Xgrep::open(&cwd)?;
+            let opts = SearchOptions {
+                case_insensitive: cli.case_insensitive,
+                regex: cli.regex,
+                file_type: cli.file_type,
+                max_count: cli.max_count,
+                changed_only: cli.changed,
+                since: cli.since,
             };
 
-            // ファイルタイプフィルタ適用
-            let results = if let Some(ref ft) = cli.file_type {
-                if let Some(exts) = filetype::extensions_for_type(ft) {
-                    results
-                        .into_iter()
-                        .filter(|r| {
-                            std::path::Path::new(&r.file)
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .is_some_and(|e| exts.contains(&e))
-                        })
-                        .collect()
-                } else {
-                    eprintln!("warning: unknown file type '{}', showing all results", ft);
-                    results
-                }
-            } else {
-                results
-            };
-
-            // max_count適用
-            let results = if let Some(max) = cli.max_count {
-                results.into_iter().take(max).collect::<Vec<_>>()
-            } else {
-                results
-            };
+            let results = xg.search(&pattern, &opts)?;
 
             if results.is_empty() {
                 std::process::exit(1);
             }
 
             if cli.count {
-                // ファイルごとのマッチ数を表示
                 let mut counts: std::collections::BTreeMap<&str, usize> =
                     std::collections::BTreeMap::new();
                 for r in &results {
@@ -286,7 +145,6 @@ fn run() -> Result<()> {
                     println!("{}:{}", file, count);
                 }
             } else if cli.files_only {
-                // マッチしたファイル名のみ表示
                 let mut seen = std::collections::BTreeSet::new();
                 for r in &results {
                     if seen.insert(&r.file) {
