@@ -127,6 +127,7 @@ fn run() -> Result<()> {
                 max_count: cli.max_count,
                 changed_only: cli.changed,
                 since: cli.since,
+                path_pattern: None,
             };
 
             let results = xg.search(&pattern, &opts)?;
