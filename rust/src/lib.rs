@@ -17,6 +17,7 @@ pub mod filetype;
 pub mod git;
 pub mod index;
 pub mod mcp;
+pub mod mcp_tools;
 pub mod output;
 pub mod search;
 pub mod trigram;
