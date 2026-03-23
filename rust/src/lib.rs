@@ -15,7 +15,7 @@ pub use search::SearchResult;
 /// 検索オプション。
 ///
 /// `Default::default()` で固定文字列・case-sensitive・フィルタなしの検索になる。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchOptions {
     pub case_insensitive: bool,
     pub regex: bool,
@@ -23,19 +23,6 @@ pub struct SearchOptions {
     pub max_count: Option<usize>,
     pub changed_only: bool,
     pub since: Option<String>,
-}
-
-impl Default for SearchOptions {
-    fn default() -> Self {
-        Self {
-            case_insensitive: false,
-            regex: false,
-            file_type: None,
-            max_count: None,
-            changed_only: false,
-            since: None,
-        }
-    }
 }
 
 /// 検索エンジンのメインエントリポイント。
@@ -125,6 +112,5 @@ fn resolve_index_path(root: &Path) -> Result<PathBuf> {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("xgrep")
         .join(format!("{:016x}", hash));
-    std::fs::create_dir_all(&cache_dir)?;
     Ok(cache_dir.join("index"))
 }
