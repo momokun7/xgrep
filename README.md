@@ -10,7 +10,7 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 |---|---------|-------|-------|
 | Setup | None | Server required | None (`cargo install`) |
 | First search | Instant | After server start | Auto-builds index |
-| Repeated search (Linux kernel) | 2,070ms | 170ms (server) | 38ms |
+| Repeated search (Linux kernel) | 2,236ms | 170ms (server) | 38ms |
 | Index size | N/A | 155% of source | 8% of source |
 | AI agent integration | None | None | MCP server built-in |
 | Memory (search) | 11MB | 288MB | 208MB |
@@ -82,24 +82,31 @@ Add to settings:
 
 ## Performance
 
-Benchmarked on Linux kernel source (92,471 files, 2.0GB) with [hyperfine](https://github.com/sharkdop/hyperfine), Apple M4, 32GB RAM.
+Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 32GB RAM, macOS.
 
-### Search Latency (warm cache)
+### Large: Linux kernel (92,947 files, 2.0GB)
 
-| Query | xgrep | ripgrep | vs ripgrep |
-|-------|-------|---------|------------|
-| `struct file_operations` | 38ms | 2,070ms | **55x faster** |
-| `printk` | 53ms | 2,026ms | **39x faster** |
-| `EXPORT_SYMBOL` | 68ms | 2,177ms | **32x faster** |
+| Query | xg | ripgrep | vs ripgrep |
+|-------|-----|---------|------------|
+| `struct file_operations` | 38ms | 2,236ms | **59x faster** |
+| `printk` | 54ms | 1,795ms | **33x faster** |
+| `EXPORT_SYMBOL` | 70ms | 1,900ms | **27x faster** |
 
-### Medium Project (ripgrep source, 248 files)
+### Medium: ripgrep source (248 files, 4.3MB)
 
-| Query | xgrep | ripgrep | vs ripgrep |
-|-------|-------|---------|------------|
-| `fn main` | 18ms | 8ms | ripgrep 2.2x faster |
-| `Options` | 19ms | 8ms | ripgrep 2.5x faster |
+| Query | xg | ripgrep | vs ripgrep |
+|-------|-----|---------|------------|
+| `fn main` | 2.5ms | 7.9ms | **3.1x faster** |
+| `Options` | 2.3ms | 7.7ms | **3.3x faster** |
+| `pub struct` | 2.6ms | 7.8ms | **3.1x faster** |
 
-> On small/medium codebases, ripgrep is faster due to xgrep's index loading overhead. xgrep's advantage grows with codebase size.
+### Small: xgrep source (17 files)
+
+| Query | xg | ripgrep | vs ripgrep |
+|-------|-----|---------|------------|
+| `fn main` | 2.1ms | 5.2ms | **2.5x faster** |
+| `SearchResult` | 1.6ms | 4.7ms | **2.9x faster** |
+| `Matcher` | 2.2ms | 5.0ms | **2.3x faster** |
 
 ### Index Cost
 
@@ -107,11 +114,11 @@ Benchmarked on Linux kernel source (92,471 files, 2.0GB) with [hyperfine](https:
 |--------|-------|-------|---------|
 | Build time | 6s | 46s | N/A |
 | Index size | 175MB (8%) | 3.0GB (155%) | N/A |
-| Breakeven | ~10 searches | - | - |
+| Breakeven | ~2 searches | - | - |
 
 > zoekt numbers are CLI mode. In server mode, zoekt search latency is significantly lower.
 
-Reproduce these benchmarks on your machine: [`bench/run.sh`](bench/run.sh)
+Reproduce these benchmarks: [`bench/run.sh`](bench/run.sh)
 
 ```bash
 ./bench/run.sh small    # xgrep source (~20 files, 30s)
