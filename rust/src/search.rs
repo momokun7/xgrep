@@ -1163,3 +1163,59 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 }
+
+#[cfg(test)]
+mod proptest_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn intersect_postings_is_commutative(
+            a in prop::collection::vec(0u32..1000, 0..100),
+            b in prop::collection::vec(0u32..1000, 0..100),
+        ) {
+            let mut a_sorted = a.clone();
+            let mut b_sorted = b.clone();
+            a_sorted.sort();
+            a_sorted.dedup();
+            b_sorted.sort();
+            b_sorted.dedup();
+
+            let result_ab = intersect_postings(&[&a_sorted, &b_sorted]);
+            let result_ba = intersect_postings(&[&b_sorted, &a_sorted]);
+            prop_assert_eq!(result_ab, result_ba);
+        }
+
+        #[test]
+        fn intersect_postings_subset_of_inputs(
+            a in prop::collection::vec(0u32..1000, 0..100),
+            b in prop::collection::vec(0u32..1000, 0..100),
+        ) {
+            let mut a_sorted = a.clone();
+            let mut b_sorted = b.clone();
+            a_sorted.sort();
+            a_sorted.dedup();
+            b_sorted.sort();
+            b_sorted.dedup();
+
+            let result = intersect_postings(&[&a_sorted, &b_sorted]);
+            for &v in &result {
+                prop_assert!(a_sorted.contains(&v));
+                prop_assert!(b_sorted.contains(&v));
+            }
+        }
+
+        #[test]
+        fn case_insensitive_contains_matches_stdlib(
+            haystack in "[a-zA-Z0-9 ]{0,100}",
+            needle in "[a-zA-Z0-9]{0,10}",
+        ) {
+            let needle_lower = needle.to_lowercase();
+            let our_result = contains_case_insensitive(&haystack, &needle_lower);
+            let stdlib_result = haystack.to_lowercase().contains(&needle_lower);
+            prop_assert_eq!(our_result, stdlib_result,
+                "Mismatch for haystack={:?}, needle={:?}", haystack, needle);
+        }
+    }
+}
