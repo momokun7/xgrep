@@ -46,14 +46,21 @@ cp target/release/xg ~/.local/bin/
 ```bash
 cargo install xgrep-search    # Install (gives you the `xg` command)
 xg "pattern"                  # Search (auto-builds index on first run)
+```
+
+## Usage
+
+```bash
+xg "pattern"              # Fixed string search
 xg -e "handle_\w+"        # Regex search
-xg "pattern" -i            # Case-insensitive
-xg "pattern" --type rs     # Filter by file type
-xg "pattern" -C 3          # Context lines
-xg "pattern" --format llm  # Markdown output for LLMs
-xg "pattern" --changed     # Only git changed files
-xg "pattern" --since 1h    # Recently changed files
-xg init                    # Explicitly build index
+xg "pattern" -i           # Case-insensitive
+xg "pattern" --type rs    # Filter by file type
+xg "pattern" -C 3         # Context lines
+xg "pattern" --format llm # Markdown output for LLMs
+xg "pattern" --changed    # Only git changed files
+xg "pattern" --since 1h   # Recently changed files
+xg "pattern" --fresh      # Check index freshness (slower but up-to-date)
+xg init                   # Explicitly rebuild index
 ```
 
 ## MCP Server for AI Agents
