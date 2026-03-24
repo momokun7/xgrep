@@ -40,7 +40,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: xg-aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: xg-x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -69,7 +69,8 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
-    needs: [create-release, build-release]
+    needs: [create-release]
+    if: always() && needs.create-release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -84,7 +85,8 @@ jobs:
 
   publish-release:
     name: Publish Release
-    needs: [create-release, build-release, publish-crate]
+    needs: [create-release, build-release]
+    if: always() && needs.create-release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Mark release as non-draft
