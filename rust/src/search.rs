@@ -616,6 +616,35 @@ mod tests {
     }
 
     #[test]
+    fn test_search_2char_no_prefix_match_fallback() {
+        // 2文字パターンでプレフィックスに一致するtrigramが存在しない場合、
+        // 全スキャンにフォールバックして正しく結果を返すことを確認
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "zq is rare").unwrap();
+        fs::write(root.join("b.txt"), "no match here").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let results = search(&reader, root, "zq", false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].file.contains("a.txt"));
+    }
+
+    #[test]
+    fn test_search_2char_no_match_returns_empty() {
+        // 2文字パターンでどこにもマッチしない場合は空結果
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let results = search(&reader, root, "zq", false).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
     fn test_lookup_trigram_prefix_returns_subset() {
         // lookup_trigram_prefix が全ファイル数より少ない候補を返すことを確認
         let dir = tempdir().unwrap();
