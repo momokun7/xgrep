@@ -56,6 +56,9 @@ pub struct SearchOptions {
     pub since: Option<String>,
     /// Filter results by path substring match (e.g., "src/auth", "tests/")
     pub path_pattern: Option<String>,
+    /// Check index freshness and use hybrid search for changed files.
+    /// When false (default), uses existing index as-is for maximum speed.
+    pub fresh: bool,
 }
 
 /// Main entry point for the search engine.
@@ -138,8 +141,23 @@ impl Xgrep {
         Ok(results)
     }
 
-    /// Index-based search with hybrid mode and auto-build based on IndexStatus.
+    /// Index-based search. When `opts.fresh` is true, checks index freshness
+    /// and uses hybrid search for changed files. When false (default), uses
+    /// existing index as-is for maximum speed.
     fn search_indexed(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
+        if !opts.fresh {
+            // Fast path: use index as-is without freshness check
+            if self.index_path.exists() {
+                let reader = index::reader::IndexReader::open(&self.index_path)?;
+                return if opts.regex {
+                    search::search_regex(&reader, &self.root, pattern, opts.case_insensitive)
+                } else {
+                    search::search(&reader, &self.root, pattern, opts.case_insensitive)
+                };
+            }
+            // Index doesn't exist, fall through to auto-build
+        }
+
         let status = index::updater::check_index_status(&self.root, &self.index_path)?;
 
         match status {

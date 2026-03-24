@@ -10,7 +10,7 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 |---|---------|-------|-------|
 | Setup | None | Server required | None (`cargo install`) |
 | First search | Instant | After server start | Auto-builds index |
-| Repeated search (Linux kernel) | 1,888ms | 170ms (server) | 114ms |
+| Repeated search (Linux kernel) | 2,052ms | 170ms (server) | 37ms |
 | Index size | N/A | 155% of source | 8% of source |
 | AI agent integration | None | None | MCP server built-in |
 | Memory (search) | 11MB | 288MB | 208MB |
@@ -88,9 +88,9 @@ Benchmarked on Linux kernel source (92,471 files, 2.0GB) with [hyperfine](https:
 
 | Query | xgrep | ripgrep | vs ripgrep |
 |-------|-------|---------|------------|
-| `struct file_operations` | 114ms | 1,888ms | **17x faster** |
-| `printk` | 127ms | 2,008ms | **16x faster** |
-| `EXPORT_SYMBOL` | 144ms | 1,964ms | **14x faster** |
+| `struct file_operations` | 37ms | 2,052ms | **55x faster** |
+| `printk` | 52ms | 1,877ms | **36x faster** |
+| `EXPORT_SYMBOL` | 64ms | 2,058ms | **32x faster** |
 
 ### Medium Project (ripgrep source, 248 files)
 

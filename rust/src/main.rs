@@ -59,6 +59,10 @@ struct Cli {
     /// Output as JSON
     #[arg(long = "json")]
     json_output: bool,
+
+    /// Check index freshness and include changed files (slower but always up-to-date)
+    #[arg(long)]
+    fresh: bool,
 }
 
 #[derive(Subcommand)]
@@ -140,6 +144,7 @@ fn run() -> Result<()> {
                 changed_only: cli.changed,
                 since: cli.since,
                 path_pattern: None,
+                fresh: cli.fresh,
             };
 
             let results = xg.search(&pattern, &opts)?;
