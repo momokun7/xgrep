@@ -24,7 +24,7 @@ xgrep is not a ripgrep replacement. Use ripgrep for one-off searches. Use xgrep 
 git clone https://github.com/momokun7/xgrep.git
 cd xgrep/rust
 cargo build --release
-cp target/release/xgrep ~/.local/bin/
+cp target/release/xg ~/.local/bin/
 ```
 
 ### Requirements
@@ -35,15 +35,15 @@ cp target/release/xgrep ~/.local/bin/
 ## Quick Start
 
 ```bash
-xgrep "pattern"              # Search (auto-builds index on first run)
-xgrep -e "handle_\w+"        # Regex search
-xgrep "pattern" -i            # Case-insensitive
-xgrep "pattern" --type rs     # Filter by file type
-xgrep "pattern" -C 3          # Context lines
-xgrep "pattern" --format llm  # Markdown output for LLMs
-xgrep "pattern" --changed     # Only git changed files
-xgrep "pattern" --since 1h    # Recently changed files
-xgrep init                    # Explicitly build index
+xg "pattern"              # Search (auto-builds index on first run)
+xg -e "handle_\w+"        # Regex search
+xg "pattern" -i            # Case-insensitive
+xg "pattern" --type rs     # Filter by file type
+xg "pattern" -C 3          # Context lines
+xg "pattern" --format llm  # Markdown output for LLMs
+xg "pattern" --changed     # Only git changed files
+xg "pattern" --since 1h    # Recently changed files
+xg init                    # Explicitly build index
 ```
 
 ## MCP Server for AI Agents
@@ -51,8 +51,8 @@ xgrep init                    # Explicitly build index
 xgrep runs as an [MCP](https://modelcontextprotocol.io/) server, giving AI coding tools fast indexed search.
 
 ```bash
-xgrep serve                        # Start MCP server
-xgrep serve --root /path/to/repo   # Specific directory
+xg serve                        # Start MCP server
+xg serve --root /path/to/repo   # Specific directory
 ```
 
 ### Claude Code
@@ -63,7 +63,7 @@ Add to settings:
 {
   "mcpServers": {
     "xgrep": {
-      "command": "xgrep",
+      "command": "xg",
       "args": ["serve"]
     }
   }

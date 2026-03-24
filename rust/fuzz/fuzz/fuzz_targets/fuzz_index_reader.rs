@@ -12,5 +12,5 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // 不正データに対してはErrを返し、パニックしないこと
-    let _ = xgrep::fuzz_exports::IndexReader::open(&index_path);
+    let _ = xgrep_search::fuzz_exports::IndexReader::open(&index_path);
 });

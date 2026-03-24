@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use xgrep::fuzz_exports::IndexReader;
+use xgrep_search::fuzz_exports::IndexReader;
 
 fuzz_target!(|data: &[u8]| {
     // 任意バイト列のデコード: パニック・無限ループしないことを検証

@@ -5,10 +5,10 @@ use std::env;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use xgrep::{output, SearchOptions, Xgrep};
+use xgrep_search::{output, SearchOptions, Xgrep};
 
 #[derive(Parser)]
-#[command(name = "xgrep", about = "Ultra-fast indexed code search")]
+#[command(name = "xg", about = "Ultra-fast indexed code search (xgrep)")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -114,7 +114,7 @@ fn run() -> Result<()> {
         Some(Commands::Serve { root }) => {
             let root_path = root.map(std::path::PathBuf::from).unwrap_or(cwd);
             let xg = Xgrep::open(&root_path)?;
-            xgrep::start_mcp_server(xg);
+            xgrep_search::start_mcp_server(xg);
         }
         None => {
             if cli.json_output && cli.format != "default" {

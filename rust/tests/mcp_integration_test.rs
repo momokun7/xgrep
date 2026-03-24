@@ -5,14 +5,14 @@ use std::process::{Command, Stdio};
 use tempfile::tempdir;
 
 fn send_mcp_messages(root: &std::path::Path, messages: &[&str]) -> Vec<serde_json::Value> {
-    let binary = env!("CARGO_BIN_EXE_xgrep");
+    let binary = env!("CARGO_BIN_EXE_xg");
     let mut child = Command::new(binary)
         .args(["serve", "--root", &root.to_string_lossy()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("Failed to start xgrep serve");
+        .expect("Failed to start xg serve");
 
     let stdin = child.stdin.as_mut().unwrap();
     for msg in messages {

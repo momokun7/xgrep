@@ -1,5 +1,5 @@
 [package]
-name = "xgrep-fuzz"
+name = "xgrep-search-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 tempfile = "3"
-xgrep = { path = "..", features = ["fuzz"] }
+xgrep-search = { path = "..", features = ["fuzz"] }
 
 # Prevent this from interfering with workspaces
 [workspace]
