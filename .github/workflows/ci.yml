@@ -17,7 +17,7 @@ jobs:
     name: Test (${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Harden Runner
@@ -41,11 +41,19 @@ jobs:
       - name: Build release
         working-directory: rust
         run: cargo build --release
-      - name: Smoke test
+      - name: Smoke test (Unix)
+        if: runner.os != 'Windows'
         working-directory: rust
         run: |
           ./target/release/xg --help | grep -q "Ultra-fast indexed code search"
           ./target/release/xg "fn main" --type rs | grep -q "fn main"
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        working-directory: rust
+        shell: pwsh
+        run: |
+          .\target\release\xg.exe --help
+          .\target\release\xg.exe "fn main" --type rs
 
   lint:
     name: Lint
