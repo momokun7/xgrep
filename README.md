@@ -162,6 +162,36 @@ For patterns that fall back to full scan, xgrep will show a warning: `warning: r
 
 **Tip:** Include at least 3 literal characters in your regex for best performance. `handle_\w+` is much faster than `\w+_auth`.
 
+## Limitations
+
+xgrep uses a [trigram inverted index](https://swtch.com/~rsc/regexp/regexp4.html), the same technique as Google Code Search (2006) and zoekt. This approach has inherent trade-offs:
+
+- **Short queries (< 3 chars) bypass the index**: Patterns like `if`, `fn`, `go` fall back to full file scan with no speed advantage over ripgrep.
+- **Common trigrams reduce filtering**: Queries containing frequent trigrams (`the`, `int`, `return`) produce many candidate files, narrowing the speed gap with ripgrep.
+- **Not designed for monorepo scale**: Tested up to ~100K files (Linux kernel). Beyond that, posting list intersection costs dominate and the index becomes less effective.
+- **Index staleness**: Background rebuild runs every ~30 seconds. Recently saved files may not appear until the next rebuild completes.
+- **find_definitions is regex-based**: Uses heuristic patterns (`fn`/`struct`/`class`/`def`), not AST analysis. False positives are expected.
+- **ASCII-only case folding**: Case-insensitive search (`-i`) handles ASCII letters only. Unicode case folding is not supported.
+
+### When to use ripgrep instead
+
+- One-off searches on a codebase you won't search again
+- Very small codebases (< 100 files, where index overhead outweighs benefit)
+- Queries shorter than 3 characters
+- When you need results from files saved within the last 30 seconds
+
+### Why trigrams?
+
+xgrep prioritizes **simplicity and small index size** over search precision. Alternative approaches:
+
+| Approach | Index size | Precision | Trade-off |
+|----------|-----------|-----------|-----------|
+| **Trigram** (xgrep, zoekt) | ~8% of source | Moderate (false positives) | Simple, small, fast to build |
+| **Suffix array** (Livegrep) | 2-5x source | High | Large index, slow to build |
+| **AST/Symbol** (Searkt, LSP) | Varies | Exact | Language-specific, complex |
+
+Trigrams are the right choice when you want a single binary that works on any codebase without language-specific setup.
+
 ## How It Works
 
 1. **Index Build**: Walks the codebase, extracts 3-byte trigrams from each file, builds an inverted index (trigram -> file IDs) with delta+varint compression
