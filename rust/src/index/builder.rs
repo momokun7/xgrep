@@ -515,7 +515,6 @@ struct FileInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::format::*;
     use std::fs;
     use tempfile::tempdir;
 
