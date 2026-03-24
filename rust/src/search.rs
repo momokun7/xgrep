@@ -8,6 +8,29 @@ use regex::RegexBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// ASCII-only case-insensitive containsチェック。アロケーションなし。
+/// needleは事前にlowercase化されている前提。
+/// Unicode case foldingは非対応だが、コード検索ではASCIIで十分。
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let needle_bytes = needle.as_bytes();
+    let haystack_bytes = haystack.as_bytes();
+    if needle_bytes.len() > haystack_bytes.len() {
+        return false;
+    }
+    'outer: for i in 0..=(haystack_bytes.len() - needle_bytes.len()) {
+        for j in 0..needle_bytes.len() {
+            if haystack_bytes[i + j].to_ascii_lowercase() != needle_bytes[j] {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub file: String,
@@ -68,8 +91,8 @@ pub fn search(
                 }
 
                 if any_empty {
-                    // バリアント全てが空のtrigramがある場合は全スキャンにフォールバック
-                    (0..reader.file_count()).collect()
+                    // そのtrigramのどのcase variantも存在しない = マッチなし
+                    vec![]
                 } else {
                     let refs: Vec<&[u32]> =
                         trigram_candidates.iter().map(|v| v.as_slice()).collect();
@@ -119,7 +142,7 @@ pub fn search(
                 let pattern_lower = search_pattern.as_str();
                 let content_str = String::from_utf8_lossy(&content);
                 for (i, line) in content_str.lines().enumerate() {
-                    if line.to_lowercase().contains(pattern_lower) {
+                    if contains_case_insensitive(line, pattern_lower) {
                         file_results.push(SearchResult {
                             file: rel_path.to_string(),
                             line_number: i + 1,
@@ -198,7 +221,7 @@ pub fn search_files(
             if case_insensitive {
                 let content_str = String::from_utf8_lossy(&content);
                 for (i, line) in content_str.lines().enumerate() {
-                    if line.to_lowercase().contains(&pattern_lower) {
+                    if contains_case_insensitive(line, &pattern_lower) {
                         file_results.push(SearchResult {
                             file: rel_str.clone(),
                             line_number: i + 1,
@@ -988,5 +1011,29 @@ mod tests {
             elapsed
         );
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_case_insensitive_no_match_returns_empty() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // "xyznonexistent" doesn't exist in any case variant
+        let results = search(&reader, root, "xyznonexistent", true).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_contains_case_insensitive() {
+        // needleは常にlowercase前提（呼び出し側でto_lowercase済み）
+        assert!(contains_case_insensitive("Hello World", "hello"));
+        assert!(contains_case_insensitive("HELLO WORLD", "hello world"));
+        assert!(contains_case_insensitive("hello", "hello"));
+        assert!(!contains_case_insensitive("hello", "xyz"));
+        assert!(contains_case_insensitive("anything", ""));
+        assert!(!contains_case_insensitive("hi", "longer"));
     }
 }
