@@ -149,11 +149,15 @@ impl Xgrep {
             // Fast path: use index as-is without freshness check
             if self.index_path.exists() {
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
-                return if opts.regex {
+                let results = if opts.regex {
                     search::search_regex(&reader, &self.root, pattern, opts.case_insensitive)
                 } else {
                     search::search(&reader, &self.root, pattern, opts.case_insensitive)
                 };
+                // Background rebuild: spawn a detached process to update the index
+                // The current search uses the existing index; next search will use the updated one
+                self.spawn_background_rebuild();
+                return results;
             }
             // Index doesn't exist, fall through to auto-build
         }
@@ -224,6 +228,36 @@ impl Xgrep {
                 }
             }
         }
+    }
+
+    /// Spawn a detached background process to rebuild the index.
+    /// Skips if: lock file exists, or index was built within the last 30 seconds.
+    fn spawn_background_rebuild(&self) {
+        // Skip if lock file exists (another rebuild in progress)
+        if self.index_path.with_extension("lock").exists() {
+            return;
+        }
+        // Skip if index is fresh enough (built within last 30 seconds)
+        if let Ok(meta) = std::fs::metadata(&self.index_path) {
+            if let Ok(modified) = meta.modified() {
+                if modified.elapsed().unwrap_or_default().as_secs() < 30 {
+                    return;
+                }
+            }
+        }
+        // Get the current executable path
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        // Spawn detached: `xg init` in the background
+        let _ = std::process::Command::new(exe)
+            .arg("init")
+            .current_dir(&self.root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 
     /// Search only git-changed files. Returns error if not a git repository.
