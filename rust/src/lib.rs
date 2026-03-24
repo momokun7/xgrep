@@ -1,4 +1,4 @@
-//! trigram逆引きインデックスによる高速コード検索エンジン。
+//! Ultra-fast indexed code search engine using trigram inverted index.
 //!
 //! # Example
 //!
@@ -37,9 +37,9 @@ use anyhow::{bail, Result};
 
 pub use search::SearchResult;
 
-/// 検索オプション。
+/// Search options.
 ///
-/// `Default::default()` で固定文字列・case-sensitive・フィルタなしの検索になる。
+/// `Default::default()` creates a case-sensitive literal string search with no filters.
 #[derive(Debug, Clone, Default)]
 pub struct SearchOptions {
     /// Case-insensitive search (ASCII folding only)
@@ -58,41 +58,41 @@ pub struct SearchOptions {
     pub path_pattern: Option<String>,
 }
 
-/// 検索エンジンのメインエントリポイント。
+/// Main entry point for the search engine.
 ///
-/// `open()` でディレクトリを指定し、`search()` で検索を実行する。
-/// インデックスの自動ビルド・鮮度チェック・ハイブリッド検索は内部で自動処理される。
+/// Use `open()` to specify a directory, then `search()` to execute queries.
+/// Index auto-build, freshness checks, and hybrid search are handled internally.
 pub struct Xgrep {
     root: PathBuf,
     index_path: PathBuf,
 }
 
 impl Xgrep {
-    /// ディレクトリを開く。インデックスパスは自動解決（.xgrep/index → ~/.cache/xgrep/&lt;hash&gt;/index）
+    /// Open a directory. Index path is auto-resolved (.xgrep/index or ~/.cache/xgrep/<hash>/index).
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = resolve_index_path(&root)?;
         Ok(Self { root, index_path })
     }
 
-    /// ローカルインデックス(.xgrep/)を明示指定して開く
+    /// Open with a local index (.xgrep/) explicitly.
     pub fn open_local(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = root.join(".xgrep").join("index");
         Ok(Self { root, index_path })
     }
 
-    /// ルートディレクトリのパスを返す
+    /// Returns the root directory path.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// インデックスファイルのパスを返す
+    /// Returns the index file path.
     pub fn index_path(&self) -> &Path {
         &self.index_path
     }
 
-    /// インデックスをビルド（またはリビルド）
+    /// Build (or rebuild) the search index.
     pub fn build_index(&self) -> Result<()> {
         if let Some(parent) = self.index_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -103,7 +103,7 @@ impl Xgrep {
         Ok(())
     }
 
-    /// 検索を実行。インデックスの自動ビルド・ハイブリッド検索・Git変更ファイル検索を内部で処理する。
+    /// Execute a search. Auto-build, hybrid search, and git-changed-file search are handled internally.
     pub fn search(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
         let mut results = if opts.changed_only || opts.since.is_some() {
             self.search_changed(pattern, opts)?
@@ -138,7 +138,7 @@ impl Xgrep {
         Ok(results)
     }
 
-    /// インデックスベースの検索。IndexStatusに応じてハイブリッド検索・自動ビルドを行う。
+    /// Index-based search with hybrid mode and auto-build based on IndexStatus.
     fn search_indexed(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
         let status = index::updater::check_index_status(&self.root, &self.index_path)?;
 
@@ -208,7 +208,7 @@ impl Xgrep {
         }
     }
 
-    /// Git変更ファイルのみを対象に検索する。Gitリポジトリでない場合はエラー。
+    /// Search only git-changed files. Returns error if not a git repository.
     fn search_changed(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
         if !git::is_git_repo(&self.root) {
             bail!("--changed/--since requires a git repository");
@@ -265,7 +265,7 @@ impl Xgrep {
     }
 }
 
-/// MCPサーバーを起動する（stdio transport）
+/// Start the MCP server (stdio transport).
 pub fn start_mcp_server(xg: Xgrep) {
     mcp::start(xg);
 }
