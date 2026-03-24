@@ -93,9 +93,16 @@ impl TrigramCache {
     /// キャッシュをファイルに保存する
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut buf = Vec::new();
+        if self.entries.len() > u32::MAX as usize {
+            // Too many entries for cache format, skip saving
+            return Ok(());
+        }
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for (path_str, cf) in &self.entries {
             let path_bytes = path_str.as_bytes();
+            if path_bytes.len() > u16::MAX as usize {
+                continue;
+            }
             buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
             buf.extend_from_slice(path_bytes);
             buf.extend_from_slice(&cf.mtime.to_le_bytes());
@@ -286,7 +293,10 @@ pub fn build_index_with_cache(
     let temp_path = temp_dir.path().join("postings.tmp");
     {
         let f = fs::File::create(&temp_path)?;
-        f.set_len((total_pairs * 4) as u64)?;
+        let temp_size = total_pairs
+            .checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!("Index too large: total_pairs overflow"))?;
+        f.set_len(temp_size as u64)?;
     }
 
     let temp_file = fs::OpenOptions::new()
@@ -378,6 +388,9 @@ pub fn build_index_with_cache(
         }
 
         let offset = current_posting_offset;
+        if posting_buf.len() > u32::MAX as usize {
+            bail!("Posting list too large for index format (> 4GB)");
+        }
         let len = posting_buf.len() as u32;
         writer.write_all(&posting_buf)?;
         current_posting_offset += len as u64;
