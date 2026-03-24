@@ -100,7 +100,7 @@ fn parse_status_paths(line: &str) -> Vec<String> {
     };
 
     if let Some(arrow_pos) = path_part.find(" -> ") {
-        // リネームの場合: 旧パスと新パスの両方を返す
+        // Rename: return both old and new paths
         let old = &path_part[..arrow_pos];
         let new = &path_part[arrow_pos + 4..];
         let old = clean(old);
@@ -127,8 +127,8 @@ fn parse_status_paths(line: &str) -> Vec<String> {
 fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<PathBuf>> {
     let mut changed = std::collections::HashSet::new();
 
-    // Staged + unstaged changes（追跡済みファイルのみ）
-    // -uno でuntracked filesを除外し、大規模リポジトリでのハングを防止
+    // Staged + unstaged changes (tracked files only)
+    // -uno excludes untracked files to prevent hangs in large repositories
     let output = std::process::Command::new("git")
         .args(["status", "--porcelain", "-uno"])
         .current_dir(root)
@@ -139,9 +139,9 @@ fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<
         }
     }
 
-    // 未追跡ファイル（.gitignoreを尊重した高速な列挙）
-    // git status --porcelain の代わりに ls-files --others を使うことで
-    // node_modules等の大量のuntracked filesがある場合でも高速に動作する
+    // Untracked files (fast enumeration respecting .gitignore)
+    // Using ls-files --others instead of git status --porcelain
+    // to stay fast even with large numbers of untracked files like node_modules
     let output = std::process::Command::new("git")
         .args(["ls-files", "--others", "--exclude-standard"])
         .current_dir(root)
@@ -160,7 +160,7 @@ fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<
 fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
     let mut files = std::collections::HashSet::new();
 
-    // コミット済みの変更: old_hash..HEAD
+    // Committed changes: old_hash..HEAD
     let output = std::process::Command::new("git")
         .args([
             "diff-tree",
@@ -206,7 +206,7 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
             let hash_changed = m.commit_hash.as_deref() != Some(curr.as_str());
 
             if hash_changed {
-                // コミットが変わった: diff-tree + status + untracked全てチェック
+                // Commit changed: check diff-tree + status + all untracked files
                 let old_hash = m.commit_hash.as_deref().unwrap_or("");
                 if let Ok(files) = changed_files_since(root, old_hash) {
                     for f in files {
@@ -215,8 +215,8 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
                 }
                 changed.extend(collect_uncommitted_changes(root)?);
             } else {
-                // コミット同一: staged/unstaged変更のみチェック（高速パス）
-                // git ls-files --othersをスキップして~170ms節約
+                // Same commit: only check staged/unstaged changes (fast path)
+                // Skip git ls-files --others to save ~170ms
                 let output = std::process::Command::new("git")
                     .args(["status", "--porcelain", "-uno"])
                     .current_dir(root)
@@ -229,7 +229,7 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
             }
         }
         _ => {
-            // 非Gitリポジトリ or メタデータなし: mtimeベースで鮮度判定
+            // Non-git repo or no metadata: determine freshness via mtime
             let index_mtime = fs::metadata(index_path)?
                 .modified()?
                 .duration_since(std::time::UNIX_EPOCH)
@@ -248,7 +248,7 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
     if changed.is_empty() {
         Ok(IndexStatus::Fresh)
     } else if changed.len() > 500 {
-        // 変更が多すぎる場合はリビルドの方が効率的
+        // Too many changes: full rebuild is more efficient
         Ok(IndexStatus::NeedsFullBuild)
     } else {
         let mut files: Vec<PathBuf> = changed.into_iter().collect();
@@ -270,7 +270,7 @@ fn build_with_cache(root: &Path, index_path: &Path) -> Result<()> {
 #[allow(dead_code)]
 pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
     if !index_path.exists() {
-        // インデックスが存在しない場合はフルビルド（キャッシュ作成付き）
+        // Index does not exist: full build (with cache creation)
         eprintln!("[indexing...]");
         build_with_cache(root, index_path)?;
         save_meta(root, index_path)?;
@@ -278,43 +278,43 @@ pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // インデックスが存在する場合、更新が必要かチェック
+    // Index exists: check if update is needed
     let meta = IndexMeta::load(index_path);
     let current_hash = current_commit_hash(root);
 
     match (&meta, &current_hash) {
         (Some(m), Some(curr)) if m.commit_hash.as_deref() == Some(curr.as_str()) => {
-            // 同じコミット。未コミットの変更があるかチェック
+            // Same commit. Check for uncommitted changes
             let uncommitted = collect_uncommitted_changes(root)?;
             if uncommitted.is_empty() {
-                // 変更なし、インデックスは最新
+                // No changes, index is up-to-date
                 return Ok(());
             }
-            // 未コミットの変更あり、キャッシュ付き増分再構築
+            // Uncommitted changes found, incremental rebuild with cache
             eprintln!("[updating index...]");
             build_with_cache(root, index_path)?;
             IndexMeta::save(index_path, Some(curr))?;
             eprintln!("[done]");
         }
         (Some(m), Some(curr)) => {
-            // コミットが異なる
+            // Different commit
             let old_hash = m.commit_hash.as_deref().unwrap_or("");
             let changed = changed_files_since(root, old_hash)?;
 
             if changed.is_empty() {
-                // ファイル変更なし（merge commitなど）
+                // No file changes (e.g. merge commit)
                 IndexMeta::save(index_path, Some(curr))?;
                 return Ok(());
             }
 
-            // 変更があるのでキャッシュ付き増分リビルド
+            // Changes detected, incremental rebuild with cache
             eprintln!("[updating index ({} files changed)...]", changed.len());
             build_with_cache(root, index_path)?;
             IndexMeta::save(index_path, Some(curr))?;
             eprintln!("[done]");
         }
         _ => {
-            // 非Gitリポジトリ or メタデータなし: mtimeベースで鮮度判定
+            // Non-git repo or no metadata: determine freshness via mtime
             let index_mtime = fs::metadata(index_path)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -380,7 +380,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         init_git_repo(root);
-        // インデックスファイルをgitignoreに追加（git statusで検出されないようにする）
+        // Add index files to .gitignore so git status does not detect them
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
         Command::new("git")
@@ -399,12 +399,12 @@ mod tests {
 
         let mtime1 = fs::metadata(&index_path).unwrap().modified().unwrap();
 
-        // 変更なしで再実行
+        // Re-run without changes
         std::thread::sleep(std::time::Duration::from_millis(100));
         ensure_fresh_index(root, &index_path).unwrap();
 
         let mtime2 = fs::metadata(&index_path).unwrap().modified().unwrap();
-        assert_eq!(mtime1, mtime2); // インデックスは再構築されていない
+        assert_eq!(mtime1, mtime2); // Index was not rebuilt
     }
 
     #[test]
@@ -429,7 +429,7 @@ mod tests {
 
         let mtime1 = fs::metadata(&index_path).unwrap().modified().unwrap();
 
-        // 新しいコミットを作成
+        // Create a new commit
         std::thread::sleep(std::time::Duration::from_millis(100));
         fs::write(root.join("new_file.txt"), "new content").unwrap();
         Command::new("git")
@@ -446,7 +446,7 @@ mod tests {
         ensure_fresh_index(root, &index_path).unwrap();
 
         let mtime2 = fs::metadata(&index_path).unwrap().modified().unwrap();
-        assert_ne!(mtime1, mtime2); // インデックスが再構築された
+        assert_ne!(mtime1, mtime2); // Index was rebuilt
     }
 
     #[test]
@@ -489,14 +489,14 @@ mod tests {
 
         let mtime1 = fs::metadata(&index_path).unwrap().modified().unwrap();
 
-        // 未コミットの変更を加える（同じコミット、ダーティな作業ツリー）
+        // Make uncommitted changes (same commit, dirty working tree)
         std::thread::sleep(std::time::Duration::from_millis(100));
         fs::write(root.join("hello.txt"), "changed content").unwrap();
 
         ensure_fresh_index(root, &index_path).unwrap();
 
         let mtime2 = fs::metadata(&index_path).unwrap().modified().unwrap();
-        assert_ne!(mtime1, mtime2); // 未コミットの変更によりインデックスが再構築された
+        assert_ne!(mtime1, mtime2); // Index was rebuilt due to uncommitted changes
     }
 
     #[test]
@@ -521,14 +521,14 @@ mod tests {
 
         let mtime1 = fs::metadata(&index_path).unwrap().modified().unwrap();
 
-        // 新しい未追跡ファイルを追加
+        // Add a new untracked file
         std::thread::sleep(std::time::Duration::from_millis(100));
         fs::write(root.join("new_file.txt"), "new content").unwrap();
 
         ensure_fresh_index(root, &index_path).unwrap();
 
         let mtime2 = fs::metadata(&index_path).unwrap().modified().unwrap();
-        assert_ne!(mtime1, mtime2); // 新しい未追跡ファイルによりインデックスが再構築された
+        assert_ne!(mtime1, mtime2); // Index was rebuilt due to new untracked file
     }
 
     #[test]
@@ -611,7 +611,7 @@ mod tests {
         let index_path = root.join("test.xgrep");
         ensure_fresh_index(root, &index_path).unwrap();
 
-        // ファイルを変更
+        // Modify a file
         fs::write(root.join("hello.txt"), "changed").unwrap();
 
         let status = check_index_status(root, &index_path).unwrap();
@@ -654,12 +654,12 @@ mod tests {
         let index_path = root.join("test.xgrep");
         ensure_fresh_index(root, &index_path).unwrap();
 
-        // 新しい未追跡ファイルを追加
+        // Add a new untracked file
         fs::write(root.join("new_file.txt"), "new content").unwrap();
 
         let status = check_index_status(root, &index_path).unwrap();
-        // commit hashが同じ場合、高速パスではuntracked filesを検出しない（性能最適化）
-        // untracked filesは次のcommit後またはフルビルドで検出される
+        // When commit hash is the same, fast path does not detect untracked files (perf optimization)
+        // Untracked files will be detected after the next commit or full rebuild
         assert!(matches!(status, IndexStatus::Fresh));
     }
 
@@ -673,7 +673,7 @@ mod tests {
         crate::index::builder::build_index(root, &index_path).unwrap();
         save_meta(root, &index_path).unwrap();
 
-        // インデックスがビルド直後なのでFreshのはず
+        // Index was just built, should be Fresh
         let status = check_index_status(root, &index_path).unwrap();
         assert!(
             matches!(status, IndexStatus::Fresh),
@@ -681,11 +681,11 @@ mod tests {
             status
         );
 
-        // 少し待ってからファイルを変更
+        // Wait briefly then modify a file
         std::thread::sleep(std::time::Duration::from_secs(1));
         fs::write(root.join("b.txt"), "world").unwrap();
 
-        // インデックスがNeedsFullBuildになるはず
+        // Index should be NeedsFullBuild now
         let status = check_index_status(root, &index_path).unwrap();
         assert!(
             matches!(status, IndexStatus::NeedsFullBuild),
@@ -705,12 +705,12 @@ mod tests {
 
         let mtime1 = fs::metadata(&index_path).unwrap().modified().unwrap();
 
-        // 変更なしで再実行
+        // Re-run without changes
         std::thread::sleep(std::time::Duration::from_millis(100));
         ensure_fresh_index(root, &index_path).unwrap();
 
         let mtime2 = fs::metadata(&index_path).unwrap().modified().unwrap();
-        assert_eq!(mtime1, mtime2); // リビルドされていない
+        assert_eq!(mtime1, mtime2); // Not rebuilt
     }
 
     #[test]
@@ -734,7 +734,7 @@ mod tests {
         let index_path = root.join("test.xgrep");
         ensure_fresh_index(root, &index_path).unwrap();
 
-        // 新しいコミット
+        // New commit
         fs::write(root.join("new_file.txt"), "new content").unwrap();
         Command::new("git")
             .args(["add", "."])

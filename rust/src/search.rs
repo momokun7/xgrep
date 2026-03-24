@@ -24,7 +24,7 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
 /// Build a table of byte offsets for the start of each line.
 /// line_offsets[i] = byte offset of the start of line i+1.
 fn build_line_offsets(content: &[u8]) -> Vec<usize> {
-    let mut offsets = vec![0]; // 1行目はオフセット0から
+    let mut offsets = vec![0]; // Line 1 starts at offset 0
     for (i, &b) in content.iter().enumerate() {
         if b == b'\n' {
             offsets.push(i + 1);
@@ -37,7 +37,7 @@ fn build_line_offsets(content: &[u8]) -> Vec<usize> {
 fn line_number_at(line_offsets: &[usize], pos: usize) -> usize {
     match line_offsets.binary_search(&pos) {
         Ok(i) => i + 1,
-        Err(i) => i, // posはi番目の行(0-indexed)の中にある → 行番号はi
+        Err(i) => i, // pos is within line i (0-indexed), so line number is i
     }
 }
 
@@ -58,7 +58,7 @@ pub struct SearchResult {
 }
 
 // ---------------------------------------------------------------------------
-// Matcher trait: 3つのマッチ戦略を統一するインターフェース
+// Matcher trait: unified interface for three matching strategies
 // ---------------------------------------------------------------------------
 
 trait Matcher: Send + Sync {
@@ -162,7 +162,7 @@ impl Matcher for CaseInsensitiveMatcher {
                 line: line.to_string(),
             });
 
-            // 同一行の重複を避けるため次の行へスキップ
+            // Skip to next line to avoid duplicate matches on the same line
             pos = line_end + 1;
             if pos >= content.len() {
                 break;
@@ -201,7 +201,7 @@ impl Matcher for RegexMatcher {
 }
 
 // ---------------------------------------------------------------------------
-// スキャン関数
+// Scan functions
 // ---------------------------------------------------------------------------
 
 /// Scan files directly from index candidate ID list (no intermediate Vec).
@@ -256,7 +256,7 @@ fn scan_direct<M: Matcher>(root: &Path, files: &[PathBuf], matcher: &M) -> Vec<S
 }
 
 // ---------------------------------------------------------------------------
-// 公開API（シグネチャ維持）
+// Public API (signature preserved)
 // ---------------------------------------------------------------------------
 
 pub fn search(

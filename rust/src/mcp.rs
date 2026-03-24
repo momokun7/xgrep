@@ -149,7 +149,7 @@ fn run_server(handler: impl Fn(&Message) -> Option<Value>) {
             }
         };
 
-        // 通知（idなし）はレスポンスを返さない
+        // Notifications (no id) do not return a response
         if msg.id.is_none() {
             handler(&msg);
             continue;
@@ -232,19 +232,19 @@ mod tests {
 
     #[test]
     fn test_parse_id_null_is_request_not_notification() {
-        // JSON-RPC 2.0: "id": null はリクエスト（通知ではない）
+        // JSON-RPC 2.0: "id": null is a request (not a notification)
         let json = r#"{"jsonrpc":"2.0","id":null,"method":"test"}"#;
         let msg = parse_message(json).unwrap();
-        assert_eq!(msg.id, Some(Value::Null)); // None ではない
-        assert!(!msg.id.is_none()); // 通知ではなくリクエストとして扱う
+        assert_eq!(msg.id, Some(Value::Null)); // Not None
+        assert!(!msg.id.is_none()); // Treated as request, not notification
     }
 
     #[test]
     fn test_parse_notification_has_no_id_field() {
-        // JSON-RPC 2.0: id フィールドが存在しない = 通知
+        // JSON-RPC 2.0: missing id field = notification
         let json = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let msg = parse_message(json).unwrap();
-        assert!(msg.id.is_none()); // 通知
+        assert!(msg.id.is_none()); // Notification
     }
 
     fn setup_test_repo() -> (tempfile::TempDir, Xgrep) {

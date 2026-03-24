@@ -12,7 +12,7 @@ use crate::index::format::*;
 use crate::trigram;
 
 // ============================================================
-// Lock Guard: 並行ビルド防止のためのアドバイザリファイルロック
+// Lock Guard: advisory file lock to prevent concurrent builds
 // ============================================================
 
 struct LockGuard {
@@ -86,7 +86,7 @@ pub fn build_index_with_cache(
     let mut cache_hits = 0usize;
     let mut cache_misses = 0usize;
     // ============================================================
-    // Pass 1: ファイルパス収集、メタデータ取得、trigram出現数カウント
+    // Pass 1: collect file paths, fetch metadata, count trigram occurrences
     // ============================================================
     let mut file_paths: Vec<PathBuf> = Vec::new();
     for entry in WalkBuilder::new(root)
@@ -141,7 +141,7 @@ pub fn build_index_with_cache(
                     .unwrap_or(0);
                 let size = meta.len();
 
-                // キャッシュヒット判定: パス+mtimeが一致すればファイル読み込みをスキップ
+                // Cache hit check: skip file read if path + mtime match
                 if let Some(cached) = cache.entries.get(&relative) {
                     if cached.mtime == mtime {
                         return Some(ChunkResult {
@@ -155,7 +155,7 @@ pub fn build_index_with_cache(
                     }
                 }
 
-                // キャッシュミス: ファイルを読み込んでtrigramを抽出
+                // Cache miss: read file and extract trigrams
                 let content = fs::read(path).ok()?;
                 if memchr::memchr(0, &content).is_some() {
                     return None;
@@ -194,7 +194,7 @@ pub fn build_index_with_cache(
     }
 
     // ============================================================
-    // オフセットテーブル計算 (prefix sum)
+    // Offset table computation (prefix sum)
     // ============================================================
     let mut sorted_trigrams: Vec<[u8; 3]> = trigram_count.keys().copied().collect();
     sorted_trigrams.sort();
@@ -214,7 +214,7 @@ pub fn build_index_with_cache(
     let mut write_positions: Vec<u32> = offset_table.clone();
 
     // ============================================================
-    // テンポラリファイル作成 (posting data用)
+    // Create temporary file (for posting data)
     // ============================================================
     if files.len() > u32::MAX as usize {
         bail!("too many files: {} (maximum {})", files.len(), u32::MAX);
@@ -228,7 +228,7 @@ pub fn build_index_with_cache(
     }
 
     if total_pairs == 0 {
-        // trigramが1つもない場合はmmapなしで直接書き出し
+        // No trigrams at all: write directly without mmap
         let result = write_index_no_postings(index_path, &sorted_trigrams, &files);
         if result.is_ok() {
             save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
@@ -253,7 +253,7 @@ pub fn build_index_with_cache(
     let mut temp_mmap = unsafe { memmap2::MmapMut::map_mut(&temp_file)? };
 
     // ============================================================
-    // Pass 2: Pass 1で収集済みのtrigramを使ってfile_idをmmapに配置
+    // Pass 2: place file_ids into mmap using trigrams collected in Pass 1
     // ============================================================
     for (file_id, trigrams) in file_trigrams.iter().enumerate() {
         let file_id = file_id as u32;
@@ -272,8 +272,8 @@ pub fn build_index_with_cache(
     temp_mmap.flush()?;
 
     // ============================================================
-    // 最終インデックスファイル書き出し (mmapから読み取り)
-    // アトミック置換: tempファイルに書き出し後、renameで差し替え
+    // Write final index file (reading from mmap)
+    // Atomic replacement: write to temp file, then rename
     // ============================================================
     let parent = index_path.parent().unwrap_or(std::path::Path::new("."));
     fs::create_dir_all(parent)?;
@@ -339,12 +339,12 @@ pub fn build_index_with_cache(
         });
     }
 
-    // mmapとテンポラリファイルを解放
+    // Release mmap and temporary file
     drop(temp_mmap);
     drop(temp_file);
     drop(temp_dir);
 
-    // File Table 書き出し
+    // Write File Table
     let mut string_pool = Vec::new();
     for fi in &files {
         let path_offset = string_pool.len() as u32;
@@ -359,17 +359,17 @@ pub fn build_index_with_cache(
         writer.write_all(&entry.to_bytes())?;
     }
 
-    // String Pool 書き出し
+    // Write String Pool
     writer.write_all(&string_pool)?;
 
-    // Header の posting_total_bytes を確定値で上書き
+    // Overwrite Header's posting_total_bytes with the final value
     header.posting_total_bytes = current_posting_offset;
     writer.flush()?;
     let mut file = writer.into_inner()?;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&header.to_bytes())?;
 
-    // Trigram Table を seek して上書き
+    // Seek and overwrite Trigram Table
     file.seek(SeekFrom::Start(Header::SIZE as u64))?;
     let mut trig_writer = BufWriter::with_capacity(64 * 1024, file);
     for entry in &trigram_entries {
@@ -378,10 +378,10 @@ pub fn build_index_with_cache(
     trig_writer.flush()?;
     drop(trig_writer);
 
-    // アトミック置換: tempファイルを最終パスにrename
+    // Atomic replacement: rename temp file to final path
     fs::rename(&temp_index_path, index_path)?;
 
-    // キャッシュを更新して保存
+    // Update and save cache
     save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
 
     if cache_hits > 0 {
@@ -399,7 +399,7 @@ fn save_cache(
     cache_path: Option<&Path>,
 ) -> Result<()> {
     if let Some(cp) = cache_path {
-        // 現在のファイル一覧でキャッシュを更新（削除されたファイルを除外）
+        // Update cache with current file list (excluding deleted files)
         let mut new_entries = HashMap::with_capacity(files.len());
         for (i, fi) in files.iter().enumerate() {
             new_entries.insert(
@@ -441,7 +441,7 @@ fn write_index_no_postings(
     let trigram_table_size = sorted_trigrams.len() * TrigramEntry::SIZE;
     writer.write_all(&vec![0u8; trigram_table_size])?;
 
-    // File Table 書き出し
+    // Write File Table
     let mut string_pool = Vec::new();
     for fi in files {
         let path_offset = string_pool.len() as u32;
@@ -460,7 +460,7 @@ fn write_index_no_postings(
     writer.flush()?;
     drop(writer);
 
-    // アトミック置換: tempファイルを最終パスにrename
+    // Atomic replacement: rename temp file to final path
     fs::rename(&temp_path, index_path)?;
 
     Ok(())
@@ -691,7 +691,7 @@ mod tests {
     fn test_trigram_cache_load_corrupt_data() {
         let dir = tempdir().unwrap();
         let cache_path = dir.path().join("bad.cache");
-        fs::write(&cache_path, b"xx").unwrap(); // 4バイト未満
+        fs::write(&cache_path, b"xx").unwrap(); // Less than 4 bytes
         let cache = TrigramCache::load(&cache_path);
         assert!(cache.entries.is_empty());
     }
@@ -709,7 +709,7 @@ mod tests {
         assert!(index_path.exists());
         assert!(cache_path.exists());
 
-        // キャッシュにエントリが含まれていることを検証
+        // Verify cache contains entries
         let cache = TrigramCache::load(&cache_path);
         assert_eq!(cache.entries.len(), 1);
         assert!(cache.entries.contains_key("hello.txt"));
@@ -725,15 +725,15 @@ mod tests {
         let index_path = root.join("index.xgrep");
         let cache_path = cache_path_for(&index_path);
 
-        // 初回ビルド（キャッシュなし）
+        // First build (no cache)
         build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
         let index_data_1 = fs::read(&index_path).unwrap();
 
-        // 2回目ビルド（キャッシュあり、ファイル変更なし）
+        // Second build (with cache, no file changes)
         build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
         let index_data_2 = fs::read(&index_path).unwrap();
 
-        // インデックスの内容が同じであることを検証
+        // Verify index contents are identical
         assert_eq!(index_data_1, index_data_2);
     }
 
@@ -749,24 +749,24 @@ mod tests {
         let index_path = root.join("index.xgrep");
         let cache_path = cache_path_for(&index_path);
 
-        // 初回ビルド
+        // First build
         build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
 
         let reader1 = IndexReader::open(&index_path).unwrap();
         assert_eq!(reader1.file_count(), 2);
 
-        // a.txtを変更
-        // mtimeを確実に変更するため少し待つ
+        // Modify a.txt
+        // Wait briefly to ensure mtime changes
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(root.join("a.txt"), "modified content xyz").unwrap();
 
-        // 増分ビルド（b.txtはキャッシュヒット、a.txtは再読み込み）
+        // Incremental build (b.txt cache hit, a.txt re-read)
         build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
 
         let reader2 = IndexReader::open(&index_path).unwrap();
         assert_eq!(reader2.file_count(), 2);
 
-        // "xyz"のtrigramが見つかることを検証
+        // Verify "xyz" trigram is found
         let posting = reader2.lookup_trigram(*b"xyz");
         assert!(
             !posting.is_empty(),
@@ -789,7 +789,7 @@ mod tests {
         let reader1 = IndexReader::open(&index_path).unwrap();
         assert_eq!(reader1.file_count(), 1);
 
-        // 新しいファイルを追加
+        // Add a new file
         fs::write(root.join("b.txt"), "new file zqx").unwrap();
 
         build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
@@ -859,14 +859,14 @@ mod tests {
         let reader1 = IndexReader::open(&index_path).unwrap();
         assert_eq!(reader1.file_count(), 2);
 
-        // b.txtを削除
+        // Delete b.txt
         fs::remove_file(root.join("b.txt")).unwrap();
 
         build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
         let reader2 = IndexReader::open(&index_path).unwrap();
         assert_eq!(reader2.file_count(), 1);
 
-        // キャッシュからも削除されていることを検証
+        // Verify it was also removed from cache
         let cache = TrigramCache::load(&cache_path);
         assert_eq!(cache.entries.len(), 1);
         assert!(!cache.entries.contains_key("b.txt"));

@@ -84,7 +84,7 @@ enum Commands {
 fn main() {
     #[cfg(unix)]
     unsafe {
-        // SAFETY: SIGPIPEをデフォルト動作に戻す。パイプ閉鎖時のパニック防止。
+        // SAFETY: Restore SIGPIPE to default behavior to prevent panic on broken pipe.
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 

@@ -75,14 +75,14 @@ Add to settings:
 | Tool | Description |
 |------|-------------|
 | `search` | Text/regex search with context. Auto-builds index. Max 4000 tokens by default. |
-| `find_definitions` | Find function/struct/class definitions across languages |
+| `find_definitions` | Find likely definitions by regex heuristics (may include false positives) |
 | `read_file` | Read file contents with optional line range |
 | `index_status` | Check index freshness and stats |
 | `build_index` | Explicitly rebuild index |
 
 ## Performance
 
-Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 32GB RAM, macOS.
+Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 32GB RAM, macOS. **All numbers are warm cache, after index build.** First run includes a one-time index build (~6s for Linux kernel). See [Index Cost](#index-cost) for details.
 
 ### Large: Linux kernel (92,947 files, 2.0GB)
 

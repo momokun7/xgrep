@@ -49,7 +49,7 @@ pub fn tools_list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "find_definitions",
-            "description": "Find definitions of a symbol (function, struct, class, etc.) in the codebase.",
+            "description": "Find likely definitions of a symbol using regex heuristics (fn/struct/class/def patterns). May include false positives — not AST-based.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

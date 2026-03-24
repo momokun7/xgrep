@@ -143,7 +143,7 @@ pub fn decode_varint(data: &[u8]) -> (u32, usize) {
     let mut shift: u32 = 0;
     for (i, &byte) in data.iter().enumerate() {
         if shift >= 35 {
-            // Overflow: u32は最大5バイト (5*7=35bit)。これ以上はmalformed
+            // Overflow: u32 requires at most 5 bytes (5*7=35bit). Beyond this is malformed
             return (result, i + 1);
         }
         if shift == 28 && (byte & 0x70) != 0 {
@@ -259,10 +259,10 @@ mod tests {
 
     #[test]
     fn test_decode_varint_overflow_all_continuation_bits() {
-        // 全バイトにcontinuation bitが設定されている不正データ
+        // Invalid data: all bytes have continuation bit set
         let data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         let (_, bytes_read) = decode_varint(&data);
-        // 5バイト目(shift=35)でoverflow検出して6バイト目を返す
+        // Overflow detected at byte 5 (shift=35), returns up to byte 6
         assert!(bytes_read > 0);
         assert!(bytes_read <= 6);
     }
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_decode_varint_exactly_5_continuation_bytes() {
-        // 5バイト全てcontinuation bit付き: shift=35でoverflow
+        // All 5 bytes have continuation bit set: overflow at shift=35
         let data = [0x80, 0x80, 0x80, 0x80, 0x80];
         let (_, bytes_read) = decode_varint(&data);
         assert!(bytes_read > 0);

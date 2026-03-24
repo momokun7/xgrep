@@ -85,7 +85,7 @@ impl IndexReader {
             .checked_add(trigram_table_size)
             .ok_or_else(|| anyhow::anyhow!("Index header overflow"))?;
 
-        // trigram tableの終端がmmap範囲内か検証
+        // Verify trigram table end is within mmap bounds
         if posting_lists_start > mmap.len() {
             bail!(
                 "Index file is truncated or corrupt (trigram table exceeds file size: need {} bytes, got {})",
@@ -106,7 +106,7 @@ impl IndexReader {
             .checked_add(file_table_size)
             .ok_or_else(|| anyhow::anyhow!("Index header overflow"))?;
 
-        // 全体のオフセットがmmap範囲内か検証
+        // Verify all offsets are within mmap bounds
         if string_pool_start > mmap.len() {
             bail!(
                 "Index file is truncated or corrupt (expected at least {} bytes, got {})",
@@ -173,7 +173,7 @@ impl IndexReader {
         }
         let (count, mut pos) = decode_varint(data);
         let count = count as usize;
-        // Sanity check: countがデータ長を超える場合は破損データ
+        // Sanity check: count exceeding data length indicates corrupt data
         if count > data.len() {
             return vec![];
         }
@@ -181,11 +181,11 @@ impl IndexReader {
         let mut prev: u32 = 0;
         for _ in 0..count {
             if pos >= data.len() {
-                break; // データが途中で切れている
+                break; // Data is truncated
             }
             let (delta, bytes_read) = decode_varint(&data[pos..]);
             if bytes_read == 0 {
-                break; // 進めない場合は無限ループ防止
+                break; // Prevent infinite loop when no progress
             }
             pos += bytes_read;
             prev = prev.saturating_add(delta);
@@ -248,7 +248,7 @@ impl IndexReader {
         for i in lo_idx..hi_idx {
             let offset = trigram_table_start + i * TrigramEntry::SIZE;
             let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
-            // sanity check: prefixが一致するエントリのみ処理
+            // Sanity check: only process entries matching the prefix
             if entry.trigram[0] != prefix[0] || entry.trigram[1] != prefix[1] {
                 continue;
             }
@@ -383,13 +383,13 @@ mod tests {
 
     #[test]
     fn test_open_truncated_index() {
-        // headerは正常だがtrigram_countが巨大で実データが不足しているケース
+        // Header is valid but trigram_count is huge with insufficient actual data
         let dir = tempdir().unwrap();
         let path = dir.path().join("truncated.xgrep");
-        let mut data = vec![0u8; 28]; // Header(24) + 4バイトだけ
+        let mut data = vec![0u8; 28]; // Header(24) + only 4 bytes
         data[0..4].copy_from_slice(b"XGRP");
         data[4..8].copy_from_slice(&VERSION.to_le_bytes());
-        data[8..12].copy_from_slice(&9999u32.to_le_bytes()); // trigram_count = 9999 (巨大)
+        data[8..12].copy_from_slice(&9999u32.to_le_bytes()); // trigram_count = 9999 (huge)
         data[12..16].copy_from_slice(&0u32.to_le_bytes()); // file_count = 0
         data[16..24].copy_from_slice(&0u64.to_le_bytes()); // posting_total_bytes = 0
         fs::write(&path, &data).unwrap();
@@ -401,7 +401,7 @@ mod tests {
     fn test_file_path_invalid_id() {
         let (_dir, index_path) = build_test_index();
         let reader = IndexReader::open(&index_path).unwrap();
-        // file_count以上のIDを渡した場合
+        // Pass an ID >= file_count
         let path = reader.file_path(9999);
         assert_eq!(path, "<invalid file_id>");
     }
@@ -429,12 +429,12 @@ mod tests {
 
     #[test]
     fn test_decode_posting_list_malformed() {
-        // countが100だがデータが2バイトしかない
+        // count is 100 but only 2 bytes of data
         let mut data = Vec::new();
         crate::index::format::encode_varint(&mut data, 100);
-        // delta用のデータは無い
+        // No data for deltas
         let result = IndexReader::decode_posting_list(&data);
-        // 無限ループせず、空 or 部分結果を返すこと
+        // Should not infinite-loop; returns empty or partial result
         assert!(result.len() < 100);
     }
 }

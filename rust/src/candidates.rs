@@ -2,7 +2,7 @@ use crate::index::reader::IndexReader;
 use crate::trigram_query;
 
 // ---------------------------------------------------------------------------
-// 候補解決（インデックスからの絞り込み）
+// Candidate resolution (narrowing down from index)
 // ---------------------------------------------------------------------------
 
 /// Resolve candidate file IDs for literal string search.
@@ -99,7 +99,7 @@ pub(crate) fn resolve_regex_candidates(
 }
 
 // ---------------------------------------------------------------------------
-// ヘルパー関数
+// Helper functions
 // ---------------------------------------------------------------------------
 
 /// Expand each Trigram node in a TrigramQuery tree into case variants.
@@ -263,9 +263,9 @@ mod tests {
 
     #[test]
     fn test_case_variants_non_letter() {
-        // 数字や記号はバリアントを生成しない
+        // Digits and symbols do not generate variants
         let variants = case_variants(*b"h1!");
-        assert_eq!(variants.len(), 2); // h/H のみ
+        assert_eq!(variants.len(), 2); // h/H only
         assert!(variants.contains(b"h1!"));
         assert!(variants.contains(b"H1!"));
     }
