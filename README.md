@@ -82,6 +82,40 @@ xgrep "pattern" --since 1h          # Only search recently changed files
 xgrep init --local                  # Store index in .xgrep/ instead of cache
 ```
 
+### MCP Server
+
+xgrep can run as an MCP (Model Context Protocol) server for AI coding tools:
+
+```bash
+xgrep serve                        # Start MCP server for current directory
+xgrep serve --root /path/to/repo   # Start for a specific directory
+```
+
+#### Claude Code
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "xgrep": {
+      "command": "xgrep",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+#### Available MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `search` | Text/regex code search with context lines |
+| `find_definitions` | Find function/struct/class definitions by name |
+| `read_file` | Read file contents with optional line range |
+| `index_status` | Check search index freshness |
+| `build_index` | Rebuild search index |
+
 ### Output Formats
 
 **Default** (ripgrep-compatible):
