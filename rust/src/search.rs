@@ -114,6 +114,9 @@ impl Matcher for CaseInsensitiveMatcher {
         let mut results = Vec::new();
 
         // コンテンツ全体を一度だけlowercase化（ASCII-only、SIMDで高速）
+        // NOTE: to_vec()でファイルサイズ分のコピーが発生するが、make_ascii_lowercase()の
+        // SIMD最適化 + memmem SIMD検索の恩恵が大きく、行単位処理より高速。
+        // MAX_CHUNK_SIZE制約により同時メモリ使用量は制限されている。
         let mut lowered = content.to_vec();
         lowered.make_ascii_lowercase();
 
