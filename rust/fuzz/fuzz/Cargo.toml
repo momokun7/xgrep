@@ -1,0 +1,32 @@
+[package]
+name = "xgrep-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+xgrep = { path = "..", features = ["fuzz"] }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_varint"
+path = "fuzz_targets/fuzz_varint.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_posting_list"
+path = "fuzz_targets/fuzz_posting_list.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_index_reader"
+path = "fuzz_targets/fuzz_index_reader.rs"
+doc = false
