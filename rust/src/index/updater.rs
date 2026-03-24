@@ -179,11 +179,6 @@ fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
         }
     }
 
-    // 未コミットの変更 + 未追跡ファイル
-    for path in collect_uncommitted_changes(root)? {
-        files.insert(path.to_string_lossy().to_string());
-    }
-
     let mut result: Vec<String> = files.into_iter().collect();
     result.sort();
     Ok(result)
