@@ -16,9 +16,9 @@
 pub(crate) mod filetype;
 pub(crate) mod git;
 pub mod index;
-pub mod mcp;
+pub(crate) mod mcp;
 pub mod mcp_server;
-pub mod mcp_tools;
+pub(crate) mod mcp_tools;
 pub mod output;
 pub mod search;
 pub(crate) mod trigram;
@@ -215,6 +215,39 @@ impl Xgrep {
         } else {
             search::search_files(&self.root, &files, pattern, opts.case_insensitive)
         }
+    }
+
+    /// インデックスのステータス情報を返す
+    pub fn index_status(&self) -> Result<String> {
+        let status = index::updater::check_index_status(&self.root, &self.index_path)?;
+        let status_str = match &status {
+            index::updater::IndexStatus::Fresh => "fresh".to_string(),
+            index::updater::IndexStatus::Stale { changed_files } => {
+                format!("stale ({} changed files)", changed_files.len())
+            }
+            index::updater::IndexStatus::NeedsFullBuild => "no index".to_string(),
+        };
+
+        let index_info = if self.index_path.exists() {
+            let meta = std::fs::metadata(&self.index_path).ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let reader = index::reader::IndexReader::open(&self.index_path).ok();
+            let file_count = reader.map(|r| r.file_count()).unwrap_or(0);
+            format!(
+                "Status: {}\nIndexed files: {}\nIndex size: {} bytes\nIndex path: {}",
+                status_str,
+                file_count,
+                size,
+                self.index_path.display()
+            )
+        } else {
+            format!(
+                "Status: {}\nIndex path: {}",
+                status_str,
+                self.index_path.display()
+            )
+        };
+        Ok(index_info)
     }
 }
 
