@@ -681,8 +681,8 @@ mod tests {
             status
         );
 
-        // Wait briefly then modify a file
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Wait for filesystem timestamp to advance (Windows NTFS needs >1s)
+        std::thread::sleep(std::time::Duration::from_secs(2));
         fs::write(root.join("b.txt"), "world").unwrap();
 
         // Index should be NeedsFullBuild now
