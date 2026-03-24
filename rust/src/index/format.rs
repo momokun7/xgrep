@@ -1,3 +1,40 @@
+//! # xgrep Index Binary Format (Version 2)
+//!
+//! ```text
+//! ┌──────────────────────────────────────────┐
+//! │ Header (24 bytes)                        │
+//! │   magic: [u8; 4]        = "XGRP"        │
+//! │   version: u32           = 2             │
+//! │   trigram_count: u32                     │
+//! │   file_count: u32                        │
+//! │   posting_total_bytes: u64               │
+//! ├──────────────────────────────────────────┤
+//! │ Trigram Table (16 bytes × trigram_count) │
+//! │   trigram: [u8; 3]                       │
+//! │   _padding: u8                           │
+//! │   posting_offset: u64                    │
+//! │   posting_len: u32                       │
+//! ├──────────────────────────────────────────┤
+//! │ Posting Lists (variable length)          │
+//! │   Per trigram:                            │
+//! │     count: varint                        │
+//! │     file_ids: varint[] (delta-encoded)   │
+//! ├──────────────────────────────────────────┤
+//! │ File Table (28 bytes × file_count)       │
+//! │   path_offset: u32                       │
+//! │   mtime: u64                             │
+//! │   size: u64                              │
+//! │   content_hash: u64                      │
+//! ├──────────────────────────────────────────┤
+//! │ String Pool (variable length)            │
+//! │   Null-terminated file paths             │
+//! └──────────────────────────────────────────┘
+//! ```
+//!
+//! All integers are little-endian. Trigram table is sorted by trigram bytes
+//! for binary search. Posting lists use LEB128 varint encoding with delta
+//! compression (file IDs stored as differences from previous).
+
 pub const MAGIC: [u8; 4] = *b"XGRP";
 pub const VERSION: u32 = 2;
 
@@ -14,6 +51,10 @@ pub struct Header {
 
 /// Trigram Table entry: 16 bytes
 /// trigram(3) + padding(1) + posting_offset(8) + posting_len(4) = 16
+///
+/// WARNING: Do NOT use `unsafe { ptr::read_unaligned(... as *const TrigramEntry) }` or similar
+/// pointer casts on this struct. Always use `to_bytes()` for serialization.
+/// The packed repr exists only to define the exact byte layout.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrigramEntry {
@@ -25,6 +66,10 @@ pub struct TrigramEntry {
 
 /// File Table entry: 28 bytes
 /// path_offset(4) + mtime(8) + size(8) + content_hash(8) = 28
+///
+/// WARNING: Do NOT use `unsafe { ptr::read_unaligned(... as *const FileEntry) }` or similar
+/// pointer casts on this struct. Always use `to_bytes()` for serialization.
+/// The packed repr exists only to define the exact byte layout.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct FileEntry {

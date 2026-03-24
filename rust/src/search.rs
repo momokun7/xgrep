@@ -8,27 +8,60 @@ use regex::RegexBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// ASCII-only case-insensitive containsチェック。アロケーションなし。
-/// needleは事前にlowercase化されている前提。
-/// Unicode case foldingは非対応だが、コード検索ではASCIIで十分。
+/// ASCII-only case-insensitive containsチェック（テスト用ラッパー）。
+#[cfg(test)]
+#[allow(dead_code)]
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    contains_case_insensitive_bytes(haystack.as_bytes(), needle.as_bytes())
+}
+
+/// バイトスライス上でのASCII case-insensitive containsチェック。
+/// needleは事前にlowercase化されている前提。
+fn contains_case_insensitive_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
     }
-    let needle_bytes = needle.as_bytes();
-    let haystack_bytes = haystack.as_bytes();
-    if needle_bytes.len() > haystack_bytes.len() {
+    if needle.len() > haystack.len() {
         return false;
     }
-    'outer: for i in 0..=(haystack_bytes.len() - needle_bytes.len()) {
-        for j in 0..needle_bytes.len() {
-            if haystack_bytes[i + j].to_ascii_lowercase() != needle_bytes[j] {
+    'outer: for i in 0..=(haystack.len() - needle.len()) {
+        for j in 0..needle.len() {
+            if haystack[i + j].to_ascii_lowercase() != needle[j] {
                 continue 'outer;
             }
         }
         return true;
     }
     false
+}
+
+/// 各行の開始バイトオフセットのテーブルを構築する。
+/// line_offsets[i] = i+1行目の開始バイトオフセット。
+fn build_line_offsets(content: &[u8]) -> Vec<usize> {
+    let mut offsets = vec![0]; // 1行目はオフセット0から
+    for (i, &b) in content.iter().enumerate() {
+        if b == b'\n' {
+            offsets.push(i + 1);
+        }
+    }
+    offsets
+}
+
+/// 事前計算されたオフセットテーブルを用いて、バイト位置から行番号(1-based)を二分探索で求める。
+fn line_number_at(line_offsets: &[usize], pos: usize) -> usize {
+    match line_offsets.binary_search(&pos) {
+        Ok(i) => i + 1,
+        Err(i) => i, // posはi番目の行(0-indexed)の中にある → 行番号はi
+    }
+}
+
+/// 行番号(1-based)から行の開始バイトオフセットを取得する。
+fn line_start(line_offsets: &[usize], line_num: usize) -> usize {
+    if line_num <= 1 {
+        0
+    } else {
+        line_offsets.get(line_num - 1).copied().unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -54,21 +87,19 @@ struct LiteralMatcher {
 impl Matcher for LiteralMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
         let finder = memmem::Finder::new(&self.pattern);
+        let line_offsets = build_line_offsets(content);
         let mut results = Vec::new();
         let mut pos = 0;
 
         while let Some(match_pos) = finder.find(&content[pos..]) {
             let abs_pos = pos + match_pos;
-            let line_num = content[..abs_pos].iter().filter(|&&b| b == b'\n').count() + 1;
-            let line_start = content[..abs_pos]
-                .iter()
-                .rposition(|&b| b == b'\n')
-                .map_or(0, |p| p + 1);
+            let line_num = line_number_at(&line_offsets, abs_pos);
+            let ls = line_start(&line_offsets, line_num);
             let line_end = content[abs_pos..]
                 .iter()
                 .position(|&b| b == b'\n')
                 .map_or(content.len(), |p| abs_pos + p);
-            let line = std::str::from_utf8(&content[line_start..line_end]).unwrap_or("<binary>");
+            let line = std::str::from_utf8(&content[ls..line_end]).unwrap_or("<binary>");
 
             results.push(SearchResult {
                 file: rel_path.to_string(),
@@ -93,13 +124,14 @@ struct CaseInsensitiveMatcher {
 
 impl Matcher for CaseInsensitiveMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        let content_str = String::from_utf8_lossy(content);
+        let needle = self.pattern_lower.as_bytes();
         let mut results = Vec::new();
-        for (i, line) in content_str.lines().enumerate() {
-            if contains_case_insensitive(line, &self.pattern_lower) {
+        for (line_idx, line_bytes) in content.split(|&b| b == b'\n').enumerate() {
+            if contains_case_insensitive_bytes(line_bytes, needle) {
+                let line = std::str::from_utf8(line_bytes).unwrap_or("<binary>");
                 results.push(SearchResult {
                     file: rel_path.to_string(),
-                    line_number: i + 1,
+                    line_number: line_idx + 1,
                     line: line.to_string(),
                 });
             }
@@ -856,5 +888,23 @@ mod tests {
         let reader = IndexReader::open(&index_path).unwrap();
         let results = search(&reader, root, "hello world", true).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_build_line_offsets() {
+        let content = b"line1\nline2\nline3";
+        let offsets = build_line_offsets(content);
+        assert_eq!(offsets, vec![0, 6, 12]);
+    }
+
+    #[test]
+    fn test_line_number_at() {
+        let offsets = vec![0, 6, 12];
+        assert_eq!(line_number_at(&offsets, 0), 1); // start of line 1
+        assert_eq!(line_number_at(&offsets, 3), 1); // middle of line 1
+        assert_eq!(line_number_at(&offsets, 6), 2); // start of line 2
+        assert_eq!(line_number_at(&offsets, 8), 2); // middle of line 2
+        assert_eq!(line_number_at(&offsets, 12), 3); // start of line 3
+        assert_eq!(line_number_at(&offsets, 15), 3); // end of line 3
     }
 }
