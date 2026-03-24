@@ -108,7 +108,8 @@ impl TrigramCache {
             buf.extend_from_slice(path_bytes);
             buf.extend_from_slice(&cf.mtime.to_le_bytes());
             buf.extend_from_slice(&cf.content_hash.to_le_bytes());
-            buf.extend_from_slice(&(cf.trigrams.len() as u32).to_le_bytes());
+            let trigram_count: u32 = cf.trigrams.len().min(u32::MAX as usize) as u32;
+            buf.extend_from_slice(&trigram_count.to_le_bytes());
             for t in &cf.trigrams {
                 buf.extend_from_slice(t);
             }

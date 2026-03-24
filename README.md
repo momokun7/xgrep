@@ -53,7 +53,7 @@ cp target/release/xgrep ~/.local/bin/
 
 ### Requirements
 
-- Rust 1.70+
+- Rust 1.82+
 - macOS or Linux
 
 ## Usage
