@@ -537,7 +537,7 @@ mod tests {
         build_index(root, &index_path).unwrap();
 
         let data = fs::read(&index_path).unwrap();
-        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         assert_eq!(&header.magic, b"XGRP");
         assert_eq!(header.version, 1);
         assert_eq!(header.file_count, 1);
@@ -569,7 +569,7 @@ mod tests {
         build_index(root, &index_path).unwrap();
 
         let data = fs::read(&index_path).unwrap();
-        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         // Only real.txt should be indexed (not .gitignore, not ignored files)
         assert_eq!(header.file_count, 1);
     }
@@ -582,7 +582,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
         let data = fs::read(&index_path).unwrap();
-        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         assert_eq!(header.file_count, 0);
         assert_eq!(header.trigram_count, 0);
     }
@@ -597,7 +597,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
         let data = fs::read(&index_path).unwrap();
-        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         assert_eq!(header.file_count, 1); // only text.txt
     }
 
@@ -610,7 +610,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
         let data = fs::read(&index_path).unwrap();
-        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         // Empty file has no trigrams but is still indexed
         assert_eq!(header.file_count, 2);
     }
@@ -623,7 +623,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
         let data = fs::read(&index_path).unwrap();
-        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         assert_eq!(header.file_count, 1);
         // File has no trigrams (< 3 bytes)
         assert_eq!(header.trigram_count, 0);
@@ -639,7 +639,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
         let data = fs::read(&index_path).unwrap();
-        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         assert_eq!(header.file_count, 2);
     }
 
@@ -651,7 +651,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
         let data = fs::read(&index_path).unwrap();
-        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         assert_eq!(header.file_count, 1);
         assert!(header.trigram_count > 0);
     }
@@ -668,7 +668,7 @@ mod tests {
         build_index(root, &index_path).unwrap();
 
         let data = fs::read(&index_path).unwrap();
-        let header: Header = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Header) };
+        let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         assert_eq!(header.file_count, 1);
     }
 
