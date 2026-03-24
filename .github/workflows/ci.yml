@@ -80,10 +80,23 @@ jobs:
             exit 1
           fi
 
+  msrv:
+    name: MSRV check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.70.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Check MSRV
+        working-directory: rust
+        run: cargo check
+
   release:
     name: Release build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [test, lint, security]
+    needs: [test, lint, security, msrv]
     strategy:
       matrix:
         include:

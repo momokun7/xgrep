@@ -70,20 +70,12 @@ impl TrigramQuery {
             TrigramQuery::None => vec![],
             TrigramQuery::Trigram(t) => reader.lookup_trigram(*t),
             TrigramQuery::And(qs) => {
-                let mut lists: Vec<Vec<u32>> = qs.iter().map(|q| q.evaluate(reader)).collect();
+                let lists: Vec<Vec<u32>> = qs.iter().map(|q| q.evaluate(reader)).collect();
                 if lists.is_empty() {
                     return (0..reader.file_count()).collect();
                 }
-                // Sort by length (shortest first for efficiency)
-                lists.sort_by_key(|l| l.len());
-                let mut result = lists[0].clone();
-                for list in &lists[1..] {
-                    result = intersect_sorted(&result, list);
-                    if result.is_empty() {
-                        break;
-                    }
-                }
-                result
+                let refs: Vec<&[u32]> = lists.iter().map(|v| v.as_slice()).collect();
+                crate::candidates::intersect_postings(&refs)
             }
             TrigramQuery::Or(qs) => {
                 let mut combined = std::collections::BTreeSet::new();
@@ -96,25 +88,6 @@ impl TrigramQuery {
             }
         }
     }
-}
-
-/// Intersect two sorted u32 slices
-fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut result = Vec::new();
-    let mut i = 0;
-    let mut j = 0;
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                result.push(a[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    result
 }
 
 /// Convert a regex pattern string to a TrigramQuery
@@ -379,5 +352,57 @@ mod tests {
         let q =
             TrigramQuery::Or(vec![TrigramQuery::Trigram(*b"abc"), TrigramQuery::All]).simplify();
         assert!(matches!(q, TrigramQuery::All)); // Or with All = All
+    }
+
+    #[test]
+    fn test_evaluate_and_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "abcdef").unwrap();
+        std::fs::write(root.join("b.txt"), "ghijkl").unwrap();
+        let index_path = root.join("index.xgrep");
+        crate::index::builder::build_index(root, &index_path).unwrap();
+        let reader = crate::index::reader::IndexReader::open(&index_path).unwrap();
+
+        // "abc" AND "bcd" should match only a.txt
+        let query = TrigramQuery::And(vec![
+            TrigramQuery::Trigram(*b"abc"),
+            TrigramQuery::Trigram(*b"bcd"),
+        ]);
+        let results = query.evaluate(&reader);
+        assert!(!results.is_empty());
+        // All results should include the file containing "abcdef"
+    }
+
+    #[test]
+    fn test_evaluate_or_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "abcdef").unwrap();
+        std::fs::write(root.join("b.txt"), "ghijkl").unwrap();
+        let index_path = root.join("index.xgrep");
+        crate::index::builder::build_index(root, &index_path).unwrap();
+        let reader = crate::index::reader::IndexReader::open(&index_path).unwrap();
+
+        let query = TrigramQuery::Or(vec![
+            TrigramQuery::Trigram(*b"abc"),
+            TrigramQuery::Trigram(*b"ghi"),
+        ]);
+        let results = query.evaluate(&reader);
+        assert!(results.len() >= 2); // Both files should match
+    }
+
+    #[test]
+    fn test_evaluate_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        let index_path = root.join("index.xgrep");
+        crate::index::builder::build_index(root, &index_path).unwrap();
+        let reader = crate::index::reader::IndexReader::open(&index_path).unwrap();
+
+        let query = TrigramQuery::All;
+        let results = query.evaluate(&reader);
+        assert_eq!(results.len(), reader.file_count() as usize);
     }
 }

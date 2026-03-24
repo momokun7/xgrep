@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{bail, Result};
 use ignore::WalkBuilder;
@@ -27,6 +26,16 @@ impl Drop for LockGuard {
 }
 
 fn acquire_lock(index_path: &Path) -> Result<LockGuard> {
+    acquire_lock_with_retry(index_path, 3)
+}
+
+fn acquire_lock_with_retry(index_path: &Path, retries: u32) -> Result<LockGuard> {
+    if retries == 0 {
+        bail!(
+            "Failed to acquire lock after retries (lock: {})",
+            index_path.with_extension("lock").display()
+        );
+    }
     let lock_path = index_path.with_extension("lock");
     match fs::OpenOptions::new()
         .write(true)
@@ -45,7 +54,7 @@ fn acquire_lock(index_path: &Path) -> Result<LockGuard> {
                     {
                         if unsafe { libc::kill(pid as i32, 0) } != 0 {
                             let _ = fs::remove_file(&lock_path);
-                            return acquire_lock(index_path);
+                            return acquire_lock_with_retry(index_path, retries - 1);
                         }
                     }
                 }
@@ -202,10 +211,7 @@ pub fn build_index_with_cache(
         trigram_to_index.insert(*t, i);
     }
 
-    let write_positions: Vec<AtomicU32> = offset_table
-        .iter()
-        .map(|&off| AtomicU32::new(off))
-        .collect();
+    let mut write_positions: Vec<u32> = offset_table.clone();
 
     // ============================================================
     // テンポラリファイル作成 (posting data用)
@@ -249,26 +255,15 @@ pub fn build_index_with_cache(
     // ============================================================
     // Pass 2: Pass 1で収集済みのtrigramを使ってfile_idをmmapに配置
     // ============================================================
-    // SAFETY: temp_mmap_ptr is derived from temp_mmap which lives for the duration of this scope.
-    // All writes are sequential within each file (single-threaded loop).
-    // AtomicU32 ensures each slot is written exactly once.
-    let temp_mmap_ptr = temp_mmap.as_mut_ptr();
-    let temp_mmap_len = temp_mmap.len();
-
     for (file_id, trigrams) in file_trigrams.iter().enumerate() {
         let file_id = file_id as u32;
         for t in trigrams {
             if let Some(&idx) = trigram_to_index.get(t) {
-                let pos = write_positions[idx].fetch_add(1, Ordering::Relaxed) as usize;
-                if pos * 4 + 4 <= temp_mmap_len {
-                    let bytes = file_id.to_ne_bytes();
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            bytes.as_ptr(),
-                            temp_mmap_ptr.add(pos * 4),
-                            4,
-                        );
-                    }
+                let pos = write_positions[idx] as usize;
+                write_positions[idx] += 1;
+                let byte_offset = pos * 4;
+                if byte_offset + 4 <= temp_mmap.len() {
+                    temp_mmap[byte_offset..byte_offset + 4].copy_from_slice(&file_id.to_le_bytes());
                 }
             }
         }
@@ -310,7 +305,7 @@ pub fn build_index_with_cache(
         let mut file_ids: Vec<u32> = Vec::with_capacity(count);
         for j in 0..count {
             let pos = (start + j) * 4;
-            let fid = u32::from_ne_bytes([
+            let fid = u32::from_le_bytes([
                 temp_mmap[pos],
                 temp_mmap[pos + 1],
                 temp_mmap[pos + 2],
