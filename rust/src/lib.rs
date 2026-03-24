@@ -16,9 +16,9 @@
 pub(crate) mod candidates;
 pub(crate) mod filetype;
 pub(crate) mod git;
-pub mod index;
+pub(crate) mod index;
 pub(crate) mod mcp;
-pub mod mcp_server;
+pub(crate) mod mcp_server;
 pub(crate) mod mcp_tools;
 pub mod output;
 pub mod search;
@@ -250,6 +250,11 @@ impl Xgrep {
         };
         Ok(index_info)
     }
+}
+
+/// MCPサーバーを起動する（stdio transport）
+pub fn start_mcp_server(xg: Xgrep) {
+    mcp_server::start(xg);
 }
 
 fn resolve_index_path(root: &Path) -> Result<PathBuf> {
