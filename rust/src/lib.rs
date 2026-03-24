@@ -25,6 +25,13 @@ pub mod search;
 pub(crate) mod trigram;
 pub(crate) mod trigram_query;
 
+/// Re-exports for fuzz testing. Not part of the public API.
+#[cfg(feature = "fuzz")]
+pub mod fuzz_exports {
+    pub use crate::index::format::{decode_varint, encode_varint};
+    pub use crate::index::reader::IndexReader;
+}
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};

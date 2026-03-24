@@ -167,7 +167,7 @@ impl IndexReader {
         vec![]
     }
 
-    fn decode_posting_list(data: &[u8]) -> Vec<u32> {
+    pub fn decode_posting_list(data: &[u8]) -> Vec<u32> {
         if data.is_empty() {
             return vec![];
         }
