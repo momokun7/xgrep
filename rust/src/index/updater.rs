@@ -123,6 +123,39 @@ fn parse_status_paths(line: &str) -> Vec<String> {
     }
 }
 
+/// Uncommitted changes (staged + unstaged) and untracked files を取得する共通ヘルパー
+fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<PathBuf>> {
+    let mut changed = std::collections::HashSet::new();
+
+    // Staged + unstaged changes（追跡済みファイルのみ）
+    // -uno でuntracked filesを除外し、大規模リポジトリでのハングを防止
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain", "-uno"])
+        .current_dir(root)
+        .output()?;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        for path in parse_status_paths(line) {
+            changed.insert(PathBuf::from(path));
+        }
+    }
+
+    // 未追跡ファイル（.gitignoreを尊重した高速な列挙）
+    // git status --porcelain の代わりに ls-files --others を使うことで
+    // node_modules等の大量のuntracked filesがある場合でも高速に動作する
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(root)
+        .output()?;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            changed.insert(PathBuf::from(line));
+        }
+    }
+
+    Ok(changed)
+}
+
 /// 2つのコミット間の変更ファイル + 未コミットの変更ファイルを取得
 fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
     let mut files = std::collections::HashSet::new();
@@ -146,30 +179,9 @@ fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
         }
     }
 
-    // 未コミットの変更（staged + unstaged、追跡済みファイルのみ）
-    // -uno でuntracked filesを除外し、大規模リポジトリでのハングを防止
-    let output = std::process::Command::new("git")
-        .args(["status", "--porcelain", "-uno"])
-        .current_dir(root)
-        .output()?;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        for path in parse_status_paths(line) {
-            files.insert(path);
-        }
-    }
-
-    // 未追跡ファイル（.gitignoreを尊重した高速な列挙）
-    // git status --porcelain の代わりに ls-files --others を使うことで
-    // node_modules等の大量のuntracked filesがある場合でも高速に動作する
-    let output = std::process::Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .current_dir(root)
-        .output()?;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            files.insert(line.to_string());
-        }
+    // 未コミットの変更 + 未追跡ファイル
+    for path in collect_uncommitted_changes(root)? {
+        files.insert(path.to_string_lossy().to_string());
     }
 
     let mut result: Vec<String> = files.into_iter().collect();
@@ -206,28 +218,8 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
                 }
             }
 
-            // 未コミット変更（staged + unstaged、untracked除外で高速化）
-            let output = std::process::Command::new("git")
-                .args(["status", "--porcelain", "-uno"])
-                .current_dir(root)
-                .output()?;
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                for path in parse_status_paths(line) {
-                    changed.insert(PathBuf::from(path));
-                }
-            }
-
-            // 未追跡ファイル（インデックスに含まれていない新規ファイル）
-            let output = std::process::Command::new("git")
-                .args(["ls-files", "--others", "--exclude-standard"])
-                .current_dir(root)
-                .output()?;
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let line = line.trim();
-                if !line.is_empty() {
-                    changed.insert(PathBuf::from(line));
-                }
-            }
+            // 未コミット変更 + 未追跡ファイル
+            changed.extend(collect_uncommitted_changes(root)?);
         }
         _ => {
             // 非Gitリポジトリ or メタデータなし: mtimeベースで鮮度判定
@@ -263,7 +255,7 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
 /// キャッシュ付きでインデックスをビルドする（増分更新）
 #[allow(dead_code)]
 fn build_with_cache(root: &Path, index_path: &Path) -> Result<()> {
-    let cache_path = crate::index::builder::cache_path_for(index_path);
+    let cache_path = crate::index::cache::cache_path_for(index_path);
     crate::index::builder::build_index_with_cache(root, index_path, Some(&cache_path))
 }
 
@@ -286,19 +278,8 @@ pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
     match (&meta, &current_hash) {
         (Some(m), Some(curr)) if m.commit_hash.as_deref() == Some(curr.as_str()) => {
             // 同じコミット。未コミットの変更があるかチェック
-            // -uno で追跡済みファイルの変更を確認（untracked除外で高速化）
-            let output = std::process::Command::new("git")
-                .args(["status", "--porcelain", "-uno"])
-                .current_dir(root)
-                .output()?;
-            let tracked_changes = String::from_utf8_lossy(&output.stdout);
-            // 未追跡ファイルも確認（.gitignoreを尊重）
-            let output = std::process::Command::new("git")
-                .args(["ls-files", "--others", "--exclude-standard"])
-                .current_dir(root)
-                .output()?;
-            let untracked = String::from_utf8_lossy(&output.stdout);
-            if tracked_changes.trim().is_empty() && untracked.trim().is_empty() {
+            let uncommitted = collect_uncommitted_changes(root)?;
+            if uncommitted.is_empty() {
                 // 変更なし、インデックスは最新
                 return Ok(());
             }
