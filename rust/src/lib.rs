@@ -42,12 +42,19 @@ pub use search::SearchResult;
 /// `Default::default()` で固定文字列・case-sensitive・フィルタなしの検索になる。
 #[derive(Debug, Clone, Default)]
 pub struct SearchOptions {
+    /// Case-insensitive search (ASCII folding only)
     pub case_insensitive: bool,
+    /// Treat pattern as regex instead of literal string
     pub regex: bool,
+    /// Filter results by file extension (e.g., "rs", "py", "js")
     pub file_type: Option<String>,
+    /// Maximum number of results to return
     pub max_count: Option<usize>,
+    /// Only search files with uncommitted git changes
     pub changed_only: bool,
+    /// Only search files changed within a time duration (e.g., "1h", "2d", "3.commits")
     pub since: Option<String>,
+    /// Filter results by path substring match (e.g., "src/auth", "tests/")
     pub path_pattern: Option<String>,
 }
 
@@ -274,4 +281,32 @@ fn resolve_index_path(root: &Path) -> Result<PathBuf> {
         .join("xgrep")
         .join(format!("{:016x}", hash));
     Ok(cache_dir.join("index"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_index_path_prefers_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Create .xgrep/index
+        std::fs::create_dir_all(root.join(".xgrep")).unwrap();
+        std::fs::write(root.join(".xgrep/index"), "dummy").unwrap();
+
+        let path = resolve_index_path(root).unwrap();
+        assert!(path.ends_with(".xgrep/index"));
+    }
+
+    #[test]
+    fn test_resolve_index_path_falls_back_to_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No .xgrep/index exists
+
+        let path = resolve_index_path(root).unwrap();
+        assert!(path.to_string_lossy().contains("xgrep"));
+        assert!(path.ends_with("index"));
+    }
 }
