@@ -85,6 +85,19 @@ pub fn tools_list() -> Vec<Value> {
                 "properties": {}
             }
         }),
+        serde_json::json!({
+            "name": "read_file",
+            "description": "Read the contents of a file. Use after search to see full file context. Returns file content with line numbers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative file path (from project root)"},
+                    "start_line": {"type": "integer", "description": "Start line number (1-based, optional)"},
+                    "end_line": {"type": "integer", "description": "End line number (inclusive, optional)"}
+                },
+                "required": ["path"]
+            }
+        }),
     ]
 }
 
@@ -256,11 +269,69 @@ pub fn handle_index_status(xg: &Xgrep) -> (String, bool) {
     }
 }
 
+/// read_file ツールのハンドラ
+pub fn handle_read_file(xg: &Xgrep, params: &Value) -> (String, bool) {
+    let path = match params.get("path").and_then(|p| p.as_str()) {
+        Some(p) => p,
+        None => return ("Missing required parameter: path".to_string(), true),
+    };
+
+    let full_path = xg.root().join(path);
+
+    // Security: prevent path traversal
+    let canonical = match full_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return (format!("Cannot read file '{}': {}", path, e), true),
+    };
+    let root_canonical = match xg.root().canonicalize() {
+        Ok(p) => p,
+        Err(e) => return (format!("Cannot resolve root: {}", e), true),
+    };
+    if !canonical.starts_with(&root_canonical) {
+        return (
+            "Error: path traversal detected, file is outside project root".to_string(),
+            true,
+        );
+    }
+
+    let content = match std::fs::read_to_string(&full_path) {
+        Ok(c) => c,
+        Err(e) => return (format!("Cannot read file '{}': {}", path, e), true),
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start = params
+        .get("start_line")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as usize;
+    let end = params
+        .get("end_line")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(lines.len() as u64) as usize;
+
+    let start = start.max(1).min(lines.len());
+    let end = end.max(start).min(lines.len());
+
+    let lang = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(output::lang_from_ext)
+        .unwrap_or("");
+
+    let mut output = format!("## {}:{}-{}\n\n```{}\n", path, start, end, lang);
+    for (i, line) in lines[start - 1..end].iter().enumerate() {
+        output.push_str(&format!("{:4} | {}\n", start + i, line));
+    }
+    output.push_str("```\n");
+
+    (output, false)
+}
+
 /// シンボル名から定義パターンの正規表現を生成
 pub fn definition_regex(symbol: &str) -> String {
     let escaped = regex::escape(symbol);
     format!(
-        r"(?:pub\s+)?(?:fn|struct|enum|trait|type|impl|class|def|function|const|let|var|interface)\s+{}\b",
+        r"(?:pub\s+)?(?:fn|struct|enum|trait|type|impl|class|def|function|func|fun|const|let|var|val|interface)\s+{}\b",
         escaped
     )
 }
@@ -274,13 +345,14 @@ mod tests {
     #[test]
     fn test_tools_list() {
         let tools = tools_list();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"search"));
         assert!(names.contains(&"find_definitions"));
         assert!(names.contains(&"index_status"));
         assert!(names.contains(&"build_index"));
+        assert!(names.contains(&"read_file"));
     }
 
     fn setup_test_repo() -> (tempfile::TempDir, Xgrep) {
@@ -436,9 +508,57 @@ mod tests {
         assert!(re.is_match("class Foo:"));
         assert!(re.is_match("def Foo("));
         assert!(re.is_match("interface Foo {"));
+        assert!(re.is_match("func Foo(")); // Go/Swift
+        assert!(re.is_match("fun Foo(")); // Kotlin
+        assert!(re.is_match("val Foo =")); // Kotlin/Scala
 
         // Should NOT match FooBar (word boundary)
         assert!(!re.is_match("fn FooBar("));
         assert!(!re.is_match("struct FooBar {"));
+    }
+
+    #[test]
+    fn test_handle_read_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("hello.rs"), "line1\nline2\nline3\nline4\nline5").unwrap();
+
+        let xg = crate::Xgrep::open(root).unwrap();
+
+        let params = serde_json::json!({"path": "hello.rs"});
+        let (text, is_error) = handle_read_file(&xg, &params);
+        assert!(!is_error);
+        assert!(text.contains("line1"));
+        assert!(text.contains("line5"));
+    }
+
+    #[test]
+    fn test_handle_read_file_line_range() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("hello.rs"), "line1\nline2\nline3\nline4\nline5").unwrap();
+
+        let xg = crate::Xgrep::open(root).unwrap();
+
+        let params = serde_json::json!({"path": "hello.rs", "start_line": 2, "end_line": 4});
+        let (text, is_error) = handle_read_file(&xg, &params);
+        assert!(!is_error);
+        assert!(text.contains("line2"));
+        assert!(text.contains("line4"));
+        assert!(!text.contains("line1"));
+        assert!(!text.contains("line5"));
+    }
+
+    #[test]
+    fn test_handle_read_file_path_traversal() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("hello.rs"), "safe").unwrap();
+
+        let xg = crate::Xgrep::open(root).unwrap();
+
+        let params = serde_json::json!({"path": "../../etc/passwd"});
+        let (_, is_error) = handle_read_file(&xg, &params);
+        assert!(is_error);
     }
 }

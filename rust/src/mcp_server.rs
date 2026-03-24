@@ -27,7 +27,7 @@ pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
                     "name": "xgrep",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "xgrep is an ultra-fast indexed code search engine. Use 'search' to find patterns, 'find_definitions' to locate symbol definitions, 'index_status' to check index health, and 'build_index' to rebuild the index."
+                "instructions": "xgrep is an ultra-fast indexed code search engine. Use 'search' to find patterns, 'find_definitions' to locate symbol definitions, 'read_file' to view full file contents, 'index_status' to check index health, and 'build_index' to rebuild the index."
             });
             Some(mcp::success_response(id, result))
         }
@@ -53,6 +53,7 @@ pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
                 "find_definitions" => mcp_tools::handle_find_definitions(xg, &arguments),
                 "build_index" => mcp_tools::handle_build_index(xg),
                 "index_status" => mcp_tools::handle_index_status(xg),
+                "read_file" => mcp_tools::handle_read_file(xg, &arguments),
                 _ => {
                     return Some(mcp::error_response(
                         id,
@@ -141,7 +142,7 @@ mod tests {
 
         let resp = handle_message(&xg, &msg).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), crate::mcp_tools::tools_list().len());
     }
 
     #[test]
