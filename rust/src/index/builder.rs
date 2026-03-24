@@ -12,6 +12,53 @@ use crate::index::format::*;
 use crate::trigram;
 
 // ============================================================
+// Lock Guard: 並行ビルド防止のためのアドバイザリファイルロック
+// ============================================================
+
+struct LockGuard {
+    path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_lock(index_path: &Path) -> Result<LockGuard> {
+    let lock_path = index_path.with_extension("lock");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(mut f) => {
+            let _ = write!(f, "{}", std::process::id());
+            Ok(LockGuard { path: lock_path })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Check for stale lock (process no longer alive)
+            if let Ok(pid_str) = fs::read_to_string(&lock_path) {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    #[cfg(unix)]
+                    {
+                        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                            let _ = fs::remove_file(&lock_path);
+                            return acquire_lock(index_path);
+                        }
+                    }
+                }
+            }
+            bail!(
+                "Index build already in progress (lock: {})",
+                lock_path.display()
+            )
+        }
+        Err(e) => bail!("Failed to create lock file: {}", e),
+    }
+}
+
+// ============================================================
 // Trigram Cache: ファイルごとのtrigramをキャッシュし、増分更新を高速化
 // ============================================================
 
@@ -139,6 +186,8 @@ pub fn build_index_with_cache(
     index_path: &Path,
     cache_path: Option<&Path>,
 ) -> Result<()> {
+    let _lock_guard = acquire_lock(index_path)?;
+    let lock_path = index_path.with_extension("lock");
     let mut cache = cache_path.map(TrigramCache::load).unwrap_or(TrigramCache {
         entries: HashMap::new(),
     });
@@ -163,7 +212,11 @@ pub fn build_index_with_cache(
         if entry.file_type().is_none_or(|ft| !ft.is_file()) {
             continue;
         }
-        file_paths.push(entry.path().to_path_buf());
+        let path = entry.path().to_path_buf();
+        if path == lock_path {
+            continue;
+        }
+        file_paths.push(path);
     }
 
     let mut files: Vec<FileInfo> = Vec::new();
@@ -863,6 +916,52 @@ mod tests {
         build_index_with_cache(root, &index_path, Some(&cache_path)).unwrap();
         let reader2 = IndexReader::open(&index_path).unwrap();
         assert_eq!(reader2.file_count(), 2);
+    }
+
+    #[test]
+    fn test_concurrent_build_lock() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello").unwrap();
+        let index_path = root.join("index.xgrep");
+
+        // Manually create a lock file with our PID (simulating a concurrent build)
+        let lock_path = index_path.with_extension("lock");
+        fs::write(&lock_path, format!("{}", std::process::id())).unwrap();
+
+        // Build should fail because lock exists and our process is alive
+        let result = build_index(root, &index_path);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("already in progress"));
+
+        // Clean up lock
+        fs::remove_file(&lock_path).unwrap();
+
+        // Now build should succeed
+        let result = build_index(root, &index_path);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_stale_lock_recovery() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello").unwrap();
+        let index_path = root.join("index.xgrep");
+
+        // Create a lock file with a non-existent PID
+        let lock_path = index_path.with_extension("lock");
+        fs::write(&lock_path, "999999999").unwrap();
+
+        // Build should succeed (stale lock recovered)
+        let result = build_index(root, &index_path);
+        assert!(result.is_ok());
+
+        // Lock file should be cleaned up
+        assert!(!lock_path.exists());
     }
 
     #[test]

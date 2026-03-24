@@ -94,3 +94,38 @@ mod tests {
         assert_eq!(encode([0xFF, 0xFF, 0xFF]), 0x00FFFFFF);
     }
 }
+
+#[cfg(test)]
+mod proptest_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn extract_trigrams_length(input in prop::collection::vec(any::<u8>(), 0..200)) {
+            let trigrams = extract_trigrams(&input);
+            if input.len() < 3 {
+                prop_assert!(trigrams.is_empty());
+            } else {
+                prop_assert!(trigrams.len() <= input.len() - 2);
+            }
+        }
+
+        #[test]
+        fn extract_trigrams_are_subsequences(input in prop::collection::vec(any::<u8>(), 3..100)) {
+            let trigrams = extract_trigrams(&input);
+            for t in &trigrams {
+                let found = input.windows(3).any(|w| w == t);
+                prop_assert!(found, "Trigram {:?} not found in input", t);
+            }
+        }
+
+        #[test]
+        fn encode_decode_roundtrip(a in any::<u8>(), b in any::<u8>(), c in any::<u8>()) {
+            let trigram = [a, b, c];
+            let encoded = encode(trigram);
+            let decoded = decode(encoded);
+            prop_assert_eq!(decoded, trigram);
+        }
+    }
+}
