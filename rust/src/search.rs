@@ -73,6 +73,13 @@ struct LiteralMatcher {
 impl Matcher for LiteralMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
         let finder = memmem::Finder::new(&self.pattern);
+
+        // Early return if no match at all
+        if finder.find(content).is_none() {
+            return vec![];
+        }
+
+        // Only build line offsets when we know there's at least one match
         let line_offsets = build_line_offsets(content);
         let mut results = Vec::new();
         let mut pos = 0;
@@ -110,17 +117,33 @@ struct CaseInsensitiveMatcher {
 
 impl Matcher for CaseInsensitiveMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        let line_offsets = build_line_offsets(content);
-        let mut results = Vec::new();
+        let pattern_bytes = self.pattern_lower.as_bytes();
 
-        // コンテンツ全体を一度だけlowercase化（ASCII-only、SIMDで高速）
-        // NOTE: to_vec()でファイルサイズ分のコピーが発生するが、make_ascii_lowercase()の
-        // SIMD最適化 + memmem SIMD検索の恩恵が大きく、行単位処理より高速。
-        // MAX_CHUNK_SIZE制約により同時メモリ使用量は制限されている。
+        // Early rejection: check if first byte of pattern exists (either case)
+        if !pattern_bytes.is_empty() {
+            let first = pattern_bytes[0];
+            let first_upper = first.to_ascii_uppercase();
+            if first == first_upper {
+                // Non-alphabetic first byte
+                if memchr::memchr(first, content).is_none() {
+                    return vec![];
+                }
+            } else if memchr::memchr2(first, first_upper, content).is_none() {
+                return vec![];
+            }
+        }
+
+        // Now do the full lowercase + memmem search
         let mut lowered = content.to_vec();
         lowered.make_ascii_lowercase();
 
-        let finder = memmem::Finder::new(self.pattern_lower.as_bytes());
+        let finder = memmem::Finder::new(pattern_bytes);
+        if finder.find(&lowered).is_none() {
+            return vec![];
+        }
+
+        let line_offsets = build_line_offsets(content);
+        let mut results = Vec::new();
         let mut pos = 0;
 
         while let Some(match_pos) = finder.find(&lowered[pos..]) {
@@ -157,6 +180,12 @@ struct RegexMatcher {
 impl Matcher for RegexMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
         let content_str = String::from_utf8_lossy(content);
+
+        // Early return if no match
+        if !self.re.is_match(&content_str) {
+            return vec![];
+        }
+
         let mut results = Vec::new();
         for (i, line) in content_str.lines().enumerate() {
             if self.re.is_match(line) {
@@ -172,70 +201,58 @@ impl Matcher for RegexMatcher {
 }
 
 // ---------------------------------------------------------------------------
-// 統一スキャン関数
+// スキャン関数
 // ---------------------------------------------------------------------------
 
-/// 1チャンクあたりの最大ファイル数。メモリ使用量の上限を制御する。
-const MAX_CHUNK_SIZE: usize = 10_000;
-
-/// ファイル候補リストに対してMatcherでスキャンし、ソート済み結果を返す。
-/// 候補をMAX_CHUNK_SIZEごとに分割し、チャンク単位で並列処理することで
-/// 同時にメモリに載るファイル数を制限する。
-fn scan_files<M: Matcher>(
-    candidates: &[(String, PathBuf)],
-    matcher: &M,
-    skip_binary: bool,
-) -> Vec<SearchResult> {
-    let mut all_results = Vec::new();
-    for chunk in candidates.chunks(MAX_CHUNK_SIZE) {
-        let mut chunk_results: Vec<SearchResult> = chunk
-            .par_iter()
-            .flat_map(|(rel_path, full_path)| {
-                let content = match fs::read(full_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("xgrep: {}: {}", full_path.display(), e);
-                        return vec![];
-                    }
-                };
-                if skip_binary && memchr::memchr(0, &content).is_some() {
-                    return vec![];
-                }
-                matcher.find_matches(&content, rel_path)
-            })
-            .collect();
-        all_results.append(&mut chunk_results);
-    }
-    all_results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
-    all_results
-}
-
-/// IndexReaderの候補IDリストから(rel_path, full_path)ペアを構築する。
-fn candidates_from_index(
+/// インデックス候補IDリストから直接スキャン（中間Vec構築なし）
+fn scan_indexed<M: Matcher>(
     reader: &IndexReader,
     root: &Path,
     candidate_ids: &[u32],
-) -> Vec<(String, PathBuf)> {
-    candidate_ids
-        .iter()
-        .map(|&fid| {
-            let rel = reader.file_path(fid).to_string();
-            let full = root.join(&rel);
-            (rel, full)
+    matcher: &M,
+) -> Vec<SearchResult> {
+    let mut results: Vec<SearchResult> = candidate_ids
+        .par_iter()
+        .flat_map(|&fid| {
+            let rel_path = reader.file_path(fid);
+            let full_path = root.join(rel_path);
+            let content = match fs::read(&full_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("xgrep: {}: {}", full_path.display(), e);
+                    return vec![];
+                }
+            };
+            matcher.find_matches(&content, rel_path)
         })
-        .collect()
+        .collect();
+    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
+    results
 }
 
-/// PathBufリストから(rel_path, full_path)ペアを構築する。
-fn candidates_from_files(root: &Path, files: &[PathBuf]) -> Vec<(String, PathBuf)> {
-    files
-        .iter()
-        .map(|rel| {
-            let rel_str = rel.to_string_lossy().to_string();
-            let full = root.join(rel);
-            (rel_str, full)
+/// ファイルパスリストから直接スキャン（バイナリスキップあり）
+fn scan_direct<M: Matcher>(root: &Path, files: &[PathBuf], matcher: &M) -> Vec<SearchResult> {
+    let mut results: Vec<SearchResult> = files
+        .par_iter()
+        .flat_map(|rel_path| {
+            let full_path = root.join(rel_path);
+            let content = match fs::read(&full_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("xgrep: {}: {}", full_path.display(), e);
+                    return vec![];
+                }
+            };
+            // Skip binary files
+            if memchr::memchr(0, &content).is_some() {
+                return vec![];
+            }
+            let rel_str = rel_path.to_string_lossy();
+            matcher.find_matches(&content, &rel_str)
         })
-        .collect()
+        .collect();
+    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -279,19 +296,16 @@ pub fn search(
         case_insensitive,
     );
 
-    let candidates = candidates_from_index(reader, root, &candidate_ids);
-
-    // インデックス経由の検索ではバイナリチェック不要（インデックスビルド時にスキップ済み）
     let results = if case_insensitive {
         let matcher = CaseInsensitiveMatcher {
             pattern_lower: search_pattern,
         };
-        scan_files(&candidates, &matcher, false)
+        scan_indexed(reader, root, &candidate_ids, &matcher)
     } else {
         let matcher = LiteralMatcher {
             pattern: pattern.as_bytes().to_vec(),
         };
-        scan_files(&candidates, &matcher, false)
+        scan_indexed(reader, root, &candidate_ids, &matcher)
     };
 
     Ok(results)
@@ -311,18 +325,16 @@ pub fn search_files(
         );
     }
 
-    let candidates = candidates_from_files(root, files);
-
     let results = if case_insensitive {
         let matcher = CaseInsensitiveMatcher {
             pattern_lower: pattern.to_lowercase(),
         };
-        scan_files(&candidates, &matcher, true)
+        scan_direct(root, files, &matcher)
     } else {
         let matcher = LiteralMatcher {
             pattern: pattern.as_bytes().to_vec(),
         };
-        scan_files(&candidates, &matcher, true)
+        scan_direct(root, files, &matcher)
     };
 
     Ok(results)
@@ -341,10 +353,9 @@ pub fn search_regex(
         .build()?;
 
     let candidate_ids = resolve_regex_candidates(reader, pattern, case_insensitive);
-    let candidates = candidates_from_index(reader, root, &candidate_ids);
 
     let matcher = RegexMatcher { re };
-    let results = scan_files(&candidates, &matcher, false);
+    let results = scan_indexed(reader, root, &candidate_ids, &matcher);
 
     Ok(results)
 }
@@ -360,9 +371,8 @@ pub fn search_files_regex(
         .case_insensitive(case_insensitive)
         .build()?;
 
-    let candidates = candidates_from_files(root, files);
     let matcher = RegexMatcher { re };
-    let results = scan_files(&candidates, &matcher, true);
+    let results = scan_direct(root, files, &matcher);
 
     Ok(results)
 }
