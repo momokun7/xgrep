@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "Ultra-fast indexed code search with MCP server for AI agents. Trigram inverted index, 50x faster than ripgrep on repeated searches."
 license = "MIT"
+readme = "../README.md"
 repository = "https://github.com/momokun7/xgrep"
 keywords = ["search", "grep", "trigram", "index", "code-search"]
 categories = ["command-line-utilities", "development-tools"]
