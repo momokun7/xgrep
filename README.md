@@ -20,22 +20,32 @@ xgrep is not a ripgrep replacement. Use ripgrep for one-off searches. Use xgrep 
 ## Install
 
 ```bash
-# From source
+cargo install xgrep-search
+```
+
+This installs the `xg` command.
+
+<details>
+<summary>Build from source</summary>
+
+```bash
 git clone https://github.com/momokun7/xgrep.git
 cd xgrep/rust
 cargo build --release
 cp target/release/xg ~/.local/bin/
 ```
+</details>
 
 ### Requirements
 
 - Rust 1.85+
-- macOS or Linux
+- macOS, Linux, or Windows
 
 ## Quick Start
 
 ```bash
-xg "pattern"              # Search (auto-builds index on first run)
+cargo install xgrep-search    # Install (gives you the `xg` command)
+xg "pattern"                  # Search (auto-builds index on first run)
 xg -e "handle_\w+"        # Regex search
 xg "pattern" -i            # Case-insensitive
 xg "pattern" --type rs     # Filter by file type
