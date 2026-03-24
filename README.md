@@ -10,7 +10,7 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 |---|---------|-------|-------|
 | Setup | None | Server required | None (`cargo install`) |
 | First search | Instant | After server start | Auto-builds index |
-| Repeated search (Linux kernel) | 1,865ms | 170ms (server) | 38ms |
+| Repeated search (Linux kernel) | 2,107ms | 170ms (server) | 254ms |
 | Index size | N/A | 155% of source | 8% of source |
 | AI agent integration | None | None | MCP server built-in |
 | Memory (search) | 11MB | 288MB | 208MB |
@@ -86,27 +86,28 @@ Benchmarked on Linux kernel source (92,471 files, 2.0GB) with [hyperfine](https:
 
 ### Search Latency (warm cache)
 
-| Query | xgrep | ripgrep | zoekt (CLI) | vs ripgrep |
-|-------|-------|---------|-------------|------------|
-| `struct file_operations` | 38ms | 1,865ms | 170ms | **50x faster** |
-| `printk` | 64ms | 1,905ms | 94ms | **30x faster** |
-| `EXPORT_SYMBOL` | 70ms | 1,897ms | 93ms | **27x faster** |
+| Query | xgrep | ripgrep | vs ripgrep |
+|-------|-------|---------|------------|
+| `struct file_operations` | 254ms | 2,107ms | **8.3x faster** |
+| `printk` | 266ms | 1,967ms | **7.4x faster** |
+| `EXPORT_SYMBOL` | 288ms | 1,898ms | **6.6x faster** |
 
-### Medium Project (ripgrep source, 209 files)
+### Medium Project (ripgrep source, 248 files)
 
 | Query | xgrep | ripgrep | vs ripgrep |
 |-------|-------|---------|------------|
-| `fn main` | 2.6ms | 7.3ms | **2.8x faster** |
-| `Options` | 2.8ms | 8.2ms | **2.9x faster** |
+| `fn main` | 18ms | 8ms | ripgrep 2.2x faster |
+| `Options` | 19ms | 8ms | ripgrep 2.5x faster |
+
+> On small/medium codebases, ripgrep is faster due to xgrep's index loading overhead. xgrep's advantage grows with codebase size.
 
 ### Index Cost
 
 | Metric | xgrep | zoekt | ripgrep |
 |--------|-------|-------|---------|
-| Build time | 22s | 46s | N/A |
-| Index size | 167MB (8%) | 3.0GB (155%) | N/A |
-| Build memory | 160MB | 2.24GB | N/A |
-| Breakeven | **12 searches** | - | - |
+| Build time | 6s | 46s | N/A |
+| Index size | 175MB (8%) | 3.0GB (155%) | N/A |
+| Breakeven | ~10 searches | - | - |
 
 > zoekt numbers are CLI mode. In server mode, zoekt search latency is significantly lower.
 
