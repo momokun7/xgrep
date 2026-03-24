@@ -1,82 +1,96 @@
-#!/usr/bin/env bash
-# bench/run.sh — xgrep (Rust) vs xgrep (Zig) vs ripgrep vs grep ベンチマーク
-# スペックのベンチマーク4項目を全てカバー:
-#   1. インデックス構築速度
-#   2. 検索レイテンシ (cold/warm)
-#   3. 検索スループット
-#   4. メモリ使用量
+#!/bin/bash
 set -euo pipefail
 
+# xgrep Benchmark Suite
+# Requirements: hyperfine, ripgrep, xgrep (xg)
+# Usage: ./bench/run.sh [small|medium|large]
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-XGREP_RUST="$SCRIPT_DIR/../rust/target/release/xgrep"
-XGREP_ZIG="$SCRIPT_DIR/../zig/zig-out/bin/xgrep"
-TARGET="$SCRIPT_DIR/linux-src"
-QUERIES=("struct file_operations" "printk" "mutex_lock" "EXPORT_SYMBOL" "void __init")
-THROUGHPUT_N=${1:-100}
+RESULTS_DIR="$SCRIPT_DIR/results"
+mkdir -p "$RESULTS_DIR"
 
-echo "=== Build ==="
-echo "Rust:"
-cd "$SCRIPT_DIR/../rust" && cargo build --release
-echo "Zig:"
-cd "$SCRIPT_DIR/../zig" && zig build -Doptimize=ReleaseFast
-cd "$TARGET"
-
-echo ""
-echo "=== 1. Index Build Time ==="
-echo "--- Rust ---"
-rm -rf ~/Library/Caches/xgrep
-time "$XGREP_RUST" init 2>&1
-
-echo "--- Zig ---"
-rm -rf ~/Library/Caches/xgrep
-time "$XGREP_ZIG" init 2>&1
-
-echo ""
-echo "=== 2. Search Latency (warm) ==="
-# ウォームアップ
-"$XGREP_RUST" "warmup" > /dev/null 2>&1 || true
-"$XGREP_ZIG" "warmup" > /dev/null 2>&1 || true
-
-for q in "${QUERIES[@]}"; do
-    echo "--- query: '$q' ---"
-    echo "xgrep (Rust):"
-    time "$XGREP_RUST" "$q" | wc -l
-    echo "xgrep (Zig):"
-    time "$XGREP_ZIG" "$q" | wc -l
-    echo "ripgrep:"
-    time rg "$q" . | wc -l
-    echo "grep:"
-    time grep -r "$q" . | wc -l
-    echo ""
+# Check dependencies
+for cmd in hyperfine rg xg; do
+    if ! command -v "$cmd" &> /dev/null; then
+        echo "ERROR: $cmd is required. Install it first."
+        exit 1
+    fi
 done
 
+MODE="${1:-medium}"
+
+echo "=== xgrep Benchmark Suite ==="
+echo "Mode: $MODE"
+echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "xg version: $(xg --version 2>/dev/null || echo 'unknown')"
+echo "rg version: $(rg --version | head -1)"
+echo "hyperfine version: $(hyperfine --version)"
 echo ""
-echo "=== 3. Throughput ($THROUGHPUT_N queries) ==="
-echo "xgrep (Rust):"
-time for i in $(seq 1 "$THROUGHPUT_N"); do "$XGREP_RUST" "struct file_operations" > /dev/null; done
 
-echo "xgrep (Zig):"
-time for i in $(seq 1 "$THROUGHPUT_N"); do "$XGREP_ZIG" "struct file_operations" > /dev/null; done
+# --- Small benchmark: xgrep's own source ---
+if [[ "$MODE" == "small" || "$MODE" == "all" ]]; then
+    echo "=== Small: xgrep source ($(find "$SCRIPT_DIR/../rust/src" -name '*.rs' | wc -l | tr -d ' ') files) ==="
+    BENCH_DIR="$SCRIPT_DIR/../rust"
 
-echo "ripgrep:"
-time for i in $(seq 1 "$THROUGHPUT_N"); do rg "struct file_operations" . > /dev/null; done
+    cd "$BENCH_DIR"
+    xg init 2>/dev/null
 
-echo "grep:"
-time for i in $(seq 1 "$THROUGHPUT_N"); do grep -r "struct file_operations" . > /dev/null; done
+    hyperfine --warmup 3 --runs 20 \
+        "xg 'fn main'" \
+        "rg 'fn main'" \
+        --export-json "$RESULTS_DIR/small.json" \
+        --export-markdown "$RESULTS_DIR/small.md"
+    echo ""
+fi
 
-echo ""
-echo "=== 4. Memory Usage ==="
-echo "xgrep Rust (index build):"
-/usr/bin/time -l "$XGREP_RUST" init 2>&1 | grep -i "maximum resident" || echo "(measurement failed)"
-echo "xgrep Zig (index build):"
-/usr/bin/time -l "$XGREP_ZIG" init 2>&1 | grep -i "maximum resident" || echo "(measurement failed)"
-echo "xgrep Rust (search):"
-/usr/bin/time -l "$XGREP_RUST" "struct file_operations" > /dev/null 2>&1 | grep -i "maximum resident" || echo "(measurement failed)"
-echo "xgrep Zig (search):"
-/usr/bin/time -l "$XGREP_ZIG" "struct file_operations" > /dev/null 2>&1 | grep -i "maximum resident" || echo "(measurement failed)"
-echo "ripgrep (search):"
-/usr/bin/time -l rg "struct file_operations" . > /dev/null 2>&1 | grep -i "maximum resident" || echo "(measurement failed)"
+# --- Medium benchmark: ripgrep source ---
+if [[ "$MODE" == "medium" || "$MODE" == "all" ]]; then
+    RG_SRC="$SCRIPT_DIR/ripgrep-src"
+    if [[ ! -d "$RG_SRC" ]]; then
+        echo "Downloading ripgrep source..."
+        git clone --depth 1 https://github.com/BurntSushi/ripgrep.git "$RG_SRC"
+    fi
 
-echo ""
-echo "=== Index Size ==="
-du -h ~/Library/Caches/xgrep/*/index 2>/dev/null || echo "(no index found)"
+    FILE_COUNT=$(find "$RG_SRC" -type f | wc -l | tr -d ' ')
+    echo "=== Medium: ripgrep source ($FILE_COUNT files) ==="
+
+    cd "$RG_SRC"
+    xg init 2>/dev/null
+
+    for pattern in "fn main" "Options" "struct.*Config"; do
+        echo "--- Pattern: $pattern ---"
+        hyperfine --warmup 3 --runs 20 \
+            "xg '$pattern'" \
+            "rg '$pattern'" \
+            --export-json "$RESULTS_DIR/medium_$(echo "$pattern" | tr ' .*' '___').json"
+    done
+    echo ""
+fi
+
+# --- Large benchmark: Linux kernel (if available) ---
+if [[ "$MODE" == "large" || "$MODE" == "all" ]]; then
+    LINUX_SRC="$SCRIPT_DIR/linux-src"
+    if [[ ! -d "$LINUX_SRC" ]]; then
+        echo "Linux kernel source not found at $LINUX_SRC"
+        echo "Download with: git clone --depth 1 https://github.com/torvalds/linux.git $LINUX_SRC"
+        echo "Skipping large benchmark."
+    else
+        FILE_COUNT=$(find "$LINUX_SRC" -type f | wc -l | tr -d ' ')
+        echo "=== Large: Linux kernel ($FILE_COUNT files) ==="
+
+        cd "$LINUX_SRC"
+        xg init 2>/dev/null
+
+        for pattern in "struct file_operations" "printk" "EXPORT_SYMBOL"; do
+            echo "--- Pattern: $pattern ---"
+            hyperfine --warmup 3 --runs 20 \
+                "xg '$pattern'" \
+                "rg '$pattern'" \
+                --export-json "$RESULTS_DIR/large_$(echo "$pattern" | tr ' ' '_').json"
+        done
+        echo ""
+    fi
+fi
+
+echo "=== Results saved to $RESULTS_DIR ==="
+ls -la "$RESULTS_DIR"/*.json 2>/dev/null || echo "No JSON results generated"
