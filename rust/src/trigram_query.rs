@@ -17,6 +17,11 @@ pub enum TrigramQuery {
 }
 
 impl TrigramQuery {
+    /// Returns true if this query matches all files (no filtering)
+    pub fn is_all(&self) -> bool {
+        matches!(self, TrigramQuery::All)
+    }
+
     /// Simplify the query tree
     pub fn simplify(self) -> TrigramQuery {
         match self {
