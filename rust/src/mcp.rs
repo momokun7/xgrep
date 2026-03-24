@@ -10,6 +10,13 @@ pub struct Message {
 
 pub fn parse_message(line: &str) -> Result<Message, String> {
     let v: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+
+    // Validate jsonrpc version
+    match v.get("jsonrpc").and_then(|v| v.as_str()) {
+        Some("2.0") => {}
+        _ => return Err("invalid or missing jsonrpc version (expected \"2.0\")".to_string()),
+    }
+
     let method = v
         .get("method")
         .and_then(|m| m.as_str())
@@ -144,6 +151,12 @@ mod tests {
     #[test]
     fn test_parse_missing_method() {
         let result = parse_message(r#"{"jsonrpc":"2.0","id":1}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_missing_jsonrpc() {
+        let result = parse_message(r#"{"method":"test","id":1}"#);
         assert!(result.is_err());
     }
 }

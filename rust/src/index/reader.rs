@@ -8,6 +8,33 @@ use memmap2::Mmap;
 
 use crate::index::format::*;
 
+pub fn read_header(data: &[u8]) -> Header {
+    Header {
+        magic: [data[0], data[1], data[2], data[3]],
+        version: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+        trigram_count: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
+        file_count: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+    }
+}
+
+fn read_trigram_entry(data: &[u8]) -> TrigramEntry {
+    TrigramEntry {
+        trigram: [data[0], data[1], data[2]],
+        _padding: data[3],
+        posting_offset: u64::from_le_bytes(data[4..12].try_into().unwrap()),
+        posting_len: u32::from_le_bytes(data[12..16].try_into().unwrap()),
+    }
+}
+
+fn read_file_entry(data: &[u8]) -> FileEntry {
+    FileEntry {
+        path_offset: u32::from_le_bytes(data[0..4].try_into().unwrap()),
+        mtime: u64::from_le_bytes(data[4..12].try_into().unwrap()),
+        size: u64::from_le_bytes(data[12..20].try_into().unwrap()),
+        content_hash: u64::from_le_bytes(data[20..28].try_into().unwrap()),
+    }
+}
+
 pub struct IndexReader {
     mmap: Mmap,
     cached_header: Header,
@@ -42,7 +69,7 @@ impl IndexReader {
             bail!("Index file too small");
         }
 
-        let header: Header = unsafe { std::ptr::read_unaligned(mmap.as_ptr() as *const Header) };
+        let header = read_header(&mmap[..Header::SIZE]);
         if &header.magic != b"XGRP" {
             bail!("Invalid index magic");
         }
@@ -66,9 +93,7 @@ impl IndexReader {
         let mut posting_lists_total_bytes = 0usize;
         for i in 0..header.trigram_count as usize {
             let entry_offset = trigram_table_start + i * TrigramEntry::SIZE;
-            let entry: TrigramEntry = unsafe {
-                std::ptr::read_unaligned(mmap[entry_offset..].as_ptr() as *const TrigramEntry)
-            };
+            let entry = read_trigram_entry(&mmap[entry_offset..entry_offset + TrigramEntry::SIZE]);
             let end = entry.posting_offset as usize + entry.posting_len as usize;
             if end > posting_lists_total_bytes {
                 posting_lists_total_bytes = end;
@@ -120,9 +145,7 @@ impl IndexReader {
             if offset + TrigramEntry::SIZE > self.mmap.len() {
                 return vec![];
             }
-            let entry: TrigramEntry = unsafe {
-                std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const TrigramEntry)
-            };
+            let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
 
             match entry.trigram.cmp(&target) {
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -186,9 +209,7 @@ impl IndexReader {
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
                 let offset = trigram_table_start + mid * TrigramEntry::SIZE;
-                let entry: TrigramEntry = unsafe {
-                    std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const TrigramEntry)
-                };
+                let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
                 if entry.trigram < lo_target {
                     lo = mid + 1;
                 } else {
@@ -206,9 +227,7 @@ impl IndexReader {
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
                 let offset = trigram_table_start + mid * TrigramEntry::SIZE;
-                let entry: TrigramEntry = unsafe {
-                    std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const TrigramEntry)
-                };
+                let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
                 if entry.trigram <= hi_target {
                     lo = mid + 1;
                 } else {
@@ -225,9 +244,7 @@ impl IndexReader {
         let mut seen = std::collections::BTreeSet::new();
         for i in lo_idx..hi_idx {
             let offset = trigram_table_start + i * TrigramEntry::SIZE;
-            let entry: TrigramEntry = unsafe {
-                std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const TrigramEntry)
-            };
+            let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
             // sanity check: prefixが一致するエントリのみ処理
             if entry.trigram[0] != prefix[0] || entry.trigram[1] != prefix[1] {
                 continue;
@@ -250,8 +267,7 @@ impl IndexReader {
         if offset + FileEntry::SIZE > self.mmap.len() {
             return "<invalid file_id>";
         }
-        let entry: FileEntry =
-            unsafe { std::ptr::read_unaligned(self.mmap[offset..].as_ptr() as *const FileEntry) };
+        let entry = read_file_entry(&self.mmap[offset..offset + FileEntry::SIZE]);
         let str_start = self.string_pool_start + entry.path_offset as usize;
         if str_start >= self.mmap.len() {
             return "<invalid>";
@@ -342,7 +358,7 @@ mod tests {
         let mut data = vec![0u8; 16];
         data[0..4].copy_from_slice(b"XGRP");
         // version = 99 (invalid)
-        data[4..8].copy_from_slice(&99u32.to_ne_bytes());
+        data[4..8].copy_from_slice(&99u32.to_le_bytes());
         fs::write(&path, &data).unwrap();
         assert!(IndexReader::open(&path).is_err());
     }
@@ -365,9 +381,9 @@ mod tests {
         let path = dir.path().join("truncated.xgrep");
         let mut data = vec![0u8; 20]; // Header(16) + 4バイトだけ
         data[0..4].copy_from_slice(b"XGRP");
-        data[4..8].copy_from_slice(&1u32.to_ne_bytes()); // version = 1
-        data[8..12].copy_from_slice(&9999u32.to_ne_bytes()); // trigram_count = 9999 (巨大)
-        data[12..16].copy_from_slice(&0u32.to_ne_bytes()); // file_count = 0
+        data[4..8].copy_from_slice(&1u32.to_le_bytes()); // version = 1
+        data[8..12].copy_from_slice(&9999u32.to_le_bytes()); // trigram_count = 9999 (巨大)
+        data[12..16].copy_from_slice(&0u32.to_le_bytes()); // file_count = 0
         fs::write(&path, &data).unwrap();
         let result = IndexReader::open(&path);
         assert!(result.is_err());

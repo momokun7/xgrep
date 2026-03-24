@@ -13,16 +13,16 @@
 //! }
 //! ```
 
-pub mod filetype;
-pub mod git;
+pub(crate) mod filetype;
+pub(crate) mod git;
 pub mod index;
 pub mod mcp;
 pub mod mcp_server;
 pub mod mcp_tools;
 pub mod output;
 pub mod search;
-pub mod trigram;
-pub mod trigram_query;
+pub(crate) mod trigram;
+pub(crate) mod trigram_query;
 
 use std::path::{Path, PathBuf};
 

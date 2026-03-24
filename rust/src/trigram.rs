@@ -13,11 +13,13 @@ pub fn extract_trigrams(data: &[u8]) -> Vec<[u8; 3]> {
 }
 
 /// trigram ([u8; 3]) を u32 にエンコード（上位1バイトは0）
+#[allow(dead_code)]
 pub fn encode(trigram: [u8; 3]) -> u32 {
     (trigram[0] as u32) << 16 | (trigram[1] as u32) << 8 | trigram[2] as u32
 }
 
 /// u32 を [u8; 3] にデコード
+#[allow(dead_code)]
 pub fn decode(value: u32) -> [u8; 3] {
     [(value >> 16) as u8, (value >> 8) as u8, value as u8]
 }
