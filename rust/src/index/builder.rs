@@ -47,18 +47,34 @@ fn acquire_lock_with_retry(index_path: &Path, retries: u32) -> Result<LockGuard>
             Ok(LockGuard { path: lock_path })
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Check for stale lock (process no longer alive)
+            let mut stale = false;
+
+            // Unix: check if locking process is still alive
+            #[cfg(unix)]
             if let Ok(pid_str) = fs::read_to_string(&lock_path) {
                 if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    #[cfg(unix)]
-                    {
-                        if unsafe { libc::kill(pid as i32, 0) } != 0 {
-                            let _ = fs::remove_file(&lock_path);
-                            return acquire_lock_with_retry(index_path, retries - 1);
+                    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                        stale = true;
+                    }
+                }
+            }
+
+            // All platforms: lock older than 5 minutes is considered stale
+            if !stale {
+                if let Ok(meta) = fs::metadata(&lock_path) {
+                    if let Ok(modified) = meta.modified() {
+                        if modified.elapsed().unwrap_or_default().as_secs() > 300 {
+                            stale = true;
                         }
                     }
                 }
             }
+
+            if stale {
+                let _ = fs::remove_file(&lock_path);
+                return acquire_lock_with_retry(index_path, retries - 1);
+            }
+
             bail!(
                 "Index build already in progress (lock: {})",
                 lock_path.display()
@@ -825,6 +841,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_stale_lock_recovery() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -835,7 +852,7 @@ mod tests {
         let lock_path = index_path.with_extension("lock");
         fs::write(&lock_path, "999999999").unwrap();
 
-        // Build should succeed (stale lock recovered)
+        // Build should succeed (stale lock recovered via PID check)
         let result = build_index(root, &index_path);
         assert!(result.is_ok());
 
