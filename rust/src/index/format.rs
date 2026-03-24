@@ -237,3 +237,31 @@ mod tests {
         assert!(bytes_read > 0);
     }
 }
+
+#[cfg(test)]
+mod proptest_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn varint_roundtrip(value in 0u32..=u32::MAX) {
+            let mut buf = Vec::new();
+            encode_varint(&mut buf, value);
+            let (decoded, bytes_read) = decode_varint(&buf);
+            prop_assert_eq!(decoded, value);
+            prop_assert!(bytes_read > 0);
+            prop_assert!(bytes_read <= 5);
+            prop_assert_eq!(bytes_read, buf.len());
+        }
+
+        #[test]
+        fn varint_encoding_is_compact(value in 0u32..=u32::MAX) {
+            let mut buf = Vec::new();
+            encode_varint(&mut buf, value);
+            prop_assert!(buf.len() <= 5);
+            if value < 128 { prop_assert_eq!(buf.len(), 1); }
+            if value < 16384 { prop_assert!(buf.len() <= 2); }
+        }
+    }
+}
