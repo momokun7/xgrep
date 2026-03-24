@@ -350,7 +350,7 @@ mod tests {
     fn test_open_invalid_version() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("badver.xgrep");
-        let mut data = vec![0u8; 20];
+        let mut data = vec![0u8; 24];
         data[0..4].copy_from_slice(b"XGRP");
         // version = 99 (invalid)
         data[4..8].copy_from_slice(&99u32.to_le_bytes());
