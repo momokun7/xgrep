@@ -83,30 +83,43 @@ fn newest_file_mtime(root: &Path) -> Option<u64> {
 /// `git status --porcelain` の1行からファイルパスを抽出する
 ///
 /// フォーマット: "XY filename" or "XY \"filename with spaces\"" or "XY old -> new"
-fn parse_status_path(line: &str) -> Option<String> {
+/// リネームの場合は旧パスと新パスの両方を返す（旧パスのstaleエントリも除外するため）
+fn parse_status_paths(line: &str) -> Vec<String> {
     if line.len() < 4 {
-        return None;
+        return vec![];
     }
     let path_part = &line[3..];
 
-    // リネームの場合: "old -> new" → 新しい名前を使う
-    let path = if let Some(arrow_pos) = path_part.find(" -> ") {
-        &path_part[arrow_pos + 4..]
-    } else {
-        path_part
+    let clean = |p: &str| -> String {
+        let p = if p.starts_with('"') && p.ends_with('"') {
+            &p[1..p.len() - 1]
+        } else {
+            p
+        };
+        p.to_string()
     };
 
-    // クォートされたパスを処理（特殊文字を含むファイル名はgitがクォートする）
-    let path = if path.starts_with('"') && path.ends_with('"') {
-        &path[1..path.len() - 1]
+    if let Some(arrow_pos) = path_part.find(" -> ") {
+        // リネームの場合: 旧パスと新パスの両方を返す
+        let old = &path_part[..arrow_pos];
+        let new = &path_part[arrow_pos + 4..];
+        let old = clean(old);
+        let new = clean(new);
+        let mut result = vec![];
+        if !old.is_empty() {
+            result.push(old);
+        }
+        if !new.is_empty() {
+            result.push(new);
+        }
+        result
     } else {
-        path
-    };
-
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.to_string())
+        let path = clean(path_part);
+        if path.is_empty() {
+            vec![]
+        } else {
+            vec![path]
+        }
     }
 }
 
@@ -140,7 +153,7 @@ fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
         .current_dir(root)
         .output()?;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Some(path) = parse_status_path(line) {
+        for path in parse_status_paths(line) {
             files.insert(path);
         }
     }
@@ -199,7 +212,7 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
                 .current_dir(root)
                 .output()?;
             for line in String::from_utf8_lossy(&output.stdout).lines() {
-                if let Some(path) = parse_status_path(line) {
+                for path in parse_status_paths(line) {
                     changed.insert(PathBuf::from(path));
                 }
             }
@@ -529,32 +542,37 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_status_path_simple() {
+    fn test_parse_status_paths_simple() {
         assert_eq!(
-            parse_status_path(" M hello.txt"),
-            Some("hello.txt".to_string())
+            parse_status_paths(" M hello.txt"),
+            vec!["hello.txt".to_string()]
         );
     }
 
     #[test]
-    fn test_parse_status_path_rename() {
+    fn test_parse_status_paths_rename() {
+        let paths = parse_status_paths("R  old.txt -> new.txt");
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"old.txt".to_string()));
+        assert!(paths.contains(&"new.txt".to_string()));
+    }
+
+    #[test]
+    fn test_parse_status_paths_quoted() {
         assert_eq!(
-            parse_status_path("R  old.txt -> new.txt"),
-            Some("new.txt".to_string())
+            parse_status_paths(" M \"file with spaces.txt\""),
+            vec!["file with spaces.txt".to_string()]
         );
     }
 
     #[test]
-    fn test_parse_status_path_quoted() {
-        assert_eq!(
-            parse_status_path(" M \"file with spaces.txt\""),
-            Some("file with spaces.txt".to_string())
-        );
+    fn test_parse_status_paths_short() {
+        assert!(parse_status_paths("M").is_empty());
     }
 
     #[test]
-    fn test_parse_status_path_short() {
-        assert_eq!(parse_status_path("M"), None);
+    fn test_parse_status_paths_empty_line() {
+        assert!(parse_status_paths("?? ").is_empty());
     }
 
     #[test]

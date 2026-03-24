@@ -78,9 +78,12 @@ impl IndexReader {
             bail!("Unsupported index version: {}", header.version);
         }
 
-        let trigram_table_start = Header::SIZE;
-        let posting_lists_start =
-            trigram_table_start + (header.trigram_count as usize) * TrigramEntry::SIZE;
+        let trigram_table_size = (header.trigram_count as usize)
+            .checked_mul(TrigramEntry::SIZE)
+            .ok_or_else(|| anyhow::anyhow!("Index header overflow: trigram_count too large"))?;
+        let posting_lists_start = Header::SIZE
+            .checked_add(trigram_table_size)
+            .ok_or_else(|| anyhow::anyhow!("Index header overflow"))?;
 
         // trigram tableの終端がmmap範囲内か検証
         if posting_lists_start > mmap.len() {
@@ -91,8 +94,17 @@ impl IndexReader {
         }
 
         let posting_lists_total_bytes = header.posting_total_bytes as usize;
-        let file_table_start = posting_lists_start + posting_lists_total_bytes;
-        let string_pool_start = file_table_start + (header.file_count as usize) * FileEntry::SIZE;
+        let file_table_start = posting_lists_start
+            .checked_add(posting_lists_total_bytes)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Index header overflow: posting_total_bytes too large")
+            })?;
+        let file_table_size = (header.file_count as usize)
+            .checked_mul(FileEntry::SIZE)
+            .ok_or_else(|| anyhow::anyhow!("Index header overflow: file_count too large"))?;
+        let string_pool_start = file_table_start
+            .checked_add(file_table_size)
+            .ok_or_else(|| anyhow::anyhow!("Index header overflow"))?;
 
         // 全体のオフセットがmmap範囲内か検証
         if string_pool_start > mmap.len() {
