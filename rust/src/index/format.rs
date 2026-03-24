@@ -39,9 +39,9 @@ impl Header {
     pub fn to_bytes(&self) -> [u8; 16] {
         let mut bytes = [0u8; 16];
         bytes[0..4].copy_from_slice(&self.magic);
-        bytes[4..8].copy_from_slice(&self.version.to_ne_bytes());
-        bytes[8..12].copy_from_slice(&self.trigram_count.to_ne_bytes());
-        bytes[12..16].copy_from_slice(&self.file_count.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&self.version.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.trigram_count.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.file_count.to_le_bytes());
         bytes
     }
 }
@@ -53,8 +53,8 @@ impl TrigramEntry {
         let mut bytes = [0u8; 16];
         bytes[0..3].copy_from_slice(&self.trigram);
         bytes[3] = self._padding;
-        bytes[4..12].copy_from_slice(&self.posting_offset.to_ne_bytes());
-        bytes[12..16].copy_from_slice(&self.posting_len.to_ne_bytes());
+        bytes[4..12].copy_from_slice(&self.posting_offset.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.posting_len.to_le_bytes());
         bytes
     }
 }
@@ -64,10 +64,10 @@ impl FileEntry {
 
     pub fn to_bytes(&self) -> [u8; 28] {
         let mut bytes = [0u8; 28];
-        bytes[0..4].copy_from_slice(&self.path_offset.to_ne_bytes());
-        bytes[4..12].copy_from_slice(&self.mtime.to_ne_bytes());
-        bytes[12..20].copy_from_slice(&self.size.to_ne_bytes());
-        bytes[20..28].copy_from_slice(&self.content_hash.to_ne_bytes());
+        bytes[0..4].copy_from_slice(&self.path_offset.to_le_bytes());
+        bytes[4..12].copy_from_slice(&self.mtime.to_le_bytes());
+        bytes[12..20].copy_from_slice(&self.size.to_le_bytes());
+        bytes[20..28].copy_from_slice(&self.content_hash.to_le_bytes());
         bytes
     }
 }
