@@ -168,7 +168,7 @@ xgrep uses a [trigram inverted index](https://swtch.com/~rsc/regexp/regexp4.html
 
 - **Short queries (< 3 chars) bypass the index**: Patterns like `if`, `fn`, `go` fall back to full file scan with no speed advantage over ripgrep.
 - **Common trigrams reduce filtering**: Queries containing frequent trigrams (`the`, `int`, `return`) produce many candidate files, narrowing the speed gap with ripgrep.
-- **Not designed for monorepo scale**: Tested up to ~100K files (Linux kernel). Beyond that, posting list intersection costs dominate and the index becomes less effective.
+- **Scaling limits not yet determined**: Tested up to 92K files (Linux kernel, 2.0GB) where performance is excellent. Behavior on larger codebases (Chromium-scale, 350K+ files) has not been benchmarked.
 - **Index staleness**: Background rebuild runs every ~30 seconds. Recently saved files may not appear until the next rebuild completes.
 - **find_definitions is regex-based**: Uses heuristic patterns (`fn`/`struct`/`class`/`def`), not AST analysis. False positives are expected.
 - **ASCII-only case folding**: Case-insensitive search (`-i`) handles ASCII letters only. Unicode case folding is not supported.
