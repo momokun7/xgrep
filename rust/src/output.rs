@@ -446,6 +446,34 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_tokens_ascii() {
+        let text = "hello world this is a test";
+        let tokens = estimate_tokens(text);
+        // ~26 bytes / 4 = ~6-7 tokens
+        assert!(tokens >= 5 && tokens <= 10);
+    }
+
+    #[test]
+    fn test_estimate_tokens_cjk() {
+        let text = "こんにちは世界";
+        let tokens = estimate_tokens(text);
+        // 21 bytes, all non-ASCII, / 2 = ~10-11 tokens
+        assert!(tokens >= 8 && tokens <= 15);
+    }
+
+    #[test]
+    fn test_estimate_tokens_mixed() {
+        let text = "hello こんにちは";
+        let tokens = estimate_tokens(text);
+        assert!(tokens > 0);
+    }
+
+    #[test]
+    fn test_estimate_tokens_empty() {
+        assert_eq!(estimate_tokens(""), 1); // minimum 1
+    }
+
+    #[test]
     fn test_format_llm_no_token_limit() {
         let dir = tempdir().unwrap();
         let root = dir.path();
