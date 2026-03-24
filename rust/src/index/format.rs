@@ -37,6 +37,7 @@ pub struct FileEntry {
 impl Header {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_bytes(&self) -> [u8; 24] {
         let mut bytes = [0u8; 24];
         bytes[0..4].copy_from_slice(&self.magic);
@@ -51,6 +52,7 @@ impl Header {
 impl TrigramEntry {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_bytes(&self) -> [u8; 16] {
         let mut bytes = [0u8; 16];
         bytes[0..3].copy_from_slice(&self.trigram);
@@ -64,6 +66,7 @@ impl TrigramEntry {
 impl FileEntry {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_bytes(&self) -> [u8; 28] {
         let mut bytes = [0u8; 28];
         bytes[0..4].copy_from_slice(&self.path_offset.to_le_bytes());

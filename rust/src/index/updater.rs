@@ -261,12 +261,14 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
 }
 
 /// キャッシュ付きでインデックスをビルドする（増分更新）
+#[allow(dead_code)]
 fn build_with_cache(root: &Path, index_path: &Path) -> Result<()> {
     let cache_path = crate::index::builder::cache_path_for(index_path);
     crate::index::builder::build_index_with_cache(root, index_path, Some(&cache_path))
 }
 
 /// インデックスが最新かチェックし、必要に応じて再構築する
+#[allow(dead_code)]
 pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
     if !index_path.exists() {
         // インデックスが存在しない場合はフルビルド（キャッシュ作成付き）
