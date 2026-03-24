@@ -4,27 +4,27 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-/// キャッシュされたファイルのtrigram情報
+/// Cached trigram information for a file.
 pub(crate) struct CachedFile {
     pub mtime: u64,
     pub content_hash: u64,
     pub trigrams: Vec<[u8; 3]>,
 }
 
-/// ファイルパス→trigram情報のキャッシュ
+/// Cache mapping file paths to trigram information.
 pub struct TrigramCache {
     pub entries: HashMap<String, CachedFile>,
 }
 
 impl TrigramCache {
-    /// 空のキャッシュを作成する
+    /// Create an empty cache.
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
         }
     }
 
-    /// キャッシュファイルを読み込む。存在しない or 破損している場合は空キャッシュを返す。
+    /// Load cache from file. Returns an empty cache if the file does not exist or is corrupted.
     pub fn load(path: &Path) -> Self {
         let data = match fs::read(path) {
             Ok(d) => d,
@@ -86,7 +86,7 @@ impl TrigramCache {
         Self { entries }
     }
 
-    /// キャッシュをファイルに保存する
+    /// Save the cache to a file.
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut buf = Vec::new();
         if self.entries.len() > u32::MAX as usize {
@@ -122,7 +122,7 @@ impl TrigramCache {
     }
 }
 
-/// キャッシュファイルのパスを返す
+/// Return the cache file path for a given index path.
 pub fn cache_path_for(index_path: &Path) -> PathBuf {
     index_path.with_extension("cache")
 }

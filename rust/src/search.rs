@@ -8,8 +8,8 @@ use regex::RegexBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// ASCII-only case-insensitive containsチェック（テスト用）。
-/// 内部でmemmem::Finderを使用し、本番コードと同じアルゴリズムで検証する。
+/// ASCII-only case-insensitive contains check (for testing).
+/// Uses memmem::Finder internally to verify with the same algorithm as production code.
 #[cfg(test)]
 #[allow(dead_code)]
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
@@ -21,8 +21,8 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
         .is_some()
 }
 
-/// 各行の開始バイトオフセットのテーブルを構築する。
-/// line_offsets[i] = i+1行目の開始バイトオフセット。
+/// Build a table of byte offsets for the start of each line.
+/// line_offsets[i] = byte offset of the start of line i+1.
 fn build_line_offsets(content: &[u8]) -> Vec<usize> {
     let mut offsets = vec![0]; // 1行目はオフセット0から
     for (i, &b) in content.iter().enumerate() {
@@ -33,7 +33,7 @@ fn build_line_offsets(content: &[u8]) -> Vec<usize> {
     offsets
 }
 
-/// 事前計算されたオフセットテーブルを用いて、バイト位置から行番号(1-based)を二分探索で求める。
+/// Find the line number (1-based) for a byte position using binary search on precomputed offsets.
 fn line_number_at(line_offsets: &[usize], pos: usize) -> usize {
     match line_offsets.binary_search(&pos) {
         Ok(i) => i + 1,
@@ -41,7 +41,7 @@ fn line_number_at(line_offsets: &[usize], pos: usize) -> usize {
     }
 }
 
-/// 行番号(1-based)から行の開始バイトオフセットを取得する。
+/// Get the byte offset for the start of a line number (1-based).
 fn line_start(line_offsets: &[usize], line_num: usize) -> usize {
     if line_num <= 1 {
         0
@@ -65,7 +65,7 @@ trait Matcher: Send + Sync {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult>;
 }
 
-/// case-sensitive固定文字列マッチ（memmem::Finder使用）
+/// Case-sensitive literal string matcher (using memmem::Finder).
 struct LiteralMatcher {
     pattern: Vec<u8>,
 }
@@ -110,7 +110,7 @@ impl Matcher for LiteralMatcher {
     }
 }
 
-/// case-insensitive固定文字列マッチ（ASCII-only folding + memmem SIMD検索）
+/// Case-insensitive literal string matcher (ASCII-only folding + memmem SIMD search).
 struct CaseInsensitiveMatcher {
     pattern_lower: String,
 }
@@ -172,7 +172,7 @@ impl Matcher for CaseInsensitiveMatcher {
     }
 }
 
-/// 正規表現マッチ
+/// Regex matcher.
 struct RegexMatcher {
     re: regex::Regex,
 }
@@ -204,7 +204,7 @@ impl Matcher for RegexMatcher {
 // スキャン関数
 // ---------------------------------------------------------------------------
 
-/// インデックス候補IDリストから直接スキャン（中間Vec構築なし）
+/// Scan files directly from index candidate ID list (no intermediate Vec).
 fn scan_indexed<M: Matcher>(
     reader: &IndexReader,
     root: &Path,
@@ -230,7 +230,7 @@ fn scan_indexed<M: Matcher>(
     results
 }
 
-/// ファイルパスリストから直接スキャン（バイナリスキップあり）
+/// Scan files directly from a file path list (skipping binary files).
 fn scan_direct<M: Matcher>(root: &Path, files: &[PathBuf], matcher: &M) -> Vec<SearchResult> {
     let mut results: Vec<SearchResult> = files
         .par_iter()

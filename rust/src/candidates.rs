@@ -5,7 +5,7 @@ use crate::trigram_query;
 // 候補解決（インデックスからの絞り込み）
 // ---------------------------------------------------------------------------
 
-/// 固定文字列検索用の候補ID解決
+/// Resolve candidate file IDs for literal string search.
 pub(crate) fn resolve_literal_candidates(
     reader: &IndexReader,
     _original_pattern: &str,
@@ -70,7 +70,7 @@ pub(crate) fn resolve_literal_candidates(
     }
 }
 
-/// 正規表現検索用の候補ID解決
+/// Resolve candidate file IDs for regex search.
 pub(crate) fn resolve_regex_candidates(
     reader: &IndexReader,
     pattern: &str,
@@ -102,7 +102,7 @@ pub(crate) fn resolve_regex_candidates(
 // ヘルパー関数
 // ---------------------------------------------------------------------------
 
-/// TrigramQueryツリー内の各Trigramノードをケースバリアントに展開する
+/// Expand each Trigram node in a TrigramQuery tree into case variants.
 fn expand_case_variants_query(query: trigram_query::TrigramQuery) -> trigram_query::TrigramQuery {
     match query {
         trigram_query::TrigramQuery::Trigram(t) => {
@@ -128,8 +128,8 @@ fn expand_case_variants_query(query: trigram_query::TrigramQuery) -> trigram_que
     }
 }
 
-/// trigramの各バイトについてASCII文字であれば大文字/小文字の両バリアントを生成する。
-/// 最大8バリアント（3バイト全てがASCII文字の場合）。
+/// Generate upper/lowercase variants for each ASCII byte in a trigram.
+/// Up to 8 variants (when all 3 bytes are ASCII letters).
 pub(crate) fn case_variants(trigram: [u8; 3]) -> Vec<[u8; 3]> {
     let cases: [Vec<u8>; 3] = [
         if trigram[0].is_ascii_alphabetic() {

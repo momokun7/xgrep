@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// gitリポジトリかどうかを判定
+/// Check if the directory is a git repository.
 pub fn is_git_repo(root: &Path) -> bool {
     Command::new("git")
         .args(["rev-parse", "--git-dir"])
@@ -13,7 +13,7 @@ pub fn is_git_repo(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Git未コミット変更ファイル一覧を取得（staged + unstaged）
+/// Get the list of uncommitted changed files (staged + unstaged).
 pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
     if !is_git_repo(root) {
         bail!("not a git repository");
@@ -56,7 +56,7 @@ pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 
-/// 指定期間の変更ファイル一覧を取得
+/// Get the list of files changed within a specified duration.
 pub fn since_files(root: &Path, duration: &str) -> Result<Vec<PathBuf>> {
     if !is_git_repo(root) {
         bail!("not a git repository");

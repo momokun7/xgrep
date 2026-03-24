@@ -176,21 +176,21 @@ impl Xgrep {
             index::updater::IndexStatus::Stale { changed_files } => {
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
 
-                // インデックスから検索（変更ファイルの結果は古い可能性あり）
+                // Search from index (results for changed files may be stale)
                 let mut index_results = if opts.regex {
                     search::search_regex(&reader, &self.root, pattern, opts.case_insensitive)?
                 } else {
                     search::search(&reader, &self.root, pattern, opts.case_insensitive)?
                 };
 
-                // 変更ファイルの結果を除外（古いデータの可能性があるため）
+                // Exclude results from changed files (may be stale data)
                 let changed_set: std::collections::HashSet<String> = changed_files
                     .iter()
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
                 index_results.retain(|r| !changed_set.contains(&r.file));
 
-                // 変更ファイルを直接スキャン
+                // Directly scan changed files
                 let direct_results = if opts.regex {
                     search::search_files_regex(
                         &self.root,
@@ -207,7 +207,7 @@ impl Xgrep {
                     )?
                 };
 
-                // マージしてソート、重複除去
+                // Merge, sort, and deduplicate
                 index_results.extend(direct_results);
                 index_results
                     .sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
@@ -215,7 +215,7 @@ impl Xgrep {
                 Ok(index_results)
             }
             index::updater::IndexStatus::NeedsFullBuild => {
-                // インデックスなし、フルビルド
+                // No index, full build required
                 eprintln!("[indexing...]");
                 self.build_index()?;
                 eprintln!("[done]");
@@ -283,7 +283,7 @@ impl Xgrep {
         }
     }
 
-    /// インデックスのステータス情報を返す
+    /// Return index status information.
     pub fn index_status(&self) -> Result<String> {
         let status = index::updater::check_index_status(&self.root, &self.index_path)?;
         let status_str = match &status {

@@ -194,8 +194,8 @@ impl IndexReader {
         result
     }
 
-    /// 2バイトプレフィックスに一致する全trigramのposting listをunionして返す。
-    /// trigram tableはソート済みなのでbinary searchで範囲を特定する。
+    /// Return the union of posting lists for all trigrams matching a 2-byte prefix.
+    /// Uses binary search on the sorted trigram table to find the range.
     pub fn lookup_trigram_prefix(&self, prefix: [u8; 2]) -> Vec<u32> {
         let count = self.cached_header.trigram_count as usize;
         if count == 0 {

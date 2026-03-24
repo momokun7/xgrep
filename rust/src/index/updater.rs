@@ -4,18 +4,18 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use ignore::WalkBuilder;
 
-/// インデックスの鮮度チェック結果
+/// Index freshness check result.
 #[derive(Debug)]
 pub enum IndexStatus {
-    /// インデックスは最新、変更なし
+    /// Index is up-to-date, no changes.
     Fresh,
-    /// インデックスは存在するが一部ファイルが変更済み。インデックス検索+変更ファイル直接スキャンで対応
+    /// Index exists but some files have changed. Use index search + direct scan of changed files.
     Stale { changed_files: Vec<PathBuf> },
-    /// インデックスが存在しない、フルビルドが必要
+    /// Index does not exist, full build required.
     NeedsFullBuild,
 }
 
-/// インデックスと一緒に保存するメタデータ
+/// Metadata stored alongside the index.
 #[derive(Debug)]
 struct IndexMeta {
     commit_hash: Option<String>,
@@ -41,7 +41,7 @@ impl IndexMeta {
     }
 }
 
-/// 現在のgit HEADコミットハッシュを取得
+/// Get the current git HEAD commit hash.
 fn current_commit_hash(root: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -55,7 +55,7 @@ fn current_commit_hash(root: &Path) -> Option<String> {
     }
 }
 
-/// ディレクトリ内の最新ファイルのmtimeを取得（UNIX epoch秒）
+/// Get the newest file mtime in the directory (UNIX epoch seconds).
 fn newest_file_mtime(root: &Path) -> Option<u64> {
     let mut newest = 0u64;
     for entry in WalkBuilder::new(root).build().flatten() {
@@ -80,10 +80,10 @@ fn newest_file_mtime(root: &Path) -> Option<u64> {
     }
 }
 
-/// `git status --porcelain` の1行からファイルパスを抽出する
+/// Extract file paths from a `git status --porcelain` line.
 ///
-/// フォーマット: "XY filename" or "XY \"filename with spaces\"" or "XY old -> new"
-/// リネームの場合は旧パスと新パスの両方を返す（旧パスのstaleエントリも除外するため）
+/// Format: "XY filename" or "XY \"filename with spaces\"" or "XY old -> new"
+/// For renames, returns both old and new paths (to also exclude stale entries for old path).
 fn parse_status_paths(line: &str) -> Vec<String> {
     if line.len() < 4 {
         return vec![];
@@ -123,7 +123,7 @@ fn parse_status_paths(line: &str) -> Vec<String> {
     }
 }
 
-/// Uncommitted changes (staged + unstaged) and untracked files を取得する共通ヘルパー
+/// Common helper to collect uncommitted changes (staged + unstaged) and untracked files.
 fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<PathBuf>> {
     let mut changed = std::collections::HashSet::new();
 
@@ -156,7 +156,7 @@ fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<
     Ok(changed)
 }
 
-/// 2つのコミット間の変更ファイル + 未コミットの変更ファイルを取得
+/// Get files changed between two commits + uncommitted changed files.
 fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
     let mut files = std::collections::HashSet::new();
 
@@ -184,13 +184,13 @@ fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-/// インデックスメタデータを保存する（build_index後に呼ぶ）
+/// Save index metadata (call after build_index).
 pub fn save_meta(root: &Path, index_path: &Path) -> Result<()> {
     let hash = current_commit_hash(root);
     IndexMeta::save(index_path, hash.as_deref())
 }
 
-/// インデックスの鮮度をチェックし、変更ファイルリストを返す（リビルドしない）
+/// Check index freshness and return changed file list (does not rebuild).
 pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus> {
     if !index_path.exists() {
         return Ok(IndexStatus::NeedsFullBuild);
@@ -259,14 +259,14 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
     }
 }
 
-/// キャッシュ付きでインデックスをビルドする（増分更新）
+/// Build the index with cache (incremental update).
 #[allow(dead_code)]
 fn build_with_cache(root: &Path, index_path: &Path) -> Result<()> {
     let cache_path = crate::index::cache::cache_path_for(index_path);
     crate::index::builder::build_index_with_cache(root, index_path, Some(&cache_path))
 }
 
-/// インデックスが最新かチェックし、必要に応じて再構築する
+/// Check if the index is up-to-date and rebuild if necessary.
 #[allow(dead_code)]
 pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
     if !index_path.exists() {

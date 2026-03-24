@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::{output, SearchOptions, Xgrep};
 
-/// MCPツール定義を返す
+/// Return MCP tool definitions.
 pub fn tools_list() -> Vec<Value> {
     vec![
         serde_json::json!({
@@ -101,7 +101,7 @@ pub fn tools_list() -> Vec<Value> {
     ]
 }
 
-/// search ツールのハンドラ
+/// Handler for the `search` tool.
 pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
     let pattern = match params.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
@@ -169,7 +169,7 @@ pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
     }
 }
 
-/// find_definitions ツールのハンドラ
+/// Handler for the `find_definitions` tool.
 pub fn handle_find_definitions(xg: &Xgrep, params: &Value) -> (String, bool) {
     let symbol = match params.get("symbol").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -215,7 +215,7 @@ pub fn handle_find_definitions(xg: &Xgrep, params: &Value) -> (String, bool) {
     }
 }
 
-/// build_index ツールのハンドラ
+/// Handler for the `build_index` tool.
 pub fn handle_build_index(xg: &Xgrep) -> (String, bool) {
     let start = std::time::Instant::now();
     match xg.build_index() {
@@ -236,7 +236,7 @@ pub fn handle_build_index(xg: &Xgrep) -> (String, bool) {
     }
 }
 
-/// index_status ツールのハンドラ
+/// Handler for the `index_status` tool.
 pub fn handle_index_status(xg: &Xgrep) -> (String, bool) {
     match xg.index_status() {
         Ok(msg) => (msg, false),
@@ -244,7 +244,7 @@ pub fn handle_index_status(xg: &Xgrep) -> (String, bool) {
     }
 }
 
-/// read_file ツールのハンドラ
+/// Handler for the `read_file` tool.
 pub fn handle_read_file(xg: &Xgrep, params: &Value) -> (String, bool) {
     let path = match params.get("path").and_then(|p| p.as_str()) {
         Some(p) => p,
@@ -307,7 +307,7 @@ pub fn handle_read_file(xg: &Xgrep, params: &Value) -> (String, bool) {
     (output, false)
 }
 
-/// シンボル名から定義パターンの正規表現を生成
+/// Generate a regex pattern for symbol definitions from a symbol name.
 pub fn definition_regex(symbol: &str) -> String {
     let escaped = regex::escape(symbol);
     format!(

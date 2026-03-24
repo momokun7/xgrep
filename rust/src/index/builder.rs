@@ -391,7 +391,7 @@ pub fn build_index_with_cache(
     Ok(())
 }
 
-/// キャッシュを更新して保存する
+/// Update and save the cache.
 fn save_cache(
     cache: &mut TrigramCache,
     files: &[FileInfo],
@@ -417,7 +417,7 @@ fn save_cache(
     Ok(())
 }
 
-/// trigramが1つもない場合の書き出し (空ファイルや3バイト未満のファイルのみ)
+/// Write index when there are no trigrams (only empty files or files shorter than 3 bytes).
 fn write_index_no_postings(
     index_path: &Path,
     sorted_trigrams: &[[u8; 3]],

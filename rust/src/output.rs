@@ -6,7 +6,7 @@ use anyhow::Result;
 
 use crate::search::SearchResult;
 
-/// ファイル拡張子からMarkdownコードブロック用の言語名を返す
+/// Return the Markdown code block language name for a file extension.
 pub fn lang_from_ext(ext: &str) -> &'static str {
     match ext {
         "rs" => "rust",
@@ -29,7 +29,7 @@ pub fn lang_from_ext(ext: &str) -> &'static str {
     }
 }
 
-/// ripgrep互換のdefault形式で出力
+/// Format output in ripgrep-compatible default format.
 pub fn format_default(results: &[SearchResult]) -> String {
     results
         .iter()
@@ -38,7 +38,7 @@ pub fn format_default(results: &[SearchResult]) -> String {
         .join("\n")
 }
 
-/// JSON形式で出力
+/// Format output as JSON.
 pub fn format_json(results: &[SearchResult]) -> String {
     let json_results: Vec<serde_json::Value> = results
         .iter()
@@ -53,14 +53,14 @@ pub fn format_json(results: &[SearchResult]) -> String {
     serde_json::to_string_pretty(&json_results).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// トークン数を推定する。ASCIIは約4バイト/トークン、CJK等の非ASCIIは約2バイト/トークン。
+/// Estimate token count. ASCII ~4 bytes/token, non-ASCII (CJK etc.) ~2 bytes/token.
 fn estimate_tokens(text: &str) -> usize {
     let ascii_bytes = text.bytes().filter(|b| b.is_ascii()).count();
     let non_ascii_bytes = text.len() - ascii_bytes;
     (ascii_bytes / 4) + (non_ascii_bytes / 2) + 1
 }
 
-/// LLM向けMarkdownコードブロック形式で出力（コンテキスト行付き）
+/// Format output as Markdown code blocks for LLM consumption (with context lines).
 pub fn format_llm(
     results: &[SearchResult],
     root: &Path,
@@ -156,7 +156,7 @@ pub fn format_llm(
     Ok(output)
 }
 
-/// ripgrep互換のコンテキスト付き出力（`--`セパレータ）
+/// Format output with context in ripgrep-compatible format (`--` separator).
 pub fn format_default_context(
     results: &[SearchResult],
     root: &Path,

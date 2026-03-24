@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 use crate::mcp_tools;
 use crate::Xgrep;
 
-/// JSON-RPCリクエスト/通知
+/// JSON-RPC request/notification.
 pub struct Message {
     pub id: Option<Value>,
     pub method: String,
@@ -59,12 +59,12 @@ pub fn tool_result(text: &str, is_error: bool) -> Value {
     })
 }
 
-/// MCPサーバーを起動する（stdio transport）
+/// Start the MCP server (stdio transport).
 pub fn start(xg: Xgrep) {
     run_server(|msg| handle_message(&xg, msg));
 }
 
-/// メッセージをディスパッチしてレスポンスを返す
+/// Dispatch a message and return the response.
 pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
     let id = match &msg.id {
         Some(id) => id.clone(),
@@ -124,7 +124,7 @@ pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
     }
 }
 
-/// MCPサーバーのメインループ。stdinから1行ずつ読み、ハンドラに渡してstdoutに返す。
+/// MCP server main loop. Reads lines from stdin, dispatches to handler, writes responses to stdout.
 fn run_server(handler: impl Fn(&Message) -> Option<Value>) {
     let stdin = io::stdin();
     let stdout = io::stdout();
