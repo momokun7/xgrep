@@ -1,10 +1,9 @@
 name: OpenSSF Scorecard
 
 on:
-  push:
-    branches: [main]
   schedule:
     - cron: "0 6 * * 1" # Every Monday
+  workflow_dispatch: # Manual trigger
 
 permissions: read-all
 
