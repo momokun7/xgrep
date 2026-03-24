@@ -3,7 +3,7 @@ set -euo pipefail
 
 # xgrep Benchmark Suite
 # Requirements: hyperfine, ripgrep, xgrep (xg)
-# Usage: ./bench/run.sh [small|medium|large]
+# Usage: ./bench/run.sh [small|medium|large|all]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
@@ -35,11 +35,13 @@ if [[ "$MODE" == "small" || "$MODE" == "all" ]]; then
     cd "$BENCH_DIR"
     xg init 2>/dev/null
 
-    hyperfine --warmup 3 --runs 20 \
-        "xg 'fn main'" \
-        "rg 'fn main'" \
-        --export-json "$RESULTS_DIR/small.json" \
-        --export-markdown "$RESULTS_DIR/small.md"
+    for pattern in "fn main" "SearchResult" "Matcher"; do
+        echo "--- Pattern: $pattern ---"
+        hyperfine --warmup 10 --runs 20 \
+            "xg '$pattern'" \
+            "rg '$pattern'" \
+            --export-json "$RESULTS_DIR/small_$(echo "$pattern" | tr ' ' '_').json"
+    done
     echo ""
 fi
 
@@ -57,12 +59,12 @@ if [[ "$MODE" == "medium" || "$MODE" == "all" ]]; then
     cd "$RG_SRC"
     xg init 2>/dev/null
 
-    for pattern in "fn main" "Options" "struct.*Config"; do
+    for pattern in "fn main" "Options" "pub struct"; do
         echo "--- Pattern: $pattern ---"
-        hyperfine --warmup 3 --runs 20 \
+        hyperfine --warmup 10 --runs 20 \
             "xg '$pattern'" \
             "rg '$pattern'" \
-            --export-json "$RESULTS_DIR/medium_$(echo "$pattern" | tr ' .*' '___').json"
+            --export-json "$RESULTS_DIR/medium_$(echo "$pattern" | tr ' ' '_').json"
     done
     echo ""
 fi
@@ -83,10 +85,11 @@ if [[ "$MODE" == "large" || "$MODE" == "all" ]]; then
 
         for pattern in "struct file_operations" "printk" "EXPORT_SYMBOL"; do
             echo "--- Pattern: $pattern ---"
-            hyperfine --warmup 3 --runs 20 \
+            hyperfine --warmup 10 --runs 30 \
                 "xg '$pattern'" \
                 "rg '$pattern'" \
-                --export-json "$RESULTS_DIR/large_$(echo "$pattern" | tr ' ' '_').json"
+                --export-json "$RESULTS_DIR/large_$(echo "$pattern" | tr ' ' '_').json" \
+                --export-markdown "$RESULTS_DIR/large_$(echo "$pattern" | tr ' ' '_').md"
         done
         echo ""
     fi
