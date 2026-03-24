@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::{index, output, SearchOptions, Xgrep};
+use crate::{output, SearchOptions, Xgrep};
 
 /// MCPツール定義を返す
 pub fn tools_list() -> Vec<Value> {
@@ -238,33 +238,8 @@ pub fn handle_build_index(xg: &Xgrep) -> (String, bool) {
 
 /// index_status ツールのハンドラ
 pub fn handle_index_status(xg: &Xgrep) -> (String, bool) {
-    match index::updater::check_index_status(xg.root(), xg.index_path()) {
-        Ok(status) => {
-            let status_str = match &status {
-                index::updater::IndexStatus::Fresh => "fresh".to_string(),
-                index::updater::IndexStatus::Stale { changed_files } => {
-                    format!("stale ({} changed files)", changed_files.len())
-                }
-                index::updater::IndexStatus::NeedsFullBuild => "no index".to_string(),
-            };
-
-            let file_count = if xg.index_path().exists() {
-                match index::reader::IndexReader::open(xg.index_path()) {
-                    Ok(reader) => Some(reader.file_count()),
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-
-            let mut msg = format!("Status: {}", status_str);
-            if let Some(count) = file_count {
-                msg.push_str(&format!("\nIndexed files: {}", count));
-            }
-            msg.push_str(&format!("\nIndex path: {}", xg.index_path().display()));
-
-            (msg, false)
-        }
+    match xg.index_status() {
+        Ok(msg) => (msg, false),
         Err(e) => (format!("Status check error: {}", e), true),
     }
 }
