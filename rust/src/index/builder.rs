@@ -177,6 +177,7 @@ pub fn cache_path_for(index_path: &Path) -> PathBuf {
     index_path.with_extension("cache")
 }
 
+#[allow(dead_code)]
 pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
     build_index_with_cache(root, index_path, None)
 }

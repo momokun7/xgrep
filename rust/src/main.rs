@@ -114,7 +114,7 @@ fn run() -> Result<()> {
         Some(Commands::Serve { root }) => {
             let root_path = root.map(std::path::PathBuf::from).unwrap_or(cwd);
             let xg = Xgrep::open(&root_path)?;
-            xgrep::mcp_server::start(xg);
+            xgrep::start_mcp_server(xg);
         }
         None => {
             if cli.json_output && cli.format != "default" {
