@@ -111,6 +111,14 @@ Benchmarked on Linux kernel source (92,471 files, 2.0GB) with [hyperfine](https:
 
 > zoekt numbers are CLI mode. In server mode, zoekt search latency is significantly lower.
 
+Reproduce these benchmarks on your machine: [`bench/run.sh`](bench/run.sh)
+
+```bash
+./bench/run.sh small    # xgrep source (~20 files, 30s)
+./bench/run.sh medium   # ripgrep source (~250 files, auto-downloads)
+./bench/run.sh large    # Linux kernel (~92K files, requires manual download)
+```
+
 ## Output Formats
 
 **Default** (ripgrep-compatible):
