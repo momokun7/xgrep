@@ -10,8 +10,7 @@ Instead, use **GitHub's [private vulnerability reporting](https://github.com/mom
 
 ## Response Timeline
 
-- Acknowledgment: within 48 hours
-- Initial assessment: within 1 week
+- Acknowledgment: best effort (typically within a few days)
 - Fix release: as soon as practical
 
 ## Scope
