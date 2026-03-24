@@ -2,7 +2,7 @@
 name = "xgrep"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 description = "Ultra-fast indexed code search using trigram inverted index"
 license = "MIT"
 repository = "https://github.com/momokun7/xgrep"
