@@ -134,30 +134,39 @@ impl Matcher for RegexMatcher {
 // 統一スキャン関数
 // ---------------------------------------------------------------------------
 
+/// 1チャンクあたりの最大ファイル数。メモリ使用量の上限を制御する。
+const MAX_CHUNK_SIZE: usize = 10_000;
+
 /// ファイル候補リストに対してMatcherでスキャンし、ソート済み結果を返す。
+/// 候補をMAX_CHUNK_SIZEごとに分割し、チャンク単位で並列処理することで
+/// 同時にメモリに載るファイル数を制限する。
 fn scan_files<M: Matcher>(
     candidates: &[(String, PathBuf)],
     matcher: &M,
     skip_binary: bool,
 ) -> Vec<SearchResult> {
-    let mut results: Vec<SearchResult> = candidates
-        .par_iter()
-        .flat_map(|(rel_path, full_path)| {
-            let content = match fs::read(full_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("xgrep: {}: {}", full_path.display(), e);
+    let mut all_results = Vec::new();
+    for chunk in candidates.chunks(MAX_CHUNK_SIZE) {
+        let mut chunk_results: Vec<SearchResult> = chunk
+            .par_iter()
+            .flat_map(|(rel_path, full_path)| {
+                let content = match fs::read(full_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("xgrep: {}: {}", full_path.display(), e);
+                        return vec![];
+                    }
+                };
+                if skip_binary && memchr::memchr(0, &content).is_some() {
                     return vec![];
                 }
-            };
-            if skip_binary && memchr::memchr(0, &content).is_some() {
-                return vec![];
-            }
-            matcher.find_matches(&content, rel_path)
-        })
-        .collect();
-    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
-    results
+                matcher.find_matches(&content, rel_path)
+            })
+            .collect();
+        all_results.append(&mut chunk_results);
+    }
+    all_results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
+    all_results
 }
 
 /// IndexReaderの候補IDリストから(rel_path, full_path)ペアを構築する。
