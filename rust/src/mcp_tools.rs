@@ -300,6 +300,11 @@ pub fn handle_read_file(xg: &Xgrep, params: &Value) -> (String, bool) {
     };
 
     let lines: Vec<&str> = content.lines().collect();
+
+    if lines.is_empty() {
+        return (format!("## {}\n\nFile is empty.\n", path), false);
+    }
+
     let start = params
         .get("start_line")
         .and_then(|v| v.as_u64())
@@ -560,5 +565,19 @@ mod tests {
         let params = serde_json::json!({"path": "../../etc/passwd"});
         let (_, is_error) = handle_read_file(&xg, &params);
         assert!(is_error);
+    }
+
+    #[test]
+    fn test_handle_read_file_empty() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("empty.txt"), "").unwrap();
+
+        let xg = crate::Xgrep::open(root).unwrap();
+
+        let params = serde_json::json!({"path": "empty.txt"});
+        let (text, is_error) = handle_read_file(&xg, &params);
+        assert!(!is_error);
+        assert!(text.contains("empty"));
     }
 }

@@ -1,7 +1,7 @@
 pub const MAGIC: [u8; 4] = *b"XGRP";
 pub const VERSION: u32 = 2;
 
-/// Header: 20 bytes
+/// Header: 24 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
@@ -9,7 +9,7 @@ pub struct Header {
     pub version: u32,             // 4
     pub trigram_count: u32,       // 4
     pub file_count: u32,          // 4
-    pub posting_total_bytes: u32, // 4
+    pub posting_total_bytes: u64, // 8
 }
 
 /// Trigram Table entry: 16 bytes
@@ -37,13 +37,13 @@ pub struct FileEntry {
 impl Header {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
-    pub fn to_bytes(&self) -> [u8; 20] {
-        let mut bytes = [0u8; 20];
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut bytes = [0u8; 24];
         bytes[0..4].copy_from_slice(&self.magic);
         bytes[4..8].copy_from_slice(&self.version.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.trigram_count.to_le_bytes());
         bytes[12..16].copy_from_slice(&self.file_count.to_le_bytes());
-        bytes[16..20].copy_from_slice(&self.posting_total_bytes.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.posting_total_bytes.to_le_bytes());
         bytes
     }
 }
@@ -98,6 +98,10 @@ pub fn decode_varint(data: &[u8]) -> (u32, usize) {
             // Overflow: u32は最大5バイト (5*7=35bit)。これ以上はmalformed
             return (result, i + 1);
         }
+        if shift == 28 && (byte & 0x70) != 0 {
+            // Varint overflow: byte 5 has bits that don't fit in u32
+            return (result, i + 1);
+        }
         result |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
             return (result, i + 1);
@@ -113,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_header_size() {
-        assert_eq!(Header::SIZE, 20);
+        assert_eq!(Header::SIZE, 24);
     }
 
     #[test]
@@ -213,6 +217,16 @@ mod tests {
         // 5バイト目(shift=35)でoverflow検出して6バイト目を返す
         assert!(bytes_read > 0);
         assert!(bytes_read <= 6);
+    }
+
+    #[test]
+    fn test_decode_varint_overflow_byte4() {
+        // Byte 4 with upper bits set (overflow for u32)
+        let data = [0x80, 0x80, 0x80, 0x80, 0xFF]; // 5th byte has all bits set
+        let (_val, bytes_read) = decode_varint(&data);
+        // Should not produce a value with the overflowed bits
+        assert!(bytes_read <= 5);
+        // Value should be capped/truncated rather than wrapping
     }
 
     #[test]
