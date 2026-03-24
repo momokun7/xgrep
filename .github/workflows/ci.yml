@@ -35,9 +35,9 @@ jobs:
         working-directory: rust
         run: |
           # Verify binary runs and shows help
-          ./target/release/xgrep --help | grep -q "Ultra-fast indexed code search"
+          ./target/release/xg --help | grep -q "Ultra-fast indexed code search"
           # Verify search works (search xgrep's own source)
-          ./target/release/xgrep "fn main" --type rs | grep -q "fn main"
+          ./target/release/xg "fn main" --type rs | grep -q "fn main"
 
   lint:
     name: Lint
@@ -100,10 +100,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: xgrep-linux-x86_64
+            artifact: xg-linux-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: xgrep-macos-arm64
+            artifact: xg-macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -120,4 +120,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: rust/target/${{ matrix.target }}/release/xgrep
+          path: rust/target/${{ matrix.target }}/release/xg

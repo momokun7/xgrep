@@ -1,6 +1,6 @@
 use std::fs;
 use tempfile::tempdir;
-use xgrep::{self, SearchOptions, Xgrep};
+use xgrep_search::{self, SearchOptions, Xgrep};
 
 #[test]
 fn test_open_and_search_basic() {
@@ -138,7 +138,7 @@ fn test_search_changed_requires_git() {
 
 #[test]
 fn test_search_result_debug_clone() {
-    let r = xgrep::SearchResult {
+    let r = xgrep_search::SearchResult {
         file: "a.rs".to_string(),
         line_number: 1,
         line: "hello".to_string(),

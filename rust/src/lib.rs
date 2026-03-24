@@ -3,7 +3,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use xgrep::{Xgrep, SearchOptions};
+//! use xgrep_search::{Xgrep, SearchOptions};
 //!
 //! let xg = Xgrep::open(".").unwrap();
 //! xg.build_index().unwrap();
