@@ -14,7 +14,7 @@ pub fn read_header(data: &[u8]) -> Header {
         version: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
         trigram_count: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
         file_count: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-        posting_total_bytes: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
+        posting_total_bytes: u64::from_le_bytes(data[16..24].try_into().unwrap()),
     }
 }
 
@@ -242,7 +242,11 @@ impl IndexReader {
             }
             let pl_start = self.posting_lists_start + entry.posting_offset as usize;
             let pl_byte_len = entry.posting_len as usize;
-            let data = &self.mmap[pl_start..pl_start + pl_byte_len];
+            let pl_end = pl_start + pl_byte_len;
+            if pl_end > self.mmap.len() {
+                continue; // skip corrupted entry
+            }
+            let data = &self.mmap[pl_start..pl_end];
             for fid in Self::decode_posting_list(data) {
                 seen.insert(fid);
             }
@@ -346,7 +350,7 @@ mod tests {
     fn test_open_invalid_version() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("badver.xgrep");
-        let mut data = vec![0u8; 20];
+        let mut data = vec![0u8; 24];
         data[0..4].copy_from_slice(b"XGRP");
         // version = 99 (invalid)
         data[4..8].copy_from_slice(&99u32.to_le_bytes());
@@ -370,12 +374,12 @@ mod tests {
         // headerは正常だがtrigram_countが巨大で実データが不足しているケース
         let dir = tempdir().unwrap();
         let path = dir.path().join("truncated.xgrep");
-        let mut data = vec![0u8; 24]; // Header(20) + 4バイトだけ
+        let mut data = vec![0u8; 28]; // Header(24) + 4バイトだけ
         data[0..4].copy_from_slice(b"XGRP");
         data[4..8].copy_from_slice(&VERSION.to_le_bytes());
         data[8..12].copy_from_slice(&9999u32.to_le_bytes()); // trigram_count = 9999 (巨大)
         data[12..16].copy_from_slice(&0u32.to_le_bytes()); // file_count = 0
-        data[16..20].copy_from_slice(&0u32.to_le_bytes()); // posting_total_bytes = 0
+        data[16..24].copy_from_slice(&0u64.to_le_bytes()); // posting_total_bytes = 0
         fs::write(&path, &data).unwrap();
         let result = IndexReader::open(&path);
         assert!(result.is_err());
@@ -394,6 +398,21 @@ mod tests {
     fn test_decode_posting_list_empty() {
         let result = IndexReader::decode_posting_list(&[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_lookup_trigram_prefix_corrupt_posting() {
+        // Verify that corrupted posting offsets don't panic
+        // Just verify the function doesn't crash with a valid but minimal index
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "abcdef").unwrap();
+        let index_path = root.join("index.xgrep");
+        crate::index::builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        // Search for prefix that may or may not exist - should not panic
+        let _ = reader.lookup_trigram_prefix(*b"zz");
+        let _ = reader.lookup_trigram_prefix(*b"ab");
     }
 
     #[test]

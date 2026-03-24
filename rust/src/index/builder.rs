@@ -105,7 +105,10 @@ impl TrigramCache {
                 buf.extend_from_slice(t);
             }
         }
-        fs::write(path, &buf)?;
+        let parent = path.parent().unwrap_or(std::path::Path::new("."));
+        let temp_path = parent.join(format!(".xgrep_cache_tmp_{}", std::process::id()));
+        fs::write(&temp_path, &buf)?;
+        fs::rename(&temp_path, path)?;
         Ok(())
     }
 }
@@ -324,11 +327,12 @@ pub fn build_index_with_cache(
 
     // ============================================================
     // 最終インデックスファイル書き出し (mmapから読み取り)
+    // アトミック置換: tempファイルに書き出し後、renameで差し替え
     // ============================================================
-    if let Some(parent) = index_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let out_file = fs::File::create(index_path)?;
+    let parent = index_path.parent().unwrap_or(std::path::Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp_index_path = parent.join(format!(".xgrep_tmp_{}", std::process::id()));
+    let out_file = fs::File::create(&temp_index_path)?;
     let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
 
     // Write placeholder header (posting_total_bytes will be updated after writing postings)
@@ -410,7 +414,7 @@ pub fn build_index_with_cache(
     writer.write_all(&string_pool)?;
 
     // Header の posting_total_bytes を確定値で上書き
-    header.posting_total_bytes = current_posting_offset as u32;
+    header.posting_total_bytes = current_posting_offset;
     writer.flush()?;
     let mut file = writer.into_inner()?;
     file.seek(SeekFrom::Start(0))?;
@@ -423,6 +427,10 @@ pub fn build_index_with_cache(
         trig_writer.write_all(&entry.to_bytes())?;
     }
     trig_writer.flush()?;
+    drop(trig_writer);
+
+    // アトミック置換: tempファイルを最終パスにrename
+    fs::rename(&temp_index_path, index_path)?;
 
     // キャッシュを更新して保存
     save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
@@ -466,10 +474,10 @@ fn write_index_no_postings(
     sorted_trigrams: &[[u8; 3]],
     files: &[FileInfo],
 ) -> Result<()> {
-    if let Some(parent) = index_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let out_file = fs::File::create(index_path)?;
+    let parent = index_path.parent().unwrap_or(std::path::Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp_path = parent.join(format!(".xgrep_tmp_{}", std::process::id()));
+    let out_file = fs::File::create(&temp_path)?;
     let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
 
     let header = Header {
@@ -501,6 +509,10 @@ fn write_index_no_postings(
 
     writer.write_all(&string_pool)?;
     writer.flush()?;
+    drop(writer);
+
+    // アトミック置換: tempファイルを最終パスにrename
+    fs::rename(&temp_path, index_path)?;
 
     Ok(())
 }
