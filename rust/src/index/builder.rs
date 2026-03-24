@@ -97,7 +97,12 @@ impl TrigramCache {
             // Too many entries for cache format, skip saving
             return Ok(());
         }
-        buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        let valid_entries = self
+            .entries
+            .iter()
+            .filter(|(p, _)| p.len() <= u16::MAX as usize)
+            .count() as u32;
+        buf.extend_from_slice(&valid_entries.to_le_bytes());
         for (path_str, cf) in &self.entries {
             let path_bytes = path_str.as_bytes();
             if path_bytes.len() > u16::MAX as usize {
