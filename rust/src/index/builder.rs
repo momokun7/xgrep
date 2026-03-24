@@ -331,11 +331,13 @@ pub fn build_index_with_cache(
     let out_file = fs::File::create(index_path)?;
     let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
 
-    let header = Header {
+    // Write placeholder header (posting_total_bytes will be updated after writing postings)
+    let mut header = Header {
         magic: MAGIC,
         version: VERSION,
         trigram_count: sorted_trigrams.len() as u32,
         file_count: files.len() as u32,
+        posting_total_bytes: 0,
     };
     writer.write_all(&header.to_bytes())?;
 
@@ -407,9 +409,14 @@ pub fn build_index_with_cache(
     // String Pool 書き出し
     writer.write_all(&string_pool)?;
 
-    // Trigram Table を seek して上書き
+    // Header の posting_total_bytes を確定値で上書き
+    header.posting_total_bytes = current_posting_offset as u32;
     writer.flush()?;
     let mut file = writer.into_inner()?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header.to_bytes())?;
+
+    // Trigram Table を seek して上書き
     file.seek(SeekFrom::Start(Header::SIZE as u64))?;
     let mut trig_writer = BufWriter::with_capacity(64 * 1024, file);
     for entry in &trigram_entries {
@@ -470,6 +477,7 @@ fn write_index_no_postings(
         version: VERSION,
         trigram_count: sorted_trigrams.len() as u32,
         file_count: files.len() as u32,
+        posting_total_bytes: 0,
     };
     writer.write_all(&header.to_bytes())?;
 
@@ -539,7 +547,7 @@ mod tests {
         let data = fs::read(&index_path).unwrap();
         let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         assert_eq!(&header.magic, b"XGRP");
-        assert_eq!(header.version, 1);
+        assert_eq!(header.version, VERSION);
         assert_eq!(header.file_count, 1);
         assert!(header.trigram_count > 0);
     }

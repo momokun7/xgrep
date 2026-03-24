@@ -52,6 +52,13 @@ pub fn search(
         );
     }
 
+    if case_insensitive && pattern.bytes().any(|b| b > 127) {
+        eprintln!(
+            "xgrep: warning: case-insensitive search with non-ASCII pattern '{}' uses ASCII-only folding",
+            pattern
+        );
+    }
+
     let search_pattern = if case_insensitive {
         pattern.to_lowercase()
     } else {
@@ -197,6 +204,13 @@ pub fn search_files(
     pattern: &str,
     case_insensitive: bool,
 ) -> Result<Vec<SearchResult>> {
+    if case_insensitive && pattern.bytes().any(|b| b > 127) {
+        eprintln!(
+            "xgrep: warning: case-insensitive search with non-ASCII pattern '{}' uses ASCII-only folding",
+            pattern
+        );
+    }
+
     let pattern_lower = if case_insensitive {
         pattern.to_lowercase()
     } else {
@@ -214,6 +228,11 @@ pub fn search_files(
                     return vec![];
                 }
             };
+
+            // Skip binary files (same check as index builder)
+            if memchr::memchr(0, &content).is_some() {
+                return vec![];
+            }
 
             let rel_str = rel_path.to_string_lossy().to_string();
             let mut file_results = Vec::new();
@@ -384,6 +403,12 @@ pub fn search_files_regex(
                     return vec![];
                 }
             };
+
+            // Skip binary files (same check as index builder)
+            if memchr::memchr(0, &content_bytes).is_some() {
+                return vec![];
+            }
+
             let content = String::from_utf8_lossy(&content_bytes);
             let rel_str = rel_path.to_string_lossy().to_string();
             let mut file_results = Vec::new();
@@ -1035,5 +1060,49 @@ mod tests {
         assert!(!contains_case_insensitive("hello", "xyz"));
         assert!(contains_case_insensitive("anything", ""));
         assert!(!contains_case_insensitive("hi", "longer"));
+    }
+
+    #[test]
+    fn test_search_files_skips_binary() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // Create a binary file with null bytes
+        fs::write(root.join("binary.bin"), b"hello\x00world").unwrap();
+        // Create a text file
+        fs::write(root.join("text.txt"), "hello world").unwrap();
+
+        let files = vec![PathBuf::from("binary.bin"), PathBuf::from("text.txt")];
+        let results = search_files(root, &files, "hello", false).unwrap();
+
+        // Should only find in text.txt, not binary.bin
+        assert_eq!(results.len(), 1);
+        assert!(results[0].file.contains("text.txt"));
+    }
+
+    #[test]
+    fn test_search_files_regex_skips_binary() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("binary.bin"), b"hello\x00world").unwrap();
+        fs::write(root.join("text.txt"), "hello world").unwrap();
+
+        let files = vec![PathBuf::from("binary.bin"), PathBuf::from("text.txt")];
+        let results = search_files_regex(root, &files, "hello", false).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].file.contains("text.txt"));
+    }
+
+    #[test]
+    fn test_case_insensitive_ascii_only_still_works() {
+        // Verify ASCII case-insensitive still works correctly
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "Hello WORLD").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let results = search(&reader, root, "hello world", true).unwrap();
+        assert_eq!(results.len(), 1);
     }
 }
