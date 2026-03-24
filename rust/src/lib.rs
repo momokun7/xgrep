@@ -13,6 +13,7 @@
 //! }
 //! ```
 
+pub(crate) mod candidates;
 pub(crate) mod filetype;
 pub(crate) mod git;
 pub mod index;
