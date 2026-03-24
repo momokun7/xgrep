@@ -38,6 +38,160 @@ pub struct SearchResult {
     pub line: String,
 }
 
+// ---------------------------------------------------------------------------
+// Matcher trait: 3つのマッチ戦略を統一するインターフェース
+// ---------------------------------------------------------------------------
+
+trait Matcher: Send + Sync {
+    fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult>;
+}
+
+/// case-sensitive固定文字列マッチ（memmem::Finder使用）
+struct LiteralMatcher {
+    pattern: Vec<u8>,
+}
+
+impl Matcher for LiteralMatcher {
+    fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
+        let finder = memmem::Finder::new(&self.pattern);
+        let mut results = Vec::new();
+        let mut pos = 0;
+
+        while let Some(match_pos) = finder.find(&content[pos..]) {
+            let abs_pos = pos + match_pos;
+            let line_num = content[..abs_pos].iter().filter(|&&b| b == b'\n').count() + 1;
+            let line_start = content[..abs_pos]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |p| p + 1);
+            let line_end = content[abs_pos..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(content.len(), |p| abs_pos + p);
+            let line = std::str::from_utf8(&content[line_start..line_end]).unwrap_or("<binary>");
+
+            results.push(SearchResult {
+                file: rel_path.to_string(),
+                line_number: line_num,
+                line: line.to_string(),
+            });
+
+            pos = line_end + 1;
+            if pos >= content.len() {
+                break;
+            }
+        }
+
+        results
+    }
+}
+
+/// case-insensitive固定文字列マッチ（ASCII-only folding）
+struct CaseInsensitiveMatcher {
+    pattern_lower: String,
+}
+
+impl Matcher for CaseInsensitiveMatcher {
+    fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
+        let content_str = String::from_utf8_lossy(content);
+        let mut results = Vec::new();
+        for (i, line) in content_str.lines().enumerate() {
+            if contains_case_insensitive(line, &self.pattern_lower) {
+                results.push(SearchResult {
+                    file: rel_path.to_string(),
+                    line_number: i + 1,
+                    line: line.to_string(),
+                });
+            }
+        }
+        results
+    }
+}
+
+/// 正規表現マッチ
+struct RegexMatcher {
+    re: regex::Regex,
+}
+
+impl Matcher for RegexMatcher {
+    fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
+        let content_str = String::from_utf8_lossy(content);
+        let mut results = Vec::new();
+        for (i, line) in content_str.lines().enumerate() {
+            if self.re.is_match(line) {
+                results.push(SearchResult {
+                    file: rel_path.to_string(),
+                    line_number: i + 1,
+                    line: line.to_string(),
+                });
+            }
+        }
+        results
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 統一スキャン関数
+// ---------------------------------------------------------------------------
+
+/// ファイル候補リストに対してMatcherでスキャンし、ソート済み結果を返す。
+fn scan_files<M: Matcher>(
+    candidates: &[(String, PathBuf)],
+    matcher: &M,
+    skip_binary: bool,
+) -> Vec<SearchResult> {
+    let mut results: Vec<SearchResult> = candidates
+        .par_iter()
+        .flat_map(|(rel_path, full_path)| {
+            let content = match fs::read(full_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("xgrep: {}: {}", full_path.display(), e);
+                    return vec![];
+                }
+            };
+            if skip_binary && memchr::memchr(0, &content).is_some() {
+                return vec![];
+            }
+            matcher.find_matches(&content, rel_path)
+        })
+        .collect();
+    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
+    results
+}
+
+/// IndexReaderの候補IDリストから(rel_path, full_path)ペアを構築する。
+fn candidates_from_index(
+    reader: &IndexReader,
+    root: &Path,
+    candidate_ids: &[u32],
+) -> Vec<(String, PathBuf)> {
+    candidate_ids
+        .iter()
+        .map(|&fid| {
+            let rel = reader.file_path(fid).to_string();
+            let full = root.join(&rel);
+            (rel, full)
+        })
+        .collect()
+}
+
+/// PathBufリストから(rel_path, full_path)ペアを構築する。
+fn candidates_from_files(root: &Path, files: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    files
+        .iter()
+        .map(|rel| {
+            let rel_str = rel.to_string_lossy().to_string();
+            let full = root.join(rel);
+            (rel_str, full)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// 公開API（シグネチャ維持）
+// ---------------------------------------------------------------------------
+
 pub fn search(
     reader: &IndexReader,
     root: &Path,
@@ -67,132 +221,28 @@ pub fn search(
     let pattern_bytes = search_pattern.as_bytes();
     let trigrams = trigram::extract_trigrams(pattern_bytes);
 
-    let candidate_ids: Vec<u32> = if case_insensitive {
-        if trigrams.is_empty() {
-            // パターンが3文字未満: 全ファイルスキャン（不可避）
-            (0..reader.file_count()).collect()
-        } else {
-            // バリアント展開のコストを事前計算し、閾値超過なら全ファイルスキャンにフォールバック
-            let total_lookups: usize = trigrams.iter().map(|t| case_variants(*t).len()).sum();
-            if total_lookups > 64 {
-                // 全アルファベットの長いパターン等: posting list lookupが多すぎるため全スキャンが安い
-                (0..reader.file_count()).collect()
-            } else {
-                // Zoekt方式: 各trigramのケースバリアントを列挙してunion → trigram間でintersect
-                let mut trigram_candidates: Vec<Vec<u32>> = Vec::new();
-                let mut any_empty = false;
+    let candidate_ids = resolve_literal_candidates(
+        reader,
+        pattern,
+        &search_pattern,
+        &trigrams,
+        case_insensitive,
+    );
 
-                for t in &trigrams {
-                    let variants = case_variants(*t);
-                    let mut union_set = std::collections::BTreeSet::new();
-                    for v in &variants {
-                        for fid in reader.lookup_trigram(*v) {
-                            union_set.insert(fid);
-                        }
-                    }
-                    if union_set.is_empty() {
-                        any_empty = true;
-                        break;
-                    }
-                    trigram_candidates.push(union_set.into_iter().collect());
-                }
+    let candidates = candidates_from_index(reader, root, &candidate_ids);
 
-                if any_empty {
-                    // そのtrigramのどのcase variantも存在しない = マッチなし
-                    vec![]
-                } else {
-                    let refs: Vec<&[u32]> =
-                        trigram_candidates.iter().map(|v| v.as_slice()).collect();
-                    intersect_postings(&refs)
-                }
-            }
-        }
-    } else if trigrams.is_empty() {
-        if pattern_bytes.len() == 2 {
-            // 2文字パターン: プレフィックスに一致する全trigramのunionで候補を絞る
-            let prefix = [pattern_bytes[0], pattern_bytes[1]];
-            let candidates = reader.lookup_trigram_prefix(prefix);
-            // 候補が空（プレフィックスに一致するtrigramが存在しない）なら全スキャン
-            if candidates.is_empty() {
-                (0..reader.file_count()).collect()
-            } else {
-                candidates
-            }
-        } else {
-            // 0-1文字パターン: 全ファイルスキャン
-            (0..reader.file_count()).collect()
-        }
+    // インデックス経由の検索ではバイナリチェック不要（インデックスビルド時にスキップ済み）
+    let results = if case_insensitive {
+        let matcher = CaseInsensitiveMatcher {
+            pattern_lower: search_pattern,
+        };
+        scan_files(&candidates, &matcher, false)
     } else {
-        let posting_lists: Vec<Vec<u32>> =
-            trigrams.iter().map(|t| reader.lookup_trigram(*t)).collect();
-        let refs: Vec<&[u32]> = posting_lists.iter().map(|v| v.as_slice()).collect();
-        intersect_postings(&refs)
+        let matcher = LiteralMatcher {
+            pattern: pattern.as_bytes().to_vec(),
+        };
+        scan_files(&candidates, &matcher, false)
     };
-
-    let mut results: Vec<SearchResult> = candidate_ids
-        .par_iter()
-        .flat_map(|&file_id| {
-            let rel_path = reader.file_path(file_id);
-            let full_path = root.join(rel_path);
-
-            let content = match fs::read(&full_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("xgrep: {}: {}", full_path.display(), e);
-                    return vec![];
-                }
-            };
-
-            let mut file_results = Vec::new();
-
-            if case_insensitive {
-                let pattern_lower = search_pattern.as_str();
-                let content_str = String::from_utf8_lossy(&content);
-                for (i, line) in content_str.lines().enumerate() {
-                    if contains_case_insensitive(line, pattern_lower) {
-                        file_results.push(SearchResult {
-                            file: rel_path.to_string(),
-                            line_number: i + 1,
-                            line: line.to_string(),
-                        });
-                    }
-                }
-            } else {
-                let finder = memmem::Finder::new(pattern.as_bytes());
-                let mut pos = 0;
-
-                while let Some(match_pos) = finder.find(&content[pos..]) {
-                    let abs_pos = pos + match_pos;
-                    let line_num = content[..abs_pos].iter().filter(|&&b| b == b'\n').count() + 1;
-                    let line_start = content[..abs_pos]
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .map_or(0, |p| p + 1);
-                    let line_end = content[abs_pos..]
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .map_or(content.len(), |p| abs_pos + p);
-                    let line =
-                        std::str::from_utf8(&content[line_start..line_end]).unwrap_or("<binary>");
-
-                    file_results.push(SearchResult {
-                        file: rel_path.to_string(),
-                        line_number: line_num,
-                        line: line.to_string(),
-                    });
-
-                    pos = line_end + 1;
-                    if pos >= content.len() {
-                        break;
-                    }
-                }
-            }
-
-            file_results
-        })
-        .collect();
-
-    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
 
     Ok(results)
 }
@@ -211,75 +261,20 @@ pub fn search_files(
         );
     }
 
-    let pattern_lower = if case_insensitive {
-        pattern.to_lowercase()
+    let candidates = candidates_from_files(root, files);
+
+    let results = if case_insensitive {
+        let matcher = CaseInsensitiveMatcher {
+            pattern_lower: pattern.to_lowercase(),
+        };
+        scan_files(&candidates, &matcher, true)
     } else {
-        String::new()
+        let matcher = LiteralMatcher {
+            pattern: pattern.as_bytes().to_vec(),
+        };
+        scan_files(&candidates, &matcher, true)
     };
 
-    let mut results: Vec<SearchResult> = files
-        .par_iter()
-        .flat_map(|rel_path| {
-            let full_path = root.join(rel_path);
-            let content = match fs::read(&full_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("xgrep: {}: {}", full_path.display(), e);
-                    return vec![];
-                }
-            };
-
-            // Skip binary files (same check as index builder)
-            if memchr::memchr(0, &content).is_some() {
-                return vec![];
-            }
-
-            let rel_str = rel_path.to_string_lossy().to_string();
-            let mut file_results = Vec::new();
-
-            if case_insensitive {
-                let content_str = String::from_utf8_lossy(&content);
-                for (i, line) in content_str.lines().enumerate() {
-                    if contains_case_insensitive(line, &pattern_lower) {
-                        file_results.push(SearchResult {
-                            file: rel_str.clone(),
-                            line_number: i + 1,
-                            line: line.to_string(),
-                        });
-                    }
-                }
-            } else {
-                let finder = memmem::Finder::new(pattern.as_bytes());
-                let mut pos = 0;
-                while let Some(match_pos) = finder.find(&content[pos..]) {
-                    let abs_pos = pos + match_pos;
-                    let line_num = content[..abs_pos].iter().filter(|&&b| b == b'\n').count() + 1;
-                    let line_start = content[..abs_pos]
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .map_or(0, |p| p + 1);
-                    let line_end = content[abs_pos..]
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .map_or(content.len(), |p| abs_pos + p);
-                    let line =
-                        std::str::from_utf8(&content[line_start..line_end]).unwrap_or("<binary>");
-                    file_results.push(SearchResult {
-                        file: rel_str.clone(),
-                        line_number: line_num,
-                        line: line.to_string(),
-                    });
-                    pos = line_end + 1;
-                    if pos >= content.len() {
-                        break;
-                    }
-                }
-            }
-            file_results
-        })
-        .collect();
-
-    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
     Ok(results)
 }
 
@@ -295,9 +290,109 @@ pub fn search_regex(
         .case_insensitive(case_insensitive)
         .build()?;
 
-    // Use trigram query for candidate filtering (Zoekt-style AST-based approach)
-    let candidate_ids = if case_insensitive {
-        // Case-insensitive: parse query, then expand each trigram into case variants
+    let candidate_ids = resolve_regex_candidates(reader, pattern, case_insensitive);
+    let candidates = candidates_from_index(reader, root, &candidate_ids);
+
+    let matcher = RegexMatcher { re };
+    let results = scan_files(&candidates, &matcher, false);
+
+    Ok(results)
+}
+
+/// Also add search_files_regex for --changed/--since with regex
+pub fn search_files_regex(
+    root: &Path,
+    files: &[PathBuf],
+    pattern: &str,
+    case_insensitive: bool,
+) -> Result<Vec<SearchResult>> {
+    let re = RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()?;
+
+    let candidates = candidates_from_files(root, files);
+    let matcher = RegexMatcher { re };
+    let results = scan_files(&candidates, &matcher, true);
+
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// 候補解決（インデックスからの絞り込み）
+// ---------------------------------------------------------------------------
+
+/// 固定文字列検索用の候補ID解決
+fn resolve_literal_candidates(
+    reader: &IndexReader,
+    _original_pattern: &str,
+    search_pattern: &str,
+    trigrams: &[[u8; 3]],
+    case_insensitive: bool,
+) -> Vec<u32> {
+    let pattern_bytes = search_pattern.as_bytes();
+
+    if case_insensitive {
+        if trigrams.is_empty() {
+            (0..reader.file_count()).collect()
+        } else {
+            let total_lookups: usize = trigrams.iter().map(|t| case_variants(*t).len()).sum();
+            if total_lookups > 64 {
+                (0..reader.file_count()).collect()
+            } else {
+                let mut trigram_candidates: Vec<Vec<u32>> = Vec::new();
+                let mut any_empty = false;
+
+                for t in trigrams {
+                    let variants = case_variants(*t);
+                    let mut union_set = std::collections::BTreeSet::new();
+                    for v in &variants {
+                        for fid in reader.lookup_trigram(*v) {
+                            union_set.insert(fid);
+                        }
+                    }
+                    if union_set.is_empty() {
+                        any_empty = true;
+                        break;
+                    }
+                    trigram_candidates.push(union_set.into_iter().collect());
+                }
+
+                if any_empty {
+                    vec![]
+                } else {
+                    let refs: Vec<&[u32]> =
+                        trigram_candidates.iter().map(|v| v.as_slice()).collect();
+                    intersect_postings(&refs)
+                }
+            }
+        }
+    } else if trigrams.is_empty() {
+        if pattern_bytes.len() == 2 {
+            let prefix = [pattern_bytes[0], pattern_bytes[1]];
+            let candidates = reader.lookup_trigram_prefix(prefix);
+            if candidates.is_empty() {
+                (0..reader.file_count()).collect()
+            } else {
+                candidates
+            }
+        } else {
+            (0..reader.file_count()).collect()
+        }
+    } else {
+        let posting_lists: Vec<Vec<u32>> =
+            trigrams.iter().map(|t| reader.lookup_trigram(*t)).collect();
+        let refs: Vec<&[u32]> = posting_lists.iter().map(|v| v.as_slice()).collect();
+        intersect_postings(&refs)
+    }
+}
+
+/// 正規表現検索用の候補ID解決
+fn resolve_regex_candidates(
+    reader: &IndexReader,
+    pattern: &str,
+    case_insensitive: bool,
+) -> Vec<u32> {
+    if case_insensitive {
         let query = trigram_query::regex_to_query(pattern);
         if query.is_all() {
             eprintln!(
@@ -316,40 +411,12 @@ pub fn search_regex(
             );
         }
         query.evaluate(reader)
-    };
-
-    // Verify with regex on candidate files
-    let mut results: Vec<SearchResult> = candidate_ids
-        .par_iter()
-        .flat_map(|&file_id| {
-            let rel_path = reader.file_path(file_id);
-            let full_path = root.join(rel_path);
-            let content_bytes = match std::fs::read(&full_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("xgrep: {}: {}", full_path.display(), e);
-                    return vec![];
-                }
-            };
-            let content = String::from_utf8_lossy(&content_bytes);
-
-            let mut file_results = Vec::new();
-            for (i, line) in content.lines().enumerate() {
-                if re.is_match(line) {
-                    file_results.push(SearchResult {
-                        file: rel_path.to_string(),
-                        line_number: i + 1,
-                        line: line.to_string(),
-                    });
-                }
-            }
-            file_results
-        })
-        .collect();
-
-    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
-    Ok(results)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// ヘルパー関数
+// ---------------------------------------------------------------------------
 
 /// Extract literal substrings from a regex pattern (simple heuristic)
 /// Finds the longest run of non-special characters (must be >= 2 chars to be useful)
@@ -379,54 +446,6 @@ fn extract_literals(pattern: &str) -> String {
         return String::new();
     }
     best
-}
-
-/// Also add search_files_regex for --changed/--since with regex
-pub fn search_files_regex(
-    root: &Path,
-    files: &[PathBuf],
-    pattern: &str,
-    case_insensitive: bool,
-) -> Result<Vec<SearchResult>> {
-    let re = RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()?;
-
-    let mut results: Vec<SearchResult> = files
-        .par_iter()
-        .flat_map(|rel_path| {
-            let full_path = root.join(rel_path);
-            let content_bytes = match std::fs::read(&full_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("xgrep: {}: {}", full_path.display(), e);
-                    return vec![];
-                }
-            };
-
-            // Skip binary files (same check as index builder)
-            if memchr::memchr(0, &content_bytes).is_some() {
-                return vec![];
-            }
-
-            let content = String::from_utf8_lossy(&content_bytes);
-            let rel_str = rel_path.to_string_lossy().to_string();
-            let mut file_results = Vec::new();
-            for (i, line) in content.lines().enumerate() {
-                if re.is_match(line) {
-                    file_results.push(SearchResult {
-                        file: rel_str.clone(),
-                        line_number: i + 1,
-                        line: line.to_string(),
-                    });
-                }
-            }
-            file_results
-        })
-        .collect();
-
-    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
-    Ok(results)
 }
 
 /// TrigramQueryツリー内の各Trigramノードをケースバリアントに展開する
