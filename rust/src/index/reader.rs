@@ -14,6 +14,7 @@ pub fn read_header(data: &[u8]) -> Header {
         version: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
         trigram_count: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
         file_count: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+        posting_total_bytes: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
     }
 }
 
@@ -89,17 +90,7 @@ impl IndexReader {
             );
         }
 
-        // Calculate total posting list bytes from trigram entries
-        let mut posting_lists_total_bytes = 0usize;
-        for i in 0..header.trigram_count as usize {
-            let entry_offset = trigram_table_start + i * TrigramEntry::SIZE;
-            let entry = read_trigram_entry(&mmap[entry_offset..entry_offset + TrigramEntry::SIZE]);
-            let end = entry.posting_offset as usize + entry.posting_len as usize;
-            if end > posting_lists_total_bytes {
-                posting_lists_total_bytes = end;
-            }
-        }
-
+        let posting_lists_total_bytes = header.posting_total_bytes as usize;
         let file_table_start = posting_lists_start + posting_lists_total_bytes;
         let string_pool_start = file_table_start + (header.file_count as usize) * FileEntry::SIZE;
 
@@ -347,7 +338,7 @@ mod tests {
     fn test_open_file_too_small() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("tiny.xgrep");
-        fs::write(&path, b"XGR").unwrap(); // only 3 bytes, need 16
+        fs::write(&path, b"XGR").unwrap(); // only 3 bytes, need 20
         assert!(IndexReader::open(&path).is_err());
     }
 
@@ -355,7 +346,7 @@ mod tests {
     fn test_open_invalid_version() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("badver.xgrep");
-        let mut data = vec![0u8; 16];
+        let mut data = vec![0u8; 20];
         data[0..4].copy_from_slice(b"XGRP");
         // version = 99 (invalid)
         data[4..8].copy_from_slice(&99u32.to_le_bytes());
@@ -379,11 +370,12 @@ mod tests {
         // headerは正常だがtrigram_countが巨大で実データが不足しているケース
         let dir = tempdir().unwrap();
         let path = dir.path().join("truncated.xgrep");
-        let mut data = vec![0u8; 20]; // Header(16) + 4バイトだけ
+        let mut data = vec![0u8; 24]; // Header(20) + 4バイトだけ
         data[0..4].copy_from_slice(b"XGRP");
-        data[4..8].copy_from_slice(&1u32.to_le_bytes()); // version = 1
+        data[4..8].copy_from_slice(&VERSION.to_le_bytes());
         data[8..12].copy_from_slice(&9999u32.to_le_bytes()); // trigram_count = 9999 (巨大)
         data[12..16].copy_from_slice(&0u32.to_le_bytes()); // file_count = 0
+        data[16..20].copy_from_slice(&0u32.to_le_bytes()); // posting_total_bytes = 0
         fs::write(&path, &data).unwrap();
         let result = IndexReader::open(&path);
         assert!(result.is_err());

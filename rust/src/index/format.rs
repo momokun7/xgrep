@@ -1,14 +1,15 @@
 pub const MAGIC: [u8; 4] = *b"XGRP";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
-/// Header: 16 bytes
+/// Header: 20 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
-    pub magic: [u8; 4],     // 4
-    pub version: u32,       // 4
-    pub trigram_count: u32, // 4
-    pub file_count: u32,    // 4
+    pub magic: [u8; 4],           // 4
+    pub version: u32,             // 4
+    pub trigram_count: u32,       // 4
+    pub file_count: u32,          // 4
+    pub posting_total_bytes: u32, // 4
 }
 
 /// Trigram Table entry: 16 bytes
@@ -36,12 +37,13 @@ pub struct FileEntry {
 impl Header {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
-    pub fn to_bytes(&self) -> [u8; 16] {
-        let mut bytes = [0u8; 16];
+    pub fn to_bytes(&self) -> [u8; 20] {
+        let mut bytes = [0u8; 20];
         bytes[0..4].copy_from_slice(&self.magic);
         bytes[4..8].copy_from_slice(&self.version.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.trigram_count.to_le_bytes());
         bytes[12..16].copy_from_slice(&self.file_count.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.posting_total_bytes.to_le_bytes());
         bytes
     }
 }
@@ -111,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_header_size() {
-        assert_eq!(Header::SIZE, 16);
+        assert_eq!(Header::SIZE, 20);
     }
 
     #[test]
