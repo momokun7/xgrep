@@ -34,12 +34,10 @@ jobs:
       - name: Smoke test
         working-directory: rust
         run: |
-          echo "hello world" > /tmp/test_xgrep.txt
-          cd /tmp
-          ./target/release/xgrep 2>/dev/null || true
-          cd -
-          # Verify binary runs
-          ./target/release/xgrep --help
+          # Verify binary runs and shows help
+          ./target/release/xgrep --help | grep -q "Ultra-fast indexed code search"
+          # Verify search works (search xgrep's own source)
+          ./target/release/xgrep "fn main" --type rs | grep -q "fn main"
 
   lint:
     name: Lint
@@ -85,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.70.0
+      - uses: dtolnay/rust-toolchain@1.82.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
