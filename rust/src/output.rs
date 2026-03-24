@@ -53,6 +53,13 @@ pub fn format_json(results: &[SearchResult]) -> String {
     serde_json::to_string_pretty(&json_results).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// トークン数を推定する。ASCIIは約4バイト/トークン、CJK等の非ASCIIは約2バイト/トークン。
+fn estimate_tokens(text: &str) -> usize {
+    let ascii_bytes = text.bytes().filter(|b| b.is_ascii()).count();
+    let non_ascii_bytes = text.len() - ascii_bytes;
+    (ascii_bytes / 4) + (non_ascii_bytes / 2) + 1
+}
+
 /// LLM向けMarkdownコードブロック形式で出力（コンテキスト行付き）
 pub fn format_llm(
     results: &[SearchResult],
@@ -128,7 +135,7 @@ pub fn format_llm(
 
         // Check token limit after each file
         if let Some(max) = max_tokens {
-            if output.len() / 4 >= max {
+            if estimate_tokens(&output) >= max {
                 let remaining_files = total_files - files_shown;
                 let remaining_matches: usize = by_file
                     .iter()

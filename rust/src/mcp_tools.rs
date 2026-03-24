@@ -269,7 +269,7 @@ pub fn handle_read_file(xg: &Xgrep, params: &Value) -> (String, bool) {
         );
     }
 
-    let content = match std::fs::read_to_string(&full_path) {
+    let content = match std::fs::read_to_string(&canonical) {
         Ok(c) => c,
         Err(e) => return (format!("Cannot read file '{}': {}", path, e), true),
     };

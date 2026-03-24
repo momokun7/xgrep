@@ -18,7 +18,6 @@ pub(crate) mod filetype;
 pub(crate) mod git;
 pub(crate) mod index;
 pub(crate) mod mcp;
-pub(crate) mod mcp_server;
 pub(crate) mod mcp_tools;
 pub mod output;
 pub mod search;
@@ -91,7 +90,7 @@ impl Xgrep {
         if let Some(parent) = self.index_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let cache = index::builder::cache_path_for(&self.index_path);
+        let cache = index::cache::cache_path_for(&self.index_path);
         index::builder::build_index_with_cache(&self.root, &self.index_path, Some(&cache))?;
         index::updater::save_meta(&self.root, &self.index_path)?;
         Ok(())
@@ -261,7 +260,7 @@ impl Xgrep {
 
 /// MCPサーバーを起動する（stdio transport）
 pub fn start_mcp_server(xg: Xgrep) {
-    mcp_server::start(xg);
+    mcp::start(xg);
 }
 
 fn resolve_index_path(root: &Path) -> Result<PathBuf> {
