@@ -17,13 +17,14 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 
 xgrep is not a ripgrep replacement. Use ripgrep for one-off searches. Use xgrep when you search the same codebase repeatedly — the index pays for itself after ~12 searches.
 
-## Install
+## Quick Start
 
 ```bash
-cargo install xgrep-search
+cargo install xgrep-search    # Installs the `xg` command
+xg "pattern"                  # Search (auto-builds index on first run)
 ```
 
-This installs the `xg` command.
+Requires Rust 1.85+. Works on macOS, Linux, and Windows.
 
 <details>
 <summary>Build from source</summary>
@@ -35,18 +36,6 @@ cargo build --release
 cp target/release/xg ~/.local/bin/
 ```
 </details>
-
-### Requirements
-
-- Rust 1.85+
-- macOS, Linux, or Windows
-
-## Quick Start
-
-```bash
-cargo install xgrep-search    # Install (gives you the `xg` command)
-xg "pattern"                  # Search (auto-builds index on first run)
-```
 
 ## Usage
 
