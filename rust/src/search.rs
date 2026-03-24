@@ -8,31 +8,17 @@ use regex::RegexBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// ASCII-only case-insensitive containsチェック（テスト用ラッパー）。
+/// ASCII-only case-insensitive containsチェック（テスト用）。
+/// 内部でmemmem::Finderを使用し、本番コードと同じアルゴリズムで検証する。
 #[cfg(test)]
 #[allow(dead_code)]
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
-    contains_case_insensitive_bytes(haystack.as_bytes(), needle.as_bytes())
-}
-
-/// バイトスライス上でのASCII case-insensitive containsチェック。
-/// needleは事前にlowercase化されている前提。
-fn contains_case_insensitive_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    if needle.len() > haystack.len() {
-        return false;
-    }
-    'outer: for i in 0..=(haystack.len() - needle.len()) {
-        for j in 0..needle.len() {
-            if haystack[i + j].to_ascii_lowercase() != needle[j] {
-                continue 'outer;
-            }
-        }
-        return true;
-    }
-    false
+    let mut lowered = haystack.as_bytes().to_vec();
+    lowered.make_ascii_lowercase();
+    let needle_lower = needle.to_lowercase();
+    memmem::Finder::new(needle_lower.as_bytes())
+        .find(&lowered)
+        .is_some()
 }
 
 /// 各行の開始バイトオフセットのテーブルを構築する。
@@ -117,23 +103,43 @@ impl Matcher for LiteralMatcher {
     }
 }
 
-/// case-insensitive固定文字列マッチ（ASCII-only folding）
+/// case-insensitive固定文字列マッチ（ASCII-only folding + memmem SIMD検索）
 struct CaseInsensitiveMatcher {
     pattern_lower: String,
 }
 
 impl Matcher for CaseInsensitiveMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        let needle = self.pattern_lower.as_bytes();
+        let line_offsets = build_line_offsets(content);
         let mut results = Vec::new();
-        for (line_idx, line_bytes) in content.split(|&b| b == b'\n').enumerate() {
-            if contains_case_insensitive_bytes(line_bytes, needle) {
-                let line = std::str::from_utf8(line_bytes).unwrap_or("<binary>");
-                results.push(SearchResult {
-                    file: rel_path.to_string(),
-                    line_number: line_idx + 1,
-                    line: line.to_string(),
-                });
+
+        // コンテンツ全体を一度だけlowercase化（ASCII-only、SIMDで高速）
+        let mut lowered = content.to_vec();
+        lowered.make_ascii_lowercase();
+
+        let finder = memmem::Finder::new(self.pattern_lower.as_bytes());
+        let mut pos = 0;
+
+        while let Some(match_pos) = finder.find(&lowered[pos..]) {
+            let abs_pos = pos + match_pos;
+            let line_num = line_number_at(&line_offsets, abs_pos);
+            let ls = line_start(&line_offsets, line_num);
+            let line_end = content[abs_pos..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(content.len(), |p| abs_pos + p);
+            let line = std::str::from_utf8(&content[ls..line_end]).unwrap_or("<binary>");
+
+            results.push(SearchResult {
+                file: rel_path.to_string(),
+                line_number: line_num,
+                line: line.to_string(),
+            });
+
+            // 同一行の重複を避けるため次の行へスキップ
+            pos = line_end + 1;
+            if pos >= content.len() {
+                break;
             }
         }
         results
