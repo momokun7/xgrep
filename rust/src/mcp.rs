@@ -159,4 +159,21 @@ mod tests {
         let result = parse_message(r#"{"method":"test","id":1}"#);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_parse_id_null_is_request_not_notification() {
+        // JSON-RPC 2.0: "id": null はリクエスト（通知ではない）
+        let json = r#"{"jsonrpc":"2.0","id":null,"method":"test"}"#;
+        let msg = parse_message(json).unwrap();
+        assert_eq!(msg.id, Some(Value::Null)); // None ではない
+        assert!(!msg.id.is_none()); // 通知ではなくリクエストとして扱う
+    }
+
+    #[test]
+    fn test_parse_notification_has_no_id_field() {
+        // JSON-RPC 2.0: id フィールドが存在しない = 通知
+        let json = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let msg = parse_message(json).unwrap();
+        assert!(msg.id.is_none()); // 通知
+    }
 }
