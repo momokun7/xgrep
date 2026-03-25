@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-03-25
+
+### Added
+- Version header (magic bytes + version) to trigram cache format for forward compatibility
+- Strict input validation for MCP tool parameters (type checking for integers and booleans)
+- Case-insensitive file type matching (`--type RUST` now works)
+- Code coverage reporting in CI (cargo-tarpaulin + Codecov)
+- CHANGELOG.md following Keep a Changelog format
+
+### Fixed
+- Suppress stderr output in MCP server mode to avoid interfering with JSON-RPC clients
+
+### Security
+- SAFETY comments on all unsafe blocks documenting invariants
+
 ## [0.1.4] - 2026-03-24
 
 ### Added
@@ -42,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parallel file scanning with rayon
 - SIMD-accelerated pattern matching via memchr
 
-[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/momokun7/xgrep/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/momokun7/xgrep/compare/v0.1.0...v0.1.4
 [0.1.0]: https://github.com/momokun7/xgrep/releases/tag/v0.1.0
