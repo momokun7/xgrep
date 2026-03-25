@@ -183,8 +183,8 @@ mod tests {
 
     #[test]
     fn test_save_load_roundtrip() {
-        let f = NamedTempFile::new().unwrap();
-        let path = f.path().to_path_buf();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.cache");
         let mut cache = TrigramCache::new();
         cache.entries.insert(
             "src/main.rs".to_string(),
@@ -205,8 +205,8 @@ mod tests {
 
     #[test]
     fn test_magic_bytes_written() {
-        let f = NamedTempFile::new().unwrap();
-        let path = f.path().to_path_buf();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.cache");
         TrigramCache::new().save(&path).unwrap();
         let data = fs::read(&path).unwrap();
         assert_eq!(&data[0..4], b"XGCH");
