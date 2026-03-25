@@ -1,0 +1,21 @@
+[package]
+name = "xgrep-napi"
+version = "0.1.5"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+xgrep-search = { path = "../rust" }
+napi = { version = "2", features = ["napi4"] }
+napi-derive = "2"
+anyhow = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
