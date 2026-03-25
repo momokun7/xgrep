@@ -2,7 +2,7 @@ import { Xgrep } from '../index.js';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { execSync } from 'child_process';
+import assert from 'assert';
 
 const dir = mkdtempSync(join(tmpdir(), 'xgrep-test-'));
 
@@ -13,26 +13,45 @@ try {
 
   // Open and build index
   const xg = Xgrep.open(dir);
-  console.log('root:', xg.root);
-  console.log('indexPath:', xg.indexPath);
+  assert.ok(xg.root, 'root should be set');
+  assert.ok(xg.indexPath, 'indexPath should be set');
 
   xg.buildIndex();
-  console.log('index built');
+  console.log('ok: buildIndex');
 
   // Search
   const results = xg.search('hello');
-  console.log(`found ${results.length} results`);
-  for (const r of results) {
-    console.log(`  ${r.file}:${r.lineNumber}: ${r.line}`);
-  }
+  assert.ok(results.length > 0, 'should find results for "hello"');
+  assert.strictEqual(results[0].file, 'hello.rs');
+  assert.strictEqual(typeof results[0].lineNumber, 'number');
+  assert.ok(results[0].line.includes('hello'));
+  console.log('ok: search');
 
   // Search with options
   const rsResults = xg.search('fn', { fileType: 'rs', maxCount: 5 });
-  console.log(`rs-only: ${rsResults.length} results`);
+  assert.ok(rsResults.length > 0, 'should find fn in rs files');
+  assert.ok(rsResults.every(r => r.file.endsWith('.rs')), 'all results should be .rs');
+  console.log('ok: search with options');
+
+  // Case-insensitive search
+  const ciResults = xg.search('HELLO', { caseInsensitive: true });
+  assert.ok(ciResults.length > 0, 'case-insensitive should find HELLO');
+  console.log('ok: case-insensitive search');
+
+  // Empty results
+  const noResults = xg.search('nonexistent_pattern_xyz');
+  assert.strictEqual(noResults.length, 0, 'should return empty for no match');
+  console.log('ok: empty results');
 
   // Index status
   const status = xg.indexStatus();
-  console.log('status:', status.split('\n')[0]);
+  assert.ok(status.includes('Index path:'), 'status should contain index path');
+  console.log('ok: indexStatus');
+
+  // Error handling: search on non-indexed repo should still work (fallback)
+  const xg2 = Xgrep.open(dir);
+  assert.ok(xg2, 'open should succeed on valid path');
+  console.log('ok: error handling');
 
   console.log('\nAll tests passed!');
 } finally {
