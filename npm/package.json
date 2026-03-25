@@ -1,6 +1,6 @@
 {
   "name": "xgrep",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Ultra-fast indexed code search engine powered by trigram index. Native Rust bindings for Node.js.",
   "main": "index.js",
   "types": "index.d.ts",
