@@ -60,6 +60,16 @@ fn newest_file_mtime(root: &Path) -> Option<u64> {
     let mut newest = 0u64;
     for entry in WalkBuilder::new(root).build().flatten() {
         if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            // Skip index-related files (.xgrep, .meta, .cache) so they don't
+            // affect freshness detection for the source tree.
+            if let Some(name) = entry.path().file_name().and_then(|n| n.to_str()) {
+                if name.ends_with(".xgrep")
+                    || name.ends_with(".xgrep.meta")
+                    || name.ends_with(".xgrep.cache")
+                {
+                    continue;
+                }
+            }
             if let Ok(meta) = entry.metadata() {
                 if let Ok(mtime) = meta.modified() {
                     let secs = mtime
