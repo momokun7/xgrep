@@ -178,6 +178,17 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn test_mcp_mode_flag() {
+        // Reset to known state
+        MCP_MODE.store(false, Ordering::Relaxed);
+        assert!(!is_mcp_mode());
+        MCP_MODE.store(true, Ordering::Relaxed);
+        assert!(is_mcp_mode());
+        // Clean up for other tests
+        MCP_MODE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
     fn test_parse_request() {
         let json = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         let msg = parse_message(json).unwrap();
