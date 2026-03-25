@@ -53,6 +53,8 @@ fn acquire_lock_with_retry(index_path: &Path, retries: u32) -> Result<LockGuard>
             #[cfg(unix)]
             if let Ok(pid_str) = fs::read_to_string(&lock_path) {
                 if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    // SAFETY: kill(pid, 0) sends no signal; it only checks process
+                    // existence. An invalid PID returns -1 (ESRCH), handled by != 0.
                     if unsafe { libc::kill(pid as i32, 0) } != 0 {
                         stale = true;
                     }
@@ -266,6 +268,9 @@ pub fn build_index_with_cache(
         .read(true)
         .write(true)
         .open(&temp_path)?;
+    // SAFETY: temp_file was just created with a unique name (PID-based) and opened
+    // with read+write. No other process shares this file, and its length was set
+    // via set_len() immediately before this call.
     let mut temp_mmap = unsafe { memmap2::MmapMut::map_mut(&temp_file)? };
 
     // ============================================================

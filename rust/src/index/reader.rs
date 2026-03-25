@@ -47,10 +47,15 @@ pub struct IndexReader {
 impl IndexReader {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
+        // SAFETY: `file` is a valid, open file descriptor. The mapped memory may become
+        // invalid if the file is modified externally; we mitigate this with advisory
+        // locking during index builds.
         let mmap = unsafe { Mmap::map(&file)? };
 
         #[cfg(unix)]
         {
+            // SAFETY: `mmap.as_ptr()` and `mmap.len()` are valid (mmap created above).
+            // MADV_WILLNEED is an advisory hint that does not modify memory contents.
             let ret = unsafe {
                 libc::madvise(
                     mmap.as_ptr() as *mut libc::c_void,
