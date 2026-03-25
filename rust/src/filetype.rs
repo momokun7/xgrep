@@ -1,6 +1,7 @@
 /// Map type name to file extensions
 pub fn extensions_for_type(type_name: &str) -> Option<Vec<&'static str>> {
-    let exts = match type_name {
+    let lower = type_name.to_ascii_lowercase();
+    let exts = match lower.as_str() {
         "rust" | "rs" => vec!["rs"],
         "python" | "py" => vec!["py", "pyi"],
         "javascript" | "js" => vec!["js", "mjs", "cjs"],
@@ -81,6 +82,17 @@ mod tests {
     fn test_extensions_none_for_unknown() {
         assert_eq!(extensions_for_type("fortran"), None);
         assert_eq!(extensions_for_type(""), None);
-        assert_eq!(extensions_for_type("RUST"), None); // case sensitive
+        assert_eq!(extensions_for_type("RUST"), Some(vec!["rs"])); // case insensitive
+    }
+
+    #[test]
+    fn test_extensions_case_insensitive() {
+        assert_eq!(extensions_for_type("RUST"), Some(vec!["rs"]));
+        assert_eq!(extensions_for_type("Py"), Some(vec!["py", "pyi"]));
+        assert_eq!(
+            extensions_for_type("JavaScript"),
+            Some(vec!["js", "mjs", "cjs"])
+        );
+        assert_eq!(extensions_for_type("GO"), Some(vec!["go"]));
     }
 }
