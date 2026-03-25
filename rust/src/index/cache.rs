@@ -1,8 +1,16 @@
+//! Trigram cache for incremental index builds.
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+
+/// Magic bytes identifying the xgrep cache format.
+const CACHE_MAGIC: &[u8; 4] = b"XGCH";
+
+/// Current cache format version.
+const CACHE_VERSION: u32 = 1;
 
 /// Cached trigram information for a file.
 pub(crate) struct CachedFile {
@@ -36,9 +44,25 @@ impl TrigramCache {
         };
         let mut entries = HashMap::new();
         let mut pos = 0;
-        if data.len() < 4 {
+
+        // Need at least 12 bytes: 4 magic + 4 version + 4 count
+        if data.len() < 12 {
             return Self { entries };
         }
+
+        // Check magic bytes
+        if &data[0..4] != CACHE_MAGIC {
+            return Self { entries };
+        }
+        pos += 4;
+
+        // Check version
+        let version = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        if version != CACHE_VERSION {
+            return Self { entries };
+        }
+        pos += 4;
+
         let count =
             u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
@@ -90,9 +114,13 @@ impl TrigramCache {
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut buf = Vec::new();
         if self.entries.len() > u32::MAX as usize {
-            // Too many entries for cache format, skip saving
             return Ok(());
         }
+
+        // Write header
+        buf.extend_from_slice(CACHE_MAGIC);
+        buf.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+
         let valid_entries = self
             .entries
             .iter()
@@ -125,4 +153,64 @@ impl TrigramCache {
 /// Return the cache file path for a given index path.
 pub fn cache_path_for(index_path: &Path) -> PathBuf {
     index_path.with_extension("cache")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_old_format_returns_empty() {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.flush().unwrap();
+        let cache = TrigramCache::load(f.path());
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn test_wrong_version_returns_empty() {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"XGCH").unwrap();
+        f.write_all(&99u32.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.flush().unwrap();
+        let cache = TrigramCache::load(f.path());
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let f = NamedTempFile::new().unwrap();
+        let path = f.path().to_path_buf();
+        let mut cache = TrigramCache::new();
+        cache.entries.insert(
+            "src/main.rs".to_string(),
+            CachedFile {
+                mtime: 1234567890,
+                content_hash: 0xdeadbeef,
+                trigrams: vec![[b'f', b'n', b' '], [b'm', b'a', b'i']],
+            },
+        );
+        cache.save(&path).unwrap();
+        let loaded = TrigramCache::load(&path);
+        assert_eq!(loaded.entries.len(), 1);
+        let e = loaded.entries.get("src/main.rs").unwrap();
+        assert_eq!(e.mtime, 1234567890);
+        assert_eq!(e.content_hash, 0xdeadbeef);
+        assert_eq!(e.trigrams.len(), 2);
+    }
+
+    #[test]
+    fn test_magic_bytes_written() {
+        let f = NamedTempFile::new().unwrap();
+        let path = f.path().to_path_buf();
+        TrigramCache::new().save(&path).unwrap();
+        let data = fs::read(&path).unwrap();
+        assert_eq!(&data[0..4], b"XGCH");
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0);
+    }
 }
