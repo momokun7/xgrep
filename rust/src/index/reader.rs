@@ -63,7 +63,7 @@ impl IndexReader {
                     libc::MADV_WILLNEED,
                 )
             };
-            if ret != 0 {
+            if ret != 0 && !crate::mcp::is_mcp_mode() {
                 eprintln!(
                     "xgrep: madvise warning: {}",
                     std::io::Error::last_os_error()

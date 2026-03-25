@@ -219,7 +219,9 @@ fn scan_indexed<M: Matcher>(
             let content = match fs::read(&full_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("xgrep: {}: {}", full_path.display(), e);
+                    if !crate::mcp::is_mcp_mode() {
+                        eprintln!("xgrep: {}: {}", full_path.display(), e);
+                    }
                     return vec![];
                 }
             };
@@ -239,7 +241,9 @@ fn scan_direct<M: Matcher>(root: &Path, files: &[PathBuf], matcher: &M) -> Vec<S
             let content = match fs::read(&full_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("xgrep: {}: {}", full_path.display(), e);
+                    if !crate::mcp::is_mcp_mode() {
+                        eprintln!("xgrep: {}: {}", full_path.display(), e);
+                    }
                     return vec![];
                 }
             };
@@ -266,14 +270,14 @@ pub fn search(
     case_insensitive: bool,
 ) -> Result<Vec<SearchResult>> {
     let pattern_bytes = pattern.as_bytes();
-    if pattern_bytes.len() < 3 && !pattern_bytes.is_empty() {
+    if pattern_bytes.len() < 3 && !pattern_bytes.is_empty() && !crate::mcp::is_mcp_mode() {
         eprintln!(
             "xgrep: warning: pattern '{}' is shorter than 3 characters, index not used (full scan)",
             pattern
         );
     }
 
-    if case_insensitive && pattern.bytes().any(|b| b > 127) {
+    if case_insensitive && pattern.bytes().any(|b| b > 127) && !crate::mcp::is_mcp_mode() {
         eprintln!(
             "xgrep: warning: case-insensitive search with non-ASCII pattern '{}' uses ASCII-only folding",
             pattern
@@ -318,7 +322,7 @@ pub fn search_files(
     pattern: &str,
     case_insensitive: bool,
 ) -> Result<Vec<SearchResult>> {
-    if case_insensitive && pattern.bytes().any(|b| b > 127) {
+    if case_insensitive && pattern.bytes().any(|b| b > 127) && !crate::mcp::is_mcp_mode() {
         eprintln!(
             "xgrep: warning: case-insensitive search with non-ASCII pattern '{}' uses ASCII-only folding",
             pattern

@@ -1,8 +1,16 @@
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::mcp_tools;
 use crate::Xgrep;
+
+static MCP_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Returns true if the process is running as an MCP server.
+pub fn is_mcp_mode() -> bool {
+    MCP_MODE.load(Ordering::Relaxed)
+}
 
 /// JSON-RPC request/notification.
 pub struct Message {
@@ -61,6 +69,7 @@ pub fn tool_result(text: &str, is_error: bool) -> Value {
 
 /// Start the MCP server (stdio transport).
 pub fn start(xg: Xgrep) {
+    MCP_MODE.store(true, Ordering::Relaxed);
     run_server(|msg| handle_message(&xg, msg));
 }
 

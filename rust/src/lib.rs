@@ -123,7 +123,7 @@ impl Xgrep {
                         .and_then(|e| e.to_str())
                         .is_some_and(|e| exts.contains(&e))
                 });
-            } else {
+            } else if !crate::mcp::is_mcp_mode() {
                 eprintln!("warning: unknown file type '{}', showing all results", ft);
             }
         }
@@ -216,9 +216,13 @@ impl Xgrep {
             }
             index::updater::IndexStatus::NeedsFullBuild => {
                 // No index, full build required
-                eprintln!("[indexing...]");
+                if !crate::mcp::is_mcp_mode() {
+                    eprintln!("[indexing...]");
+                }
                 self.build_index()?;
-                eprintln!("[done]");
+                if !crate::mcp::is_mcp_mode() {
+                    eprintln!("[done]");
+                }
 
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
                 if opts.regex {
