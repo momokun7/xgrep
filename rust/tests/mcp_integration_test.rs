@@ -4,13 +4,22 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use tempfile::tempdir;
 
+struct McpOutput {
+    responses: Vec<serde_json::Value>,
+    stderr: String,
+}
+
 fn send_mcp_messages(root: &std::path::Path, messages: &[&str]) -> Vec<serde_json::Value> {
+    send_mcp_messages_full(root, messages).responses
+}
+
+fn send_mcp_messages_full(root: &std::path::Path, messages: &[&str]) -> McpOutput {
     let binary = env!("CARGO_BIN_EXE_xg");
     let mut child = Command::new(binary)
         .args(["serve", "--root", &root.to_string_lossy()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("Failed to start xg serve");
 
@@ -22,12 +31,16 @@ fn send_mcp_messages(root: &std::path::Path, messages: &[&str]) -> Vec<serde_jso
 
     let output = child.wait_with_output().expect("Failed to read output");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+    McpOutput {
+        responses: stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect(),
+        stderr,
+    }
 }
 
 #[test]
@@ -141,4 +154,54 @@ fn test_mcp_unknown_tool() {
 
     assert_eq!(responses[1]["id"], 2);
     assert!(responses[1]["error"]["code"].as_i64().unwrap() == -32602);
+}
+
+#[test]
+fn test_mcp_input_validation_error() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("a.rs"), "fn hello() {}").unwrap();
+
+    let responses = send_mcp_messages(
+        root,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"pattern":"hello","max_results":"not_a_number"}}}"#,
+        ],
+    );
+
+    assert_eq!(responses[1]["id"], 2);
+    let text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("must be an integer"));
+    assert_eq!(responses[1]["result"]["isError"], true);
+}
+
+#[test]
+fn test_mcp_stderr_suppressed() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    // Short pattern (< 3 chars) normally triggers a stderr warning
+    fs::write(root.join("a.rs"), "fn ab() {}").unwrap();
+
+    let output = send_mcp_messages_full(
+        root,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"pattern":"ab"}}}"#,
+        ],
+    );
+
+    // Search should succeed
+    assert_eq!(output.responses[1]["id"], 2);
+    assert_eq!(output.responses[1]["result"]["isError"], false);
+    // stderr should be empty in MCP mode (no "pattern shorter than 3" warning)
+    assert!(
+        output.stderr.is_empty(),
+        "Expected no stderr in MCP mode, got: {}",
+        output.stderr
+    );
 }
