@@ -1,6 +1,37 @@
+//! MCP tool handlers for xgrep search operations.
+
 use serde_json::Value;
 
 use crate::{output, SearchOptions, Xgrep};
+
+/// Validate that a JSON value, if present, is a non-negative integer.
+fn param_u64(params: &Value, key: &str) -> Result<Option<u64>, String> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(v) if v.is_u64() => Ok(Some(v.as_u64().unwrap())),
+        Some(v) if v.is_i64() => {
+            let n = v.as_i64().unwrap();
+            if n >= 0 {
+                Ok(Some(n as u64))
+            } else {
+                Err(format!(
+                    "Parameter '{}' must be non-negative, got {}",
+                    key, n
+                ))
+            }
+        }
+        Some(v) => Err(format!("Parameter '{}' must be an integer, got {}", key, v)),
+    }
+}
+
+/// Validate that a JSON value, if present, is a boolean.
+fn param_bool(params: &Value, key: &str) -> Result<Option<bool>, String> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(v) if v.is_boolean() => Ok(Some(v.as_bool().unwrap())),
+        Some(v) => Err(format!("Parameter '{}' must be a boolean, got {}", key, v)),
+    }
+}
 
 /// Return MCP tool definitions.
 pub fn tools_list() -> Vec<Value> {
@@ -108,29 +139,30 @@ pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
         None => return ("Missing required parameter: pattern".to_string(), true),
     };
 
-    let max_results = params
-        .get("max_results")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20) as usize;
-    let context_lines = params
-        .get("context_lines")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3) as usize;
-    let max_tokens = params
-        .get("max_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(4000);
+    let max_results = match param_u64(params, "max_results") {
+        Ok(v) => v.unwrap_or(20) as usize,
+        Err(e) => return (e, true),
+    };
+    let context_lines = match param_u64(params, "context_lines") {
+        Ok(v) => v.unwrap_or(3) as usize,
+        Err(e) => return (e, true),
+    };
+    let max_tokens = match param_u64(params, "max_tokens") {
+        Ok(v) => v.unwrap_or(4000) as usize,
+        Err(e) => return (e, true),
+    };
+    let case_insensitive = match param_bool(params, "case_insensitive") {
+        Ok(v) => v.unwrap_or(false),
+        Err(e) => return (e, true),
+    };
+    let regex = match param_bool(params, "regex") {
+        Ok(v) => v.unwrap_or(false),
+        Err(e) => return (e, true),
+    };
 
     let opts = SearchOptions {
-        case_insensitive: params
-            .get("case_insensitive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        regex: params
-            .get("regex")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        case_insensitive,
+        regex,
         file_type: params
             .get("file_type")
             .and_then(|v| v.as_str())
@@ -280,14 +312,14 @@ pub fn handle_read_file(xg: &Xgrep, params: &Value) -> (String, bool) {
         return (format!("## {}\n\nFile is empty.\n", path), false);
     }
 
-    let start = params
-        .get("start_line")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as usize;
-    let end = params
-        .get("end_line")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(lines.len() as u64) as usize;
+    let start = match param_u64(params, "start_line") {
+        Ok(v) => v.unwrap_or(1) as usize,
+        Err(e) => return (e, true),
+    };
+    let end = match param_u64(params, "end_line") {
+        Ok(v) => v.unwrap_or(lines.len() as u64) as usize,
+        Err(e) => return (e, true),
+    };
 
     let start = start.max(1).min(lines.len());
     let end = end.max(start).min(lines.len());
@@ -554,5 +586,32 @@ mod tests {
         let (text, is_error) = handle_read_file(&xg, &params);
         assert!(!is_error);
         assert!(text.contains("empty"));
+    }
+
+    #[test]
+    fn test_handle_search_invalid_max_results() {
+        let (_dir, xg) = setup_test_repo();
+        let params = serde_json::json!({"pattern": "hello", "max_results": "not_a_number"});
+        let (output, is_error) = handle_search(&xg, &params);
+        assert!(is_error);
+        assert!(output.contains("must be an integer"));
+    }
+
+    #[test]
+    fn test_handle_search_invalid_bool() {
+        let (_dir, xg) = setup_test_repo();
+        let params = serde_json::json!({"pattern": "hello", "regex": "yes"});
+        let (output, is_error) = handle_search(&xg, &params);
+        assert!(is_error);
+        assert!(output.contains("must be a boolean"));
+    }
+
+    #[test]
+    fn test_handle_search_negative_max_results() {
+        let (_dir, xg) = setup_test_repo();
+        let params = serde_json::json!({"pattern": "hello", "max_results": -5});
+        let (output, is_error) = handle_search(&xg, &params);
+        assert!(is_error);
+        assert!(output.contains("non-negative"));
     }
 }
