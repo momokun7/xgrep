@@ -1,3 +1,5 @@
+//! Candidate file resolution from trigram index queries.
+
 use crate::index::reader::IndexReader;
 use crate::trigram_query;
 
