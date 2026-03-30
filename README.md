@@ -40,16 +40,19 @@ cp target/release/xg ~/.local/bin/
 ## Usage
 
 ```bash
-xg "pattern"              # Fixed string search
-xg -e "handle_\w+"        # Regex search
-xg "pattern" -i           # Case-insensitive
-xg "pattern" --type rs    # Filter by file type
-xg "pattern" -C 3         # Context lines
-xg "pattern" --format llm # Markdown output for LLMs
-xg "pattern" --changed    # Only git changed files
-xg "pattern" --since 1h   # Recently changed files
-xg "pattern" --fresh      # Check index freshness (slower but up-to-date)
-xg init                   # Explicitly rebuild index
+xg "pattern"                  # Fixed string search
+xg "pattern" /path/to/repo    # Search a specific directory (no cd needed)
+xg -e "handle_\w+"            # Regex search
+xg "pattern" -i               # Case-insensitive
+xg "pattern" --type rs        # Filter by file type
+xg "pattern" -C 3             # Context lines
+xg "pattern" --format llm     # Markdown output for LLMs
+xg "pattern" --changed        # Only git changed files
+xg "pattern" --since 1h       # Recently changed files
+xg "pattern" --fresh          # Check index freshness (slower but up-to-date)
+xg init                       # Explicitly rebuild index
+xg init /path/to/repo         # Build index for a specific directory
+xg --version                  # Show version
 ```
 
 ## MCP Server for AI Agents
