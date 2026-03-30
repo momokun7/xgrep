@@ -116,7 +116,7 @@ fn resolve_dir(path: Option<&Path>) -> Result<PathBuf> {
             }
             Ok(p.canonicalize()?)
         }
-        None => Ok(env::current_dir()?),
+        None => Ok(env::current_dir()?.canonicalize()?),
     }
 }
 

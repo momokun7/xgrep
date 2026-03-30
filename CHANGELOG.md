@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-03-31
+
+### Added
+- `--version` / `-V` flag to display version from Cargo.toml
+- Optional PATH positional argument (`xg "pattern" /path/to/dir`) to search without `cd`
+- PATH argument also works with `xg init /path/to/dir`
+
+### Fixed
+- `--fresh` and `--changed` path doubling when xgrep root is a git subdirectory (#15)
+- `--since` also affected by the same git-root-relative path issue
+
 ## [0.1.5] - 2026-03-25
 
 ### Added
@@ -57,7 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parallel file scanning with rayon
 - SIMD-accelerated pattern matching via memchr
 
-[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/momokun7/xgrep/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/momokun7/xgrep/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/momokun7/xgrep/compare/v0.1.0...v0.1.4
 [0.1.0]: https://github.com/momokun7/xgrep/releases/tag/v0.1.0
