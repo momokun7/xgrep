@@ -41,6 +41,62 @@ impl IndexMeta {
     }
 }
 
+/// Get the git repository root directory (via `git rev-parse --show-toplevel`).
+fn git_toplevel(root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Compute the relative prefix from `git_toplevel` to `root`.
+///
+/// For example, if git_toplevel is `/repo` and root is `/repo/sub/dir`,
+/// returns `Some("sub/dir")`. If root is not under git_toplevel, returns `None`.
+///
+/// Both paths are canonicalized to handle symlinks (e.g. /var -> /private/var on macOS).
+fn root_prefix_in_git(git_toplevel: &Path, root: &Path) -> Option<PathBuf> {
+    let canon_toplevel = fs::canonicalize(git_toplevel).unwrap_or_else(|_| git_toplevel.into());
+    let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.into());
+    canon_root
+        .strip_prefix(&canon_toplevel)
+        .ok()
+        .map(PathBuf::from)
+}
+
+/// Convert a git-root-relative path to an xgrep-root-relative path.
+///
+/// `prefix` is the relative path from git_toplevel to xgrep root (computed
+/// by `root_prefix_in_git`). Git commands return paths relative to the
+/// repository root; this function strips the prefix so that the resulting
+/// path is relative to `root`.
+///
+/// Returns `None` if the path is outside of `root` (belongs to a sibling
+/// subdirectory in the same git repo).
+fn to_root_relative(prefix: &Path, git_rel_path: &str) -> Option<PathBuf> {
+    let git_path = Path::new(git_rel_path);
+    git_path.strip_prefix(prefix).ok().map(PathBuf::from)
+}
+
+/// Convert a git-root-relative path using the computed prefix.
+///
+/// If `prefix` is `None` (root == git toplevel), the path is used as-is.
+/// If `prefix` is `Some`, the prefix is stripped; paths outside root return `None`.
+fn convert_git_path(prefix: &Option<PathBuf>, git_rel_path: &str) -> Option<PathBuf> {
+    match prefix {
+        Some(pfx) if !pfx.as_os_str().is_empty() => to_root_relative(pfx, git_rel_path),
+        _ => Some(PathBuf::from(git_rel_path)),
+    }
+}
+
 /// Get the current git HEAD commit hash.
 fn current_commit_hash(root: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
@@ -134,7 +190,11 @@ fn parse_status_paths(line: &str) -> Vec<String> {
 }
 
 /// Common helper to collect uncommitted changes (staged + unstaged) and untracked files.
+///
+/// Returned paths are relative to `root`, not to the git repository root.
+/// Paths outside of `root` are filtered out.
 fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<PathBuf>> {
+    let prefix = git_toplevel(root).and_then(|tl| root_prefix_in_git(&tl, root));
     let mut changed = std::collections::HashSet::new();
 
     // Staged + unstaged changes (tracked files only)
@@ -145,7 +205,9 @@ fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<
         .output()?;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         for path in parse_status_paths(line) {
-            changed.insert(PathBuf::from(path));
+            if let Some(p) = convert_git_path(&prefix, &path) {
+                changed.insert(p);
+            }
         }
     }
 
@@ -159,15 +221,21 @@ fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let line = line.trim();
         if !line.is_empty() {
-            changed.insert(PathBuf::from(line));
+            if let Some(p) = convert_git_path(&prefix, line) {
+                changed.insert(p);
+            }
         }
     }
 
     Ok(changed)
 }
 
-/// Get files changed between two commits + uncommitted changed files.
-fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
+/// Get files changed between two commits.
+///
+/// Returned paths are relative to `root`, not to the git repository root.
+/// Paths outside of `root` are filtered out.
+fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<PathBuf>> {
+    let prefix = git_toplevel(root).and_then(|tl| root_prefix_in_git(&tl, root));
     let mut files = std::collections::HashSet::new();
 
     // Committed changes: old_hash..HEAD
@@ -185,11 +253,13 @@ fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<String>> {
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let line = line.trim();
         if !line.is_empty() {
-            files.insert(line.to_string());
+            if let Some(p) = convert_git_path(&prefix, line) {
+                files.insert(p);
+            }
         }
     }
 
-    let mut result: Vec<String> = files.into_iter().collect();
+    let mut result: Vec<PathBuf> = files.into_iter().collect();
     result.sort();
     Ok(result)
 }
@@ -220,20 +290,23 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
                 let old_hash = m.commit_hash.as_deref().unwrap_or("");
                 if let Ok(files) = changed_files_since(root, old_hash) {
                     for f in files {
-                        changed.insert(PathBuf::from(f));
+                        changed.insert(f);
                     }
                 }
                 changed.extend(collect_uncommitted_changes(root)?);
             } else {
                 // Same commit: only check staged/unstaged changes (fast path)
                 // Skip git ls-files --others to save ~170ms
+                let prefix = git_toplevel(root).and_then(|tl| root_prefix_in_git(&tl, root));
                 let output = std::process::Command::new("git")
                     .args(["status", "--porcelain", "-uno"])
                     .current_dir(root)
                     .output()?;
                 for line in String::from_utf8_lossy(&output.stdout).lines() {
                     for path in parse_status_paths(line) {
-                        changed.insert(PathBuf::from(path));
+                        if let Some(p) = convert_git_path(&prefix, &path) {
+                            changed.insert(p);
+                        }
                     }
                 }
             }
@@ -764,5 +837,210 @@ mod tests {
             }
             other => panic!("expected Stale, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_to_root_relative_subdir() {
+        let prefix = PathBuf::from("sub/dir");
+
+        // Path inside root
+        let result = to_root_relative(&prefix, "sub/dir/file.rs");
+        assert_eq!(result, Some(PathBuf::from("file.rs")));
+
+        // Path outside root (sibling directory)
+        let result = to_root_relative(&prefix, "other/file.rs");
+        assert!(result.is_none());
+
+        // Nested path inside root
+        let result = to_root_relative(&prefix, "sub/dir/nested/deep.rs");
+        assert_eq!(result, Some(PathBuf::from("nested/deep.rs")));
+    }
+
+    #[test]
+    fn test_to_root_relative_empty_prefix() {
+        let prefix = PathBuf::from("");
+
+        let result = to_root_relative(&prefix, "src/main.rs");
+        assert_eq!(result, Some(PathBuf::from("src/main.rs")));
+    }
+
+    #[test]
+    fn test_convert_git_path_no_prefix() {
+        // When prefix is None (root == git toplevel), path is used as-is
+        let result = convert_git_path(&None, "src/main.rs");
+        assert_eq!(result, Some(PathBuf::from("src/main.rs")));
+    }
+
+    #[test]
+    fn test_convert_git_path_with_prefix() {
+        let prefix = Some(PathBuf::from("sub/dir"));
+
+        let result = convert_git_path(&prefix, "sub/dir/file.rs");
+        assert_eq!(result, Some(PathBuf::from("file.rs")));
+
+        // Outside root
+        let result = convert_git_path(&prefix, "other/file.rs");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_collect_uncommitted_changes_subdir() {
+        // Set up a git repo with a subdirectory structure
+        let dir = tempdir().unwrap();
+        let git_root = dir.path();
+        init_git_repo(git_root);
+
+        // Create subdirectory structure
+        let sub_dir = git_root.join("sub").join("dir");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(git_root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
+        fs::write(sub_dir.join("file.rs"), "fn main() {}").unwrap();
+        fs::write(git_root.join("root_file.txt"), "root").unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+
+        // Modify a file in the subdirectory
+        fs::write(sub_dir.join("file.rs"), "fn main() { changed }").unwrap();
+        // Also modify a file outside the subdirectory
+        fs::write(git_root.join("root_file.txt"), "changed root").unwrap();
+
+        // Collect changes from the subdirectory (xgrep root = sub/dir)
+        let changes = collect_uncommitted_changes(&sub_dir).unwrap();
+
+        // Should contain file.rs (relative to sub/dir), NOT sub/dir/file.rs
+        assert!(
+            changes.contains(&PathBuf::from("file.rs")),
+            "expected file.rs in changes, got: {:?}",
+            changes
+        );
+
+        // Should NOT contain root_file.txt (outside of sub/dir)
+        assert!(
+            !changes.contains(&PathBuf::from("root_file.txt")),
+            "root_file.txt should be filtered out, got: {:?}",
+            changes
+        );
+
+        // Should NOT contain git-root-relative path
+        assert!(
+            !changes.contains(&PathBuf::from("sub/dir/file.rs")),
+            "should not contain git-root-relative path, got: {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn test_check_index_status_subdir_stale() {
+        // When xgrep root is a subdirectory of git root, changed_files
+        // should be relative to xgrep root, not git root.
+        let dir = tempdir().unwrap();
+        let git_root = dir.path();
+        init_git_repo(git_root);
+
+        let sub_dir = git_root.join("sub").join("dir");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(git_root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
+        fs::write(sub_dir.join("file.rs"), "fn main() {}").unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+
+        // Build index from the subdirectory
+        let index_path = sub_dir.join("test.xgrep");
+        ensure_fresh_index(&sub_dir, &index_path).unwrap();
+
+        // Modify a file in the subdirectory
+        fs::write(sub_dir.join("file.rs"), "fn main() { changed }").unwrap();
+
+        let status = check_index_status(&sub_dir, &index_path).unwrap();
+        match status {
+            IndexStatus::Stale { changed_files } => {
+                // Paths should be relative to sub/dir, not git root
+                assert!(
+                    changed_files.contains(&PathBuf::from("file.rs")),
+                    "expected file.rs, got: {:?}",
+                    changed_files
+                );
+                assert!(
+                    !changed_files.contains(&PathBuf::from("sub/dir/file.rs")),
+                    "should not contain git-root-relative path: {:?}",
+                    changed_files
+                );
+            }
+            other => panic!("expected Stale, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_changed_files_since_subdir() {
+        let dir = tempdir().unwrap();
+        let git_root = dir.path();
+        init_git_repo(git_root);
+
+        let sub_dir = git_root.join("sub");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(sub_dir.join("a.txt"), "hello").unwrap();
+        fs::write(git_root.join("root.txt"), "root").unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+
+        let old_hash = current_commit_hash(git_root).unwrap();
+
+        // New commit with changes in both locations
+        fs::write(sub_dir.join("a.txt"), "changed").unwrap();
+        fs::write(git_root.join("root.txt"), "changed root").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "changes"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+
+        // Query from subdirectory
+        let files = changed_files_since(&sub_dir, &old_hash).unwrap();
+
+        // Should contain a.txt (relative to sub/), not sub/a.txt
+        assert!(
+            files.contains(&PathBuf::from("a.txt")),
+            "expected a.txt, got: {:?}",
+            files
+        );
+
+        // Should NOT contain root.txt (outside of sub/)
+        assert!(
+            !files.contains(&PathBuf::from("root.txt")),
+            "root.txt should be filtered out: {:?}",
+            files
+        );
     }
 }

@@ -13,12 +13,72 @@ pub fn is_git_repo(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Get the git repository root directory.
+fn git_toplevel(root: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+/// Convert a git-root-relative path to a root-relative path.
+/// When root is a subdirectory of the git repo, strips the prefix.
+/// Returns None if the path is outside root's scope.
+fn to_root_relative(root: &Path, git_root: &Path, git_rel_path: &str) -> Option<PathBuf> {
+    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canon_git = std::fs::canonicalize(git_root).unwrap_or_else(|_| git_root.to_path_buf());
+
+    if canon_root == canon_git {
+        // root IS the git root, no conversion needed
+        return Some(PathBuf::from(git_rel_path));
+    }
+
+    // root is a subdirectory of git root: compute the prefix to strip
+    let prefix = canon_root.strip_prefix(&canon_git).ok()?;
+    let rel = PathBuf::from(git_rel_path);
+    rel.strip_prefix(prefix).ok().map(|p| p.to_path_buf())
+}
+
+/// Collect git-changed file paths, converting to root-relative paths.
+fn collect_git_paths(root: &Path, git_root: &Option<PathBuf>, lines: &str) -> HashSet<PathBuf> {
+    let mut files = HashSet::new();
+    for line in lines.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rel = match git_root {
+            Some(gr) => match to_root_relative(root, gr, line) {
+                Some(p) => p,
+                None => continue, // path outside root's scope
+            },
+            None => PathBuf::from(line),
+        };
+        let full = root.join(&rel);
+        if full.exists() {
+            files.insert(rel);
+        }
+    }
+    files
+}
+
 /// Get the list of uncommitted changed files (staged + unstaged).
 pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
     if !is_git_repo(root) {
         bail!("not a git repository");
     }
 
+    let gr = git_toplevel(root);
     let mut files = HashSet::new();
 
     // unstaged changes
@@ -26,30 +86,22 @@ pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
         .args(["diff", "--name-only"])
         .current_dir(root)
         .output()?;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            let path = root.join(line);
-            if path.exists() {
-                files.insert(PathBuf::from(line));
-            }
-        }
-    }
+    files.extend(collect_git_paths(
+        root,
+        &gr,
+        &String::from_utf8_lossy(&output.stdout),
+    ));
 
     // staged changes
     let output = Command::new("git")
         .args(["diff", "--cached", "--name-only"])
         .current_dir(root)
         .output()?;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            let path = root.join(line);
-            if path.exists() {
-                files.insert(PathBuf::from(line));
-            }
-        }
-    }
+    files.extend(collect_git_paths(
+        root,
+        &gr,
+        &String::from_utf8_lossy(&output.stdout),
+    ));
 
     let mut result: Vec<PathBuf> = files.into_iter().collect();
     result.sort();
@@ -81,16 +133,8 @@ pub fn since_files(root: &Path, duration: &str) -> Result<Vec<PathBuf>> {
             .output()?
     };
 
-    let mut files = HashSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            let path = root.join(line);
-            if path.exists() {
-                files.insert(PathBuf::from(line));
-            }
-        }
-    }
+    let gr = git_toplevel(root);
+    let files = collect_git_paths(root, &gr, &String::from_utf8_lossy(&output.stdout));
 
     let mut result: Vec<PathBuf> = files.into_iter().collect();
     result.sort();

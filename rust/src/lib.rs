@@ -365,4 +365,143 @@ mod tests {
         assert!(path.to_string_lossy().contains("xgrep"));
         assert!(path.ends_with("index"));
     }
+
+    /// Regression test for GitHub Issue #15:
+    /// When xgrep root is a subdirectory of the git repository root,
+    /// --fresh search must not double the path (e.g., /repo/sub/sub/file).
+    #[test]
+    fn test_fresh_search_in_git_subdirectory_no_path_doubling() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let git_root = dir.path();
+
+        // Initialize git repo at top level
+        Command::new("git")
+            .args(["init"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+
+        // Create subdirectory with a file
+        let sub = git_root.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("hello.rs"), "pub fn hello() { }").unwrap();
+
+        // Initial commit
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+
+        // Build index rooted at the subdirectory (not git root)
+        let xg = Xgrep::open_local(&sub).unwrap();
+        xg.build_index().unwrap();
+
+        // Modify the file to make index stale
+        std::fs::write(sub.join("hello.rs"), "pub fn hello_world() { }").unwrap();
+
+        // Search with fresh=true — this is the scenario that caused path doubling
+        let opts = SearchOptions {
+            fresh: true,
+            ..Default::default()
+        };
+        let results = xg.search("hello_world", &opts).unwrap();
+
+        // Must find the changed content (not fail with file-not-found)
+        assert!(
+            !results.is_empty(),
+            "fresh search in git subdirectory should find changed file content"
+        );
+        // Path must be relative to xgrep root, not contain the subdirectory prefix twice
+        for r in &results {
+            assert!(
+                !r.file.contains("subdir/subdir"),
+                "path should not be doubled: got '{}'",
+                r.file
+            );
+        }
+    }
+
+    /// Regression test: --fresh with --changed in a git subdirectory.
+    /// Ensures search_changed also uses correct paths.
+    #[test]
+    fn test_changed_search_in_git_subdirectory() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let git_root = dir.path();
+
+        Command::new("git")
+            .args(["init"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+
+        let sub = git_root.join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("lib.rs"), "fn original() {}").unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(git_root)
+            .output()
+            .unwrap();
+
+        // Modify the file (uncommitted change)
+        std::fs::write(sub.join("lib.rs"), "fn modified_unique_marker() {}").unwrap();
+
+        // Search changed files from subdirectory root
+        let xg = Xgrep::open_local(&sub).unwrap();
+        xg.build_index().unwrap();
+
+        let opts = SearchOptions {
+            changed_only: true,
+            ..Default::default()
+        };
+        let results = xg.search("modified_unique_marker", &opts).unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "--changed search in subdirectory should find modified content"
+        );
+        for r in &results {
+            assert!(
+                !r.file.contains("pkg/pkg"),
+                "path should not be doubled: got '{}'",
+                r.file
+            );
+        }
+    }
 }
