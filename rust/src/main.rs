@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::env;
+use std::path::{Path, PathBuf};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -8,13 +9,17 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use xgrep_search::{output, SearchOptions, Xgrep};
 
 #[derive(Parser)]
-#[command(name = "xg", about = "Ultra-fast indexed code search (xgrep)")]
+#[command(name = "xg", about = "Ultra-fast indexed code search (xgrep)", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
     /// Search pattern
     pattern: Option<String>,
+
+    /// Directory to search (default: current directory)
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
 
     /// Output format (default, llm)
     #[arg(long, default_value = "default")]
@@ -72,6 +77,10 @@ enum Commands {
         /// Store index in .xgrep/ instead of ~/.cache/xgrep/
         #[arg(long)]
         local: bool,
+
+        /// Directory to index (default: current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
     },
     /// Start MCP server (stdio transport)
     Serve {
@@ -94,16 +103,33 @@ fn main() {
     }
 }
 
+/// Resolve the target directory from an optional path argument.
+/// Returns the canonicalized directory path, or an error if the path is invalid.
+fn resolve_dir(path: Option<&Path>) -> Result<PathBuf> {
+    match path {
+        Some(p) => {
+            if !p.exists() {
+                anyhow::bail!("path does not exist: {}", p.display());
+            }
+            if !p.is_dir() {
+                anyhow::bail!("not a directory: {}", p.display());
+            }
+            Ok(p.canonicalize()?)
+        }
+        None => Ok(env::current_dir()?),
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let cwd = env::current_dir()?;
 
     match cli.command {
-        Some(Commands::Init { local }) => {
+        Some(Commands::Init { local, path }) => {
+            let dir = resolve_dir(path.as_deref())?;
             let xg = if local {
-                Xgrep::open_local(&cwd)?
+                Xgrep::open_local(&dir)?
             } else {
-                Xgrep::open(&cwd)?
+                Xgrep::open(&dir)?
             };
             let start = std::time::Instant::now();
             xg.build_index()?;
@@ -116,7 +142,9 @@ fn run() -> Result<()> {
             );
         }
         Some(Commands::Serve { root }) => {
-            let root_path = root.map(std::path::PathBuf::from).unwrap_or(cwd);
+            let root_path = root
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| env::current_dir().expect("failed to get current directory"));
             let xg = Xgrep::open(&root_path)?;
             xgrep_search::start_mcp_server(xg);
         }
@@ -135,7 +163,8 @@ fn run() -> Result<()> {
                 std::process::exit(1);
             });
 
-            let xg = Xgrep::open(&cwd)?;
+            let dir = resolve_dir(cli.path.as_deref())?;
+            let xg = Xgrep::open(&dir)?;
             let opts = SearchOptions {
                 case_insensitive: cli.case_insensitive,
                 regex: cli.regex,
@@ -175,11 +204,11 @@ fn run() -> Result<()> {
                 let output_str = match cli.format.as_str() {
                     "llm" => {
                         let ctx = cli.context.unwrap_or(3);
-                        output::format_llm(&results, &cwd, ctx, None)?
+                        output::format_llm(&results, &dir, ctx, None)?
                     }
                     _ => {
                         if let Some(ctx) = cli.context {
-                            output::format_default_context(&results, &cwd, ctx)?
+                            output::format_default_context(&results, &dir, ctx)?
                         } else {
                             output::format_default(&results)
                         }
@@ -190,4 +219,40 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn resolve_dir_none_returns_cwd() {
+        let result = resolve_dir(None).unwrap();
+        let cwd = env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(result, cwd);
+    }
+
+    #[test]
+    fn resolve_dir_absolute_path() {
+        let tmp = env::temp_dir();
+        let result = resolve_dir(Some(&tmp)).unwrap();
+        assert_eq!(result, tmp.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_dir_nonexistent_path() {
+        let bad = PathBuf::from("/nonexistent_xgrep_test_path");
+        let err = resolve_dir(Some(&bad)).unwrap_err();
+        assert!(err.to_string().contains("path does not exist"));
+    }
+
+    #[test]
+    fn resolve_dir_file_path() {
+        let tmp = env::temp_dir().join("xgrep_test_resolve_dir_file");
+        fs::write(&tmp, "test").unwrap();
+        let err = resolve_dir(Some(&tmp)).unwrap_err();
+        assert!(err.to_string().contains("not a directory"));
+        fs::remove_file(&tmp).ok();
+    }
 }
