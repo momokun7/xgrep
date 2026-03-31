@@ -1,8 +1,22 @@
 # xgrep
 
+[![CI](https://github.com/momokun7/xgrep/actions/workflows/ci.yml/badge.svg)](https://github.com/momokun7/xgrep/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/xgrep-search.svg)](https://crates.io/crates/xgrep-search)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Ultra-fast indexed code search engine with MCP server for AI coding tools.
 
 Pre-builds a trigram inverted index, then searches in milliseconds. Designed for repeated searches on large codebases — by humans and AI agents alike.
+
+## Features
+
+- **Indexed search** — trigram inverted index makes repeated searches 2-59x faster than ripgrep
+- **File discovery** — `--find` mode locates files 4-36x faster than fd/find
+- **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io/) server for AI coding tools (Claude Code, Cursor, etc.)
+- **LLM-optimized output** — `--format llm` produces Markdown with language tags, context lines, and token-aware truncation
+- **Git-aware** — search only changed files (`--changed`), recent commits (`--since 1h`), respects `.gitignore`
+- **Zero config** — `cargo install xgrep-search`, then `xg "pattern"`. Index builds automatically on first search
+- **Hybrid search** — serves results from index instantly while rebuilding in the background
 
 ## Why xgrep?
 
@@ -257,6 +271,10 @@ Follows the same convention as ripgrep.
 2. **Search**: Extracts trigrams from query, intersects posting lists to find candidate files, verifies matches
 3. **Hybrid Mode**: When the index is stale, combines index results with direct scanning of changed files — no rebuild needed
 4. **MCP Server**: Exposes search via JSON-RPC over stdio, with LLM-optimized output and token-aware truncation
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 

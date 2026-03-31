@@ -9,6 +9,7 @@ zig/zig-out/
 zig/.zig-cache/
 .xgrep/
 docs/superpowers/
+reviews/
 bench/results/
 bench/ripgrep-src/
 bench/.zoekt-idx-*/
