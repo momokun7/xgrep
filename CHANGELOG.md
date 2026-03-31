@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-03-31
+
+### Changed
+- Unified crates.io and npm publish into single release workflow (single `v*` tag)
+- npm package version auto-synced from Cargo.toml (no manual package.json updates)
+- Removed standalone npm-publish.yml
+
+### Fixed
+- Windows path separator in test assertions
+
 ## [0.2.0] - 2026-03-31
 
 ### Added
@@ -91,7 +101,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parallel file scanning with rayon
 - SIMD-accelerated pattern matching via memchr
 
-[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/momokun7/xgrep/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/momokun7/xgrep/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/momokun7/xgrep/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/momokun7/xgrep/compare/v0.1.4...v0.1.5
