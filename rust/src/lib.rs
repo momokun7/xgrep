@@ -581,7 +581,11 @@ mod tests {
 
         let py_files = xg.find_files("*.py").unwrap();
         assert_eq!(py_files.len(), 1);
-        assert_eq!(py_files[0], "src/util.py");
+        assert!(
+            py_files[0] == "src/util.py" || py_files[0] == "src\\util.py",
+            "expected src/util.py or src\\util.py, got: {}",
+            py_files[0]
+        );
 
         let md_files = xg.find_files("*.md").unwrap();
         assert_eq!(md_files.len(), 1);
