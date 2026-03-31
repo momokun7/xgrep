@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
+use crate::error::Result;
 
 use crate::search::SearchResult;
 

@@ -14,6 +14,7 @@
 //! ```
 
 pub(crate) mod candidates;
+pub mod error;
 pub(crate) mod filetype;
 pub(crate) mod git;
 pub mod hints;
@@ -34,8 +35,7 @@ pub mod fuzz_exports {
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
-
+pub use error::{Result, XgrepError};
 pub use filetype::extensions_for_type;
 pub use filetype::list_all_types;
 pub use search::SearchResult;
@@ -46,7 +46,7 @@ pub use search::SearchResult;
 /// and untracked files. Returns an error if `root` is not inside a git repository.
 pub fn git_changed_files(root: &Path) -> Result<Vec<PathBuf>> {
     if !git::is_git_repo(root) {
-        bail!("--changed requires a git repository");
+        return Err(XgrepError::NotGitRepo);
     }
     git::changed_files(root)
 }
@@ -281,7 +281,7 @@ impl Xgrep {
     /// Search only git-changed files. Returns error if not a git repository.
     fn search_changed(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
         if !git::is_git_repo(&self.root) {
-            bail!("--changed/--since requires a git repository");
+            return Err(XgrepError::NotGitRepo);
         }
 
         let mut files = Vec::new();
@@ -322,7 +322,7 @@ impl Xgrep {
 
         if is_glob {
             let glob = glob::Pattern::new(pattern)
-                .map_err(|e| anyhow::anyhow!("invalid glob pattern: {}", e))?;
+                .map_err(|e| XgrepError::InvalidPattern(format!("invalid glob: {}", e)))?;
             for fid in 0..file_count {
                 let path = reader.file_path(fid);
                 if glob.matches(path) {
@@ -639,5 +639,75 @@ mod tests {
 
         let results = xg.find_files("makefile").unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_git_changed_files_returns_not_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = git_changed_files(dir.path()).unwrap_err();
+        assert!(matches!(err, XgrepError::NotGitRepo));
+    }
+
+    #[test]
+    fn test_changed_search_returns_not_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let opts = SearchOptions {
+            changed_only: true,
+            ..Default::default()
+        };
+        let err = xg.search("hello", &opts).unwrap_err();
+        assert!(matches!(err, XgrepError::NotGitRepo));
+    }
+
+    #[test]
+    fn test_find_files_invalid_glob_returns_invalid_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let err = xg.find_files("[invalid").unwrap_err();
+        assert!(matches!(err, XgrepError::InvalidPattern(_)));
+    }
+
+    #[test]
+    fn test_index_reader_invalid_magic_returns_index_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.xgrep");
+        std::fs::write(&path, b"BADMxxxxxxxxxxxxxxxxxxxxxxxx").unwrap();
+        match index::reader::IndexReader::open(&path) {
+            Err(XgrepError::IndexError(_)) => {}
+            other => panic!("expected IndexError, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_index_reader_too_small_returns_index_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.xgrep");
+        std::fs::write(&path, b"XGR").unwrap();
+        match index::reader::IndexReader::open(&path) {
+            Err(XgrepError::IndexError(_)) => {}
+            other => panic!("expected IndexError, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn test_search_invalid_regex_returns_invalid_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let opts = SearchOptions {
+            regex: true,
+            ..Default::default()
+        };
+        let err = xg.search("[invalid", &opts).unwrap_err();
+        assert!(matches!(err, XgrepError::InvalidPattern(_)));
     }
 }

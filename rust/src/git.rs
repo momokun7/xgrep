@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use crate::error::{Result, XgrepError};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -75,7 +75,7 @@ fn collect_git_paths(root: &Path, git_root: &Option<PathBuf>, lines: &str) -> Ha
 /// Get the list of uncommitted changed files (staged + unstaged).
 pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
     if !is_git_repo(root) {
-        bail!("not a git repository");
+        return Err(XgrepError::NotGitRepo);
     }
 
     let gr = git_toplevel(root);
@@ -111,7 +111,7 @@ pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// Get the list of files changed within a specified duration.
 pub fn since_files(root: &Path, duration: &str) -> Result<Vec<PathBuf>> {
     if !is_git_repo(root) {
-        bail!("not a git repository");
+        return Err(XgrepError::NotGitRepo);
     }
 
     let output = if let Some(since_str) = parse_duration(duration)? {
@@ -145,7 +145,10 @@ fn parse_duration(duration: &str) -> Result<Option<String>> {
     if duration.ends_with(".commits") {
         let n = duration.strip_suffix(".commits").unwrap();
         if n.parse::<u32>().is_err() {
-            bail!("invalid commit count: {}", n);
+            return Err(XgrepError::InvalidPattern(format!(
+                "invalid commit count: {}",
+                n
+            )));
         }
         return Ok(None);
     }
@@ -159,15 +162,15 @@ fn parse_duration(duration: &str) -> Result<Option<String>> {
     } else if let Some(stripped) = duration.strip_suffix('w') {
         (stripped, "week")
     } else {
-        bail!(
+        return Err(XgrepError::InvalidPattern(format!(
             "invalid duration format: {}. Use Nh, Nm, Nd, Nw, or N.commits",
             duration
-        );
+        )));
     };
 
     let n: u32 = num_str
         .parse()
-        .map_err(|_| anyhow::anyhow!("invalid number: {}", num_str))?;
+        .map_err(|_| XgrepError::InvalidPattern(format!("invalid number: {}", num_str)))?;
     let plural = if n == 1 { "" } else { "s" };
     Ok(Some(format!("{} {}{} ago", n, unit, plural)))
 }

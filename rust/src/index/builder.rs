@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use crate::error::{Result, XgrepError};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 
@@ -31,10 +31,10 @@ fn acquire_lock(index_path: &Path) -> Result<LockGuard> {
 
 fn acquire_lock_with_retry(index_path: &Path, retries: u32) -> Result<LockGuard> {
     if retries == 0 {
-        bail!(
-            "Failed to acquire lock after retries (lock: {})",
+        return Err(XgrepError::LockError(format!(
+            "failed to acquire lock after retries (lock: {})",
             index_path.with_extension("lock").display()
-        );
+        )));
     }
     let lock_path = index_path.with_extension("lock");
     match fs::OpenOptions::new()
@@ -77,12 +77,15 @@ fn acquire_lock_with_retry(index_path: &Path, retries: u32) -> Result<LockGuard>
                 return acquire_lock_with_retry(index_path, retries - 1);
             }
 
-            bail!(
-                "Index build already in progress (lock: {})",
+            Err(XgrepError::LockError(format!(
+                "index build already in progress (lock: {})",
                 lock_path.display()
-            )
+            )))
         }
-        Err(e) => bail!("Failed to create lock file: {}", e),
+        Err(e) => Err(XgrepError::LockError(format!(
+            "failed to create lock file: {}",
+            e
+        ))),
     }
 }
 
@@ -118,7 +121,7 @@ pub fn build_index_with_cache(
         })
         .build()
     {
-        let entry = entry?;
+        let entry = entry.map_err(|e| XgrepError::IndexError(e.to_string()))?;
         if entry.file_type().is_none_or(|ft| !ft.is_file()) {
             continue;
         }
@@ -235,14 +238,18 @@ pub fn build_index_with_cache(
     // Create temporary file (for posting data)
     // ============================================================
     if files.len() > u32::MAX as usize {
-        bail!("too many files: {} (maximum {})", files.len(), u32::MAX);
+        return Err(XgrepError::IndexError(format!(
+            "too many files: {} (maximum {})",
+            files.len(),
+            u32::MAX
+        )));
     }
     if sorted_trigrams.len() > u32::MAX as usize {
-        bail!(
+        return Err(XgrepError::IndexError(format!(
             "too many unique trigrams: {} (maximum {})",
             sorted_trigrams.len(),
             u32::MAX
-        );
+        )));
     }
 
     if total_pairs == 0 {
@@ -258,9 +265,9 @@ pub fn build_index_with_cache(
     let temp_path = temp_dir.path().join("postings.tmp");
     {
         let f = fs::File::create(&temp_path)?;
-        let temp_size = total_pairs
-            .checked_mul(4)
-            .ok_or_else(|| anyhow::anyhow!("Index too large: total_pairs overflow"))?;
+        let temp_size = total_pairs.checked_mul(4).ok_or_else(|| {
+            XgrepError::IndexError("index too large: total_pairs overflow".to_string())
+        })?;
         f.set_len(temp_size as u64)?;
     }
 
@@ -346,7 +353,9 @@ pub fn build_index_with_cache(
 
         let offset = current_posting_offset;
         if posting_buf.len() > u32::MAX as usize {
-            bail!("Posting list too large for index format (> 4GB)");
+            return Err(XgrepError::IndexError(
+                "posting list too large for index format (> 4GB)".to_string(),
+            ));
         }
         let len = posting_buf.len() as u32;
         writer.write_all(&posting_buf)?;
@@ -386,7 +395,9 @@ pub fn build_index_with_cache(
     // Overwrite Header's posting_total_bytes with the final value
     header.posting_total_bytes = current_posting_offset;
     writer.flush()?;
-    let mut file = writer.into_inner()?;
+    let mut file = writer
+        .into_inner()
+        .map_err(|e| XgrepError::Io(e.into_error()))?;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&header.to_bytes())?;
 

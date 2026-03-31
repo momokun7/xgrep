@@ -1,7 +1,7 @@
 use crate::candidates::{resolve_literal_candidates, resolve_regex_candidates};
+use crate::error::{Result, XgrepError};
 use crate::index::reader::IndexReader;
 use crate::trigram;
-use anyhow::Result;
 use memchr::memmem;
 use rayon::prelude::*;
 use regex::RegexBuilder;
@@ -354,7 +354,8 @@ pub fn search_regex(
 ) -> Result<Vec<SearchResult>> {
     let re = RegexBuilder::new(pattern)
         .case_insensitive(case_insensitive)
-        .build()?;
+        .build()
+        .map_err(|e| XgrepError::InvalidPattern(e.to_string()))?;
 
     let candidate_ids = resolve_regex_candidates(reader, pattern, case_insensitive);
 
@@ -373,7 +374,8 @@ pub fn search_files_regex(
 ) -> Result<Vec<SearchResult>> {
     let re = RegexBuilder::new(pattern)
         .case_insensitive(case_insensitive)
-        .build()?;
+        .build()
+        .map_err(|e| XgrepError::InvalidPattern(e.to_string()))?;
 
     let matcher = RegexMatcher { re };
     let results = scan_direct(root, files, &matcher);

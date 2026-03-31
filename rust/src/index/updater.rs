@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use crate::error::Result;
 use ignore::WalkBuilder;
 
 /// Index freshness check result.

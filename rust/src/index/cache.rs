@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use crate::error::Result;
 
 /// Magic bytes identifying the xgrep cache format.
 const CACHE_MAGIC: &[u8; 4] = b"XGCH";

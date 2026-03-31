@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use crate::error::{Result, XgrepError};
 #[cfg(unix)]
 use libc;
 use memmap2::Mmap;
@@ -72,52 +72,59 @@ impl IndexReader {
         }
 
         if mmap.len() < Header::SIZE {
-            bail!("Index file too small");
+            return Err(XgrepError::IndexError("index file too small".to_string()));
         }
 
         let header = read_header(&mmap[..Header::SIZE]);
         if &header.magic != b"XGRP" {
-            bail!("Invalid index magic");
+            return Err(XgrepError::IndexError("invalid index magic".to_string()));
         }
         if header.version != VERSION {
-            bail!("Unsupported index version: {}", header.version);
+            return Err(XgrepError::IndexError(format!(
+                "unsupported index version: {}",
+                header.version
+            )));
         }
 
         let trigram_table_size = (header.trigram_count as usize)
             .checked_mul(TrigramEntry::SIZE)
-            .ok_or_else(|| anyhow::anyhow!("Index header overflow: trigram_count too large"))?;
+            .ok_or_else(|| {
+                XgrepError::IndexError("header overflow: trigram_count too large".to_string())
+            })?;
         let posting_lists_start = Header::SIZE
             .checked_add(trigram_table_size)
-            .ok_or_else(|| anyhow::anyhow!("Index header overflow"))?;
+            .ok_or_else(|| XgrepError::IndexError("header overflow".to_string()))?;
 
         // Verify trigram table end is within mmap bounds
         if posting_lists_start > mmap.len() {
-            bail!(
-                "Index file is truncated or corrupt (trigram table exceeds file size: need {} bytes, got {})",
+            return Err(XgrepError::IndexError(format!(
+                "index file is truncated or corrupt (trigram table exceeds file size: need {} bytes, got {})",
                 posting_lists_start, mmap.len()
-            );
+            )));
         }
 
         let posting_lists_total_bytes = header.posting_total_bytes as usize;
         let file_table_start = posting_lists_start
             .checked_add(posting_lists_total_bytes)
             .ok_or_else(|| {
-                anyhow::anyhow!("Index header overflow: posting_total_bytes too large")
+                XgrepError::IndexError("header overflow: posting_total_bytes too large".to_string())
             })?;
         let file_table_size = (header.file_count as usize)
             .checked_mul(FileEntry::SIZE)
-            .ok_or_else(|| anyhow::anyhow!("Index header overflow: file_count too large"))?;
+            .ok_or_else(|| {
+                XgrepError::IndexError("header overflow: file_count too large".to_string())
+            })?;
         let string_pool_start = file_table_start
             .checked_add(file_table_size)
-            .ok_or_else(|| anyhow::anyhow!("Index header overflow"))?;
+            .ok_or_else(|| XgrepError::IndexError("header overflow".to_string()))?;
 
         // Verify all offsets are within mmap bounds
         if string_pool_start > mmap.len() {
-            bail!(
-                "Index file is truncated or corrupt (expected at least {} bytes, got {})",
+            return Err(XgrepError::IndexError(format!(
+                "index file is truncated or corrupt (expected at least {} bytes, got {})",
                 string_pool_start,
                 mmap.len()
-            );
+            )));
         }
 
         Ok(Self {
