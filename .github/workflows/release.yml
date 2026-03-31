@@ -100,7 +100,7 @@ jobs:
         working-directory: rust
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
+        run: cargo publish --locked
 
   build-npm:
     name: Build npm (${{ matrix.target }})
