@@ -75,6 +75,17 @@ pub struct SearchOptions {
     pub fresh: bool,
 }
 
+/// Configuration for the search engine.
+///
+/// Controls runtime behavior such as suppressing stderr output.
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    /// Suppress diagnostic messages (warnings, progress) on stderr.
+    /// Set to `true` when running as an MCP server or in any context
+    /// where stderr output is undesirable.
+    pub quiet: bool,
+}
+
 /// Main entry point for the search engine.
 ///
 /// Use `open()` to specify a directory, then `search()` to execute queries.
@@ -82,6 +93,7 @@ pub struct SearchOptions {
 pub struct Xgrep {
     root: PathBuf,
     index_path: PathBuf,
+    config: Config,
 }
 
 impl Xgrep {
@@ -89,14 +101,34 @@ impl Xgrep {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = resolve_index_path(&root)?;
-        Ok(Self { root, index_path })
+        Ok(Self {
+            root,
+            index_path,
+            config: Config::default(),
+        })
     }
 
     /// Open with a local index (.xgrep/) explicitly.
     pub fn open_local(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = root.join(".xgrep").join("index");
-        Ok(Self { root, index_path })
+        Ok(Self {
+            root,
+            index_path,
+            config: Config::default(),
+        })
+    }
+
+    /// Set the configuration using builder pattern.
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = config;
+        mcp::set_quiet(self.config.quiet);
+        self
+    }
+
+    /// Returns the current configuration.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Returns the root directory path.
@@ -137,7 +169,7 @@ impl Xgrep {
                         .and_then(|e| e.to_str())
                         .is_some_and(|e| exts.contains(&e))
                 });
-            } else if !crate::mcp::is_mcp_mode() {
+            } else if !self.config.quiet {
                 eprintln!("warning: unknown file type '{}', showing all results", ft);
             }
         }
@@ -230,11 +262,11 @@ impl Xgrep {
             }
             index::updater::IndexStatus::NeedsFullBuild => {
                 // No index, full build required
-                if !crate::mcp::is_mcp_mode() {
+                if !self.config.quiet {
                     eprintln!("[indexing...]");
                 }
                 self.build_index()?;
-                if !crate::mcp::is_mcp_mode() {
+                if !self.config.quiet {
                     eprintln!("[done]");
                 }
 
@@ -305,11 +337,11 @@ impl Xgrep {
     /// Returns a list of relative file paths from the index.
     pub fn find_files(&self, pattern: &str) -> Result<Vec<String>> {
         if !self.index_path.exists() {
-            if !crate::mcp::is_mcp_mode() {
+            if !self.config.quiet {
                 eprintln!("[indexing...]");
             }
             self.build_index()?;
-            if !crate::mcp::is_mcp_mode() {
+            if !self.config.quiet {
                 eprintln!("[done]");
             }
         }

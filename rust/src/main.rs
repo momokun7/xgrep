@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use xgrep_search::{output, SearchOptions, Xgrep};
+use xgrep_search::{output, Config, SearchOptions, Xgrep};
 
 #[derive(Parser)]
 #[command(name = "xg", about = "Ultra-fast indexed code search (xgrep)", version)]
@@ -196,7 +196,7 @@ fn run() -> Result<()> {
             let root_path = root
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| env::current_dir().expect("failed to get current directory"));
-            let xg = Xgrep::open(&root_path)?;
+            let xg = Xgrep::open(&root_path)?.with_config(Config { quiet: true });
             xgrep_search::start_mcp_server(xg);
         }
         Some(Commands::Status { path }) => {

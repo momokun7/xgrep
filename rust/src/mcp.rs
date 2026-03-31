@@ -5,11 +5,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::mcp_tools;
 use crate::Xgrep;
 
-static MCP_MODE: AtomicBool = AtomicBool::new(false);
+static QUIET_MODE: AtomicBool = AtomicBool::new(false);
 
-/// Returns true if the process is running as an MCP server.
+/// Set the quiet mode flag. When true, suppresses stderr diagnostics.
+pub fn set_quiet(quiet: bool) {
+    QUIET_MODE.store(quiet, Ordering::Relaxed);
+}
+
+/// Returns true if quiet mode is enabled (stderr diagnostics suppressed).
+pub fn is_quiet() -> bool {
+    QUIET_MODE.load(Ordering::Relaxed)
+}
+
+/// Returns true if quiet mode is enabled.
+/// Kept for backward compatibility with modules that cannot be changed (e.g., search.rs).
 pub fn is_mcp_mode() -> bool {
-    MCP_MODE.load(Ordering::Relaxed)
+    is_quiet()
 }
 
 /// JSON-RPC request/notification.
@@ -69,7 +80,7 @@ pub fn tool_result(text: &str, is_error: bool) -> Value {
 
 /// Start the MCP server (stdio transport).
 pub fn start(xg: Xgrep) {
-    MCP_MODE.store(true, Ordering::Relaxed);
+    set_quiet(true);
     run_server(|msg| handle_message(&xg, msg));
 }
 
@@ -178,14 +189,16 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_mcp_mode_flag() {
+    fn test_quiet_mode_flag() {
         // Reset to known state
-        MCP_MODE.store(false, Ordering::Relaxed);
-        assert!(!is_mcp_mode());
-        MCP_MODE.store(true, Ordering::Relaxed);
-        assert!(is_mcp_mode());
-        // Clean up for other tests
-        MCP_MODE.store(false, Ordering::Relaxed);
+        set_quiet(false);
+        assert!(!is_quiet());
+        assert!(!is_mcp_mode()); // backward compat
+        set_quiet(true);
+        assert!(is_quiet());
+        assert!(is_mcp_mode()); // backward compat
+                                // Clean up for other tests
+        set_quiet(false);
     }
 
     #[test]
