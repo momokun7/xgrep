@@ -108,7 +108,7 @@ jobs:
         run: |
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           if cargo search xgrep-search --limit 1 2>/dev/null | grep -q "\"$CARGO_VERSION\""; then
-            echo "xgrep-search $CARGO_VERSION already published, skipping"
+            echo "::warning::xgrep-search $CARGO_VERSION already published on crates.io — skipping. If the tag was moved to a new commit, bump the version (e.g. v${CARGO_VERSION%.*}.$((${CARGO_VERSION##*.} + 1))) instead of re-tagging."
           else
             cargo publish --allow-dirty
           fi
@@ -209,7 +209,7 @@ jobs:
         run: |
           RELEASE_VERSION="${{ needs.create-release.outputs.version }}"
           if npm view xgrep@"$RELEASE_VERSION" version 2>/dev/null | grep -q "$RELEASE_VERSION"; then
-            echo "xgrep@$RELEASE_VERSION already published, skipping"
+            echo "::warning::xgrep@$RELEASE_VERSION already published on npm — skipping. If the tag was moved to a new commit, bump the version instead of re-tagging."
           else
             npm publish --access public
           fi
