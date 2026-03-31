@@ -1,6 +1,6 @@
 [package]
 name = "xgrep-search"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Ultra-fast indexed code search engine with MCP server for AI coding tools."

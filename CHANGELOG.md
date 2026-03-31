@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-01
+
+### Added
+- Structured error types with `thiserror` — library consumers can now match on `XgrepError` variants (#25)
+- `InvalidArgument` error variant for CLI argument validation errors
+- `Config` struct with `quiet` field for controlling stderr output (#28)
+- `with_config()` builder method on `Xgrep` for runtime configuration
+- criterion.rs benchmark infrastructure (`cargo bench`) for search latency, index build, and candidate resolution (#26)
+- Positional trigrams design document for future index format v3 (#29)
+
+### Changed
+- **Breaking:** Public API return type changed from `anyhow::Result` to `Result<T, XgrepError>` (#25)
+- **Breaking:** `search` module functions are now `pub(crate)` — use `Xgrep::search()` instead
+- RegexMatcher: restored early return for non-matching files + zero-copy UTF-8 with `Cow` (#27)
+- CaseInsensitiveMatcher: hybrid approach — full-file SIMD rejection + per-line processing (#27)
+- Global `MCP_MODE` replaced with struct-based `Config` propagation (#28)
+- Slimmed down README (282 → 145 lines), moved details to `docs/benchmarks.md`
+
+### Removed
+- Global `AtomicBool` state (`MCP_MODE`) from `mcp.rs`
+- `anyhow` dependency from library layer (retained in CLI binary)
+
 ## [0.2.1] - 2026-03-31
 
 ### Changed
@@ -101,7 +123,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parallel file scanning with rayon
 - SIMD-accelerated pattern matching via memchr
 
-[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/momokun7/xgrep/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/momokun7/xgrep/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/momokun7/xgrep/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/momokun7/xgrep/compare/v0.1.5...v0.1.6
