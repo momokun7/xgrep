@@ -1,6 +1,6 @@
 [package]
 name = "xgrep-search"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Ultra-fast indexed code search with MCP server for AI agents. Trigram inverted index, 50x faster than ripgrep on repeated searches."
@@ -30,6 +30,7 @@ regex-syntax = "0.8"
 tempfile = "3"
 mimalloc = { version = "0.1", default-features = false }
 serde_json = "1"
+glob = "0.3"
 
 [features]
 default = []

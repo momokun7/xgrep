@@ -95,10 +95,8 @@ jobs:
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install cargo-binstall
-        run: curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-      - name: Install cargo-audit (pre-built)
-        run: cargo binstall cargo-audit --no-confirm --log-level warn
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
       - name: Cargo audit
         working-directory: rust
         run: cargo audit

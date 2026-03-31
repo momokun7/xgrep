@@ -66,6 +66,7 @@ pub fn format_llm(
     root: &Path,
     context_lines: usize,
     max_tokens: Option<usize>,
+    absolute_paths: bool,
 ) -> Result<String> {
     if results.is_empty() {
         return Ok(String::new());
@@ -87,6 +88,12 @@ pub fn format_llm(
         let content = fs::read_to_string(&full_path)?;
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
+
+        let display_path = if absolute_paths {
+            full_path.to_string_lossy().to_string()
+        } else {
+            file.to_string()
+        };
 
         let lang = Path::new(file)
             .extension()
@@ -116,9 +123,9 @@ pub fn format_llm(
             first_block = false;
 
             if start == end {
-                output.push_str(&format!("## {}:{}\n\n", file, start));
+                output.push_str(&format!("## {}:{}\n\n", display_path, start));
             } else {
-                output.push_str(&format!("## {}:{}-{}\n\n", file, start, end));
+                output.push_str(&format!("## {}:{}-{}\n\n", display_path, start, end));
             }
 
             output.push_str(&format!("```{}\n", lang));
@@ -161,6 +168,7 @@ pub fn format_default_context(
     results: &[SearchResult],
     root: &Path,
     context_lines: usize,
+    absolute_paths: bool,
 ) -> Result<String> {
     if results.is_empty() {
         return Ok(String::new());
@@ -178,6 +186,12 @@ pub fn format_default_context(
         let content = fs::read_to_string(&full_path)?;
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
+
+        let display_path = if absolute_paths {
+            full_path.to_string_lossy().to_string()
+        } else {
+            file.to_string()
+        };
 
         let mut ranges: Vec<(usize, usize, Vec<usize>)> = Vec::new();
         for &ln in line_numbers {
@@ -198,9 +212,9 @@ pub fn format_default_context(
             for i in start..=end {
                 if i <= lines.len() {
                     if match_lines.contains(&i) {
-                        block.push_str(&format!("{}:{}:{}\n", file, i, lines[i - 1]));
+                        block.push_str(&format!("{}:{}:{}\n", display_path, i, lines[i - 1]));
                     } else {
-                        block.push_str(&format!("{}-{}-{}\n", file, i, lines[i - 1]));
+                        block.push_str(&format!("{}-{}-{}\n", display_path, i, lines[i - 1]));
                     }
                 }
             }
@@ -315,7 +329,7 @@ mod tests {
             line_number: 3,
             line: "fn hello() {}".to_string(),
         }];
-        let output = format_llm(&results, root, 2, None).unwrap();
+        let output = format_llm(&results, root, 2, None, false).unwrap();
         assert!(output.contains("## test.rs:"));
         assert!(output.contains("```rust"));
         assert!(output.contains("fn hello() {}"));
@@ -340,7 +354,7 @@ mod tests {
                 line: "l5".to_string(),
             },
         ];
-        let output = format_llm(&results, root, 1, None).unwrap();
+        let output = format_llm(&results, root, 1, None, false).unwrap();
         let block_count = output.matches("```rust").count();
         assert_eq!(block_count, 1); // merged into one block
     }
@@ -359,7 +373,7 @@ mod tests {
             line_number: 3,
             line: "match_line".to_string(),
         }];
-        let output = format_default_context(&results, root, 1).unwrap();
+        let output = format_default_context(&results, root, 1, false).unwrap();
         assert!(output.contains("test.rs-2-line2")); // context line uses -
         assert!(output.contains("test.rs:3:match_line")); // match line uses :
         assert!(output.contains("test.rs-4-line4")); // context line uses -
@@ -374,7 +388,7 @@ mod tests {
     #[test]
     fn test_format_llm_empty() {
         let dir = tempdir().unwrap();
-        let output = format_llm(&[], dir.path(), 3, None).unwrap();
+        let output = format_llm(&[], dir.path(), 3, None, false).unwrap();
         assert_eq!(output, "");
     }
 
@@ -388,7 +402,7 @@ mod tests {
             line_number: 2,
             line: "\techo hello".to_string(),
         }];
-        let output = format_llm(&results, root, 1, None).unwrap();
+        let output = format_llm(&results, root, 1, None, false).unwrap();
         // No extension = empty language
         assert!(output.contains("```\n")); // no language after ```
         assert!(output.contains("echo hello"));
@@ -404,7 +418,7 @@ mod tests {
             line_number: 3,
             line: "line3".to_string(),
         }];
-        let output = format_llm(&results, root, 0, None).unwrap();
+        let output = format_llm(&results, root, 0, None, false).unwrap();
         assert!(output.contains("line3"));
         assert!(!output.contains("line2")); // no context
         assert!(!output.contains("line4"));
@@ -413,7 +427,7 @@ mod tests {
     #[test]
     fn test_format_default_context_empty() {
         let dir = tempdir().unwrap();
-        let output = format_default_context(&[], dir.path(), 3).unwrap();
+        let output = format_default_context(&[], dir.path(), 3, false).unwrap();
         assert_eq!(output, "");
     }
 
@@ -439,7 +453,7 @@ mod tests {
         }
 
         // With very low token limit, should truncate after first file
-        let output = format_llm(&results, root, 1, Some(50)).unwrap();
+        let output = format_llm(&results, root, 1, Some(50), false).unwrap();
         assert!(output.contains("truncated"));
         assert!(output.contains("more matches"));
         assert!(output.contains("more files"));
@@ -485,7 +499,7 @@ mod tests {
             line: "line2".to_string(),
         }];
 
-        let output = format_llm(&results, root, 1, None).unwrap();
+        let output = format_llm(&results, root, 1, None, false).unwrap();
         assert!(!output.contains("truncated"));
         assert!(output.contains("line2"));
     }

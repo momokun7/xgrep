@@ -11,6 +11,7 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 | Setup | None | Server required | None (`cargo install`) |
 | First search | Instant | After server start | Auto-builds index |
 | Repeated search (Linux kernel) | 2,236ms | 170ms (server) | 38ms |
+| File discovery (next.js, 26K files) | N/A | N/A | 13ms (fd: 290ms) |
 | Index size | N/A | 155% of source | 8% of source |
 | AI agent integration | None | None | MCP server built-in |
 | Memory (search) | 11MB | 288MB | 208MB |
@@ -42,6 +43,7 @@ cp target/release/xg ~/.local/bin/
 ```bash
 xg "pattern"                  # Fixed string search
 xg "pattern" /path/to/repo    # Search a specific directory (no cd needed)
+xg "pattern" /path/to/file.rs # Search a single file directly
 xg -e "handle_\w+"            # Regex search
 xg "pattern" -i               # Case-insensitive
 xg "pattern" --type rs        # Filter by file type
@@ -50,10 +52,27 @@ xg "pattern" --format llm     # Markdown output for LLMs
 xg "pattern" --changed        # Only git changed files
 xg "pattern" --since 1h       # Recently changed files
 xg "pattern" --fresh          # Check index freshness (slower but up-to-date)
+xg "pattern" --absolute-paths # Show absolute paths in output
+xg "pattern" --exclude vendor  # Exclude paths containing "vendor"
+xg "pattern" --no-hints       # Suppress regex pattern hints
+xg --find "*.rs" /path/to/repo   # Find files by glob pattern
+xg --find config /path/to/repo   # Find files by substring
+xg --find "*.rs" --changed       # Find changed .rs files
+xg --find "*" -t toml            # Find all .toml files (--find + -t)
+xg --list-types               # Show supported file types
+xg status                     # Show index status
 xg init                       # Explicitly rebuild index
 xg init /path/to/repo         # Build index for a specific directory
 xg --version                  # Show version
 ```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `XGREP_LLM_CONTEXT` | Default context lines for `--format llm` | `3` |
+| `XGREP_ABSOLUTE_PATHS` | Set to `1` to always use absolute paths | unset |
+| `XGREP_NO_HINTS` | Set to `1` to suppress regex pattern hints | unset |
 
 ## MCP Server for AI Agents
 
@@ -127,12 +146,33 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 
 > zoekt numbers are CLI mode. In server mode, zoekt search latency is significantly lower.
 
-Reproduce these benchmarks: [`bench/run.sh`](bench/run.sh)
+### File Discovery: `--find` vs fd vs find
+
+Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) (`-N --warmup 5 --min-runs 50`). Repos are shallow-cloned to a temp directory for reproducibility.
+
+**tokio** (825 files, Rust async runtime):
+
+| Query | xg --find | fd | find | vs fd |
+|-------|-----------|-----|------|-------|
+| `*.rs` (769 files) | 2.4ms | 8.9ms | 7.9ms | **3.7x faster** |
+| `config` (substring) | 1.9ms | 8.1ms | 8.3ms | **4.3x faster** |
+
+**next.js** (26,424 files, React framework):
+
+| Query | xg --find | fd | find | vs fd |
+|-------|-----------|-----|------|-------|
+| `*.ts` (4,639 files) | 12.9ms | 289.7ms | 606.5ms | **22x faster** |
+| `config` (substring) | 6.4ms | 228.9ms | 637.0ms | **36x faster** |
+
+`xg --find` reads file paths from the in-memory index (mmap), while fd/find walk the filesystem. The gap widens with repository size.
+
+### Reproduce Benchmarks
 
 ```bash
 ./bench/run.sh small    # xgrep source (~20 files, 30s)
 ./bench/run.sh medium   # ripgrep source (~250 files, auto-downloads)
 ./bench/run.sh large    # Linux kernel (~92K files, requires manual download)
+./benchmarks/bench_find.sh  # --find vs fd vs find (auto-clones repos)
 ```
 
 ## Output Formats
@@ -200,6 +240,16 @@ xgrep prioritizes **simplicity and small index size** over search precision. Alt
 | **AST/Symbol** (Searkt, LSP) | Varies | Exact | Language-specific, complex |
 
 Trigrams are the right choice when you want a single binary that works on any codebase without language-specific setup.
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Matches found |
+| `1` | No matches found (not an error) |
+| `2` | Error (invalid pattern, missing index, I/O error, usage error) |
+
+Follows the same convention as ripgrep.
 
 ## How It Works
 

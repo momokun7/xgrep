@@ -16,6 +16,7 @@
 pub(crate) mod candidates;
 pub(crate) mod filetype;
 pub(crate) mod git;
+pub mod hints;
 pub(crate) mod index;
 pub(crate) mod mcp;
 pub(crate) mod mcp_tools;
@@ -35,7 +36,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
+pub use filetype::extensions_for_type;
+pub use filetype::list_all_types;
 pub use search::SearchResult;
+
+/// Return git changed files (unstaged + staged) relative to the given root.
+///
+/// Returns paths relative to `root`. Includes unstaged changes, staged changes,
+/// and untracked files. Returns an error if `root` is not inside a git repository.
+pub fn git_changed_files(root: &Path) -> Result<Vec<PathBuf>> {
+    if !git::is_git_repo(root) {
+        bail!("--changed requires a git repository");
+    }
+    git::changed_files(root)
+}
 
 /// Search options.
 ///
@@ -287,6 +301,48 @@ impl Xgrep {
         }
     }
 
+    /// Find files matching a glob or substring pattern.
+    /// Returns a list of relative file paths from the index.
+    pub fn find_files(&self, pattern: &str) -> Result<Vec<String>> {
+        if !self.index_path.exists() {
+            if !crate::mcp::is_mcp_mode() {
+                eprintln!("[indexing...]");
+            }
+            self.build_index()?;
+            if !crate::mcp::is_mcp_mode() {
+                eprintln!("[done]");
+            }
+        }
+
+        let reader = index::reader::IndexReader::open(&self.index_path)?;
+        let file_count = reader.file_count();
+        let mut matched = Vec::new();
+
+        let is_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
+
+        if is_glob {
+            let glob = glob::Pattern::new(pattern)
+                .map_err(|e| anyhow::anyhow!("invalid glob pattern: {}", e))?;
+            for fid in 0..file_count {
+                let path = reader.file_path(fid);
+                if glob.matches(path) {
+                    matched.push(path.to_string());
+                }
+            }
+        } else {
+            let pattern_lower = pattern.to_lowercase();
+            for fid in 0..file_count {
+                let path = reader.file_path(fid);
+                if path.to_lowercase().contains(&pattern_lower) {
+                    matched.push(path.to_string());
+                }
+            }
+        }
+
+        matched.sort();
+        Ok(matched)
+    }
+
     /// Return index status information.
     pub fn index_status(&self) -> Result<String> {
         let status = index::updater::check_index_status(&self.root, &self.index_path)?;
@@ -503,5 +559,85 @@ mod tests {
                 r.file
             );
         }
+    }
+
+    #[test]
+    fn test_find_files_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn hello() {}").unwrap();
+        std::fs::write(root.join("src/util.py"), "def hello(): pass").unwrap();
+        std::fs::write(root.join("README.md"), "# readme").unwrap();
+
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+
+        let rs_files = xg.find_files("*.rs").unwrap();
+        assert_eq!(rs_files.len(), 2);
+        assert!(rs_files.iter().all(|f| f.ends_with(".rs")));
+
+        let py_files = xg.find_files("*.py").unwrap();
+        assert_eq!(py_files.len(), 1);
+        assert!(
+            py_files[0] == "src/util.py" || py_files[0] == "src\\util.py",
+            "expected src/util.py or src\\util.py, got: {}",
+            py_files[0]
+        );
+
+        let md_files = xg.find_files("*.md").unwrap();
+        assert_eq!(md_files.len(), 1);
+    }
+
+    #[test]
+    fn test_find_files_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/config.rs"), "// config").unwrap();
+        std::fs::write(root.join("src/app_config.toml"), "key = 1").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+
+        let config_files = xg.find_files("config").unwrap();
+        assert_eq!(config_files.len(), 2);
+        assert!(config_files.iter().all(|f| f.contains("config")));
+    }
+
+    #[test]
+    fn test_find_files_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("hello.rs"), "fn hello() {}").unwrap();
+
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+
+        let results = xg.find_files("*.py").unwrap();
+        assert!(results.is_empty());
+
+        let results = xg.find_files("nonexistent").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_find_files_case_insensitive_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("Makefile"), "all:").unwrap();
+        std::fs::write(root.join("makefile.bak"), "old").unwrap();
+
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+
+        let results = xg.find_files("makefile").unwrap();
+        assert_eq!(results.len(), 2);
     }
 }
