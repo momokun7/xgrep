@@ -62,9 +62,22 @@ xg "pattern" -t rs            # Filter by file type
 xg "pattern" -C 3             # Context lines
 xg "pattern" --format llm     # Markdown output for LLMs
 xg "pattern" --changed        # Only git changed files
+xg "pattern" --exclude vendor  # Exclude paths containing "vendor"
+xg "pattern" --absolute-paths # Show absolute paths
+xg "pattern" --no-hints       # Suppress regex pattern hints
 xg --find "*.rs"              # Find files by glob pattern
+xg --list-types               # Show supported file types
+xg status                     # Show index status
 xg init                       # Explicitly rebuild index
 ```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `XGREP_LLM_CONTEXT` | Default context lines for `--format llm` | `3` |
+| `XGREP_ABSOLUTE_PATHS` | Set to `1` to always use absolute paths | unset |
+| `XGREP_NO_HINTS` | Set to `1` to suppress regex pattern hints | unset |
 
 Run `xg --help` for all options.
 
