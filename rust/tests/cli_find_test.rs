@@ -336,8 +336,16 @@ fn test_search_with_exclude() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("src/main.rs"));
-    assert!(!stdout.contains("tests/"));
+    assert!(
+        stdout.contains("src/main.rs") || stdout.contains("src\\main.rs"),
+        "expected src/main.rs in output, got: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("tests/") && !stdout.contains("tests\\"),
+        "expected tests/ to be excluded, got: {}",
+        stdout
+    );
 }
 
 #[test]
