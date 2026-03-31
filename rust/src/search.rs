@@ -133,40 +133,34 @@ impl Matcher for CaseInsensitiveMatcher {
             }
         }
 
-        // Now do the full lowercase + memmem search
-        let mut lowered = content.to_vec();
-        lowered.make_ascii_lowercase();
-
+        // Per-line lowercasing: avoid copying the entire file content.
+        // Only lowercase one line at a time and search within it.
         let finder = memmem::Finder::new(pattern_bytes);
-        if finder.find(&lowered).is_none() {
-            return vec![];
-        }
-
-        let line_offsets = build_line_offsets(content);
         let mut results = Vec::new();
-        let mut pos = 0;
+        let mut line_num = 0usize;
+        let mut start = 0usize;
 
-        while let Some(match_pos) = finder.find(&lowered[pos..]) {
-            let abs_pos = pos + match_pos;
-            let line_num = line_number_at(&line_offsets, abs_pos);
-            let ls = line_start(&line_offsets, line_num);
-            let line_end = content[abs_pos..]
+        while start < content.len() {
+            line_num += 1;
+            let line_end = content[start..]
                 .iter()
                 .position(|&b| b == b'\n')
-                .map_or(content.len(), |p| abs_pos + p);
-            let line = std::str::from_utf8(&content[ls..line_end]).unwrap_or("<binary>");
+                .map_or(content.len(), |p| start + p);
 
-            results.push(SearchResult {
-                file: rel_path.to_string(),
-                line_number: line_num,
-                line: line.to_string(),
-            });
+            let line_bytes = &content[start..line_end];
+            let mut lowered_line = line_bytes.to_vec();
+            lowered_line.make_ascii_lowercase();
 
-            // Skip to next line to avoid duplicate matches on the same line
-            pos = line_end + 1;
-            if pos >= content.len() {
-                break;
+            if finder.find(&lowered_line).is_some() {
+                let line = std::str::from_utf8(line_bytes).unwrap_or("<binary>");
+                results.push(SearchResult {
+                    file: rel_path.to_string(),
+                    line_number: line_num,
+                    line: line.to_string(),
+                });
             }
+
+            start = line_end + 1;
         }
         results
     }
@@ -179,12 +173,11 @@ struct RegexMatcher {
 
 impl Matcher for RegexMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        let content_str = String::from_utf8_lossy(content);
-
-        // Early return if no match
-        if !self.re.is_match(&content_str) {
-            return vec![];
-        }
+        // Try zero-copy UTF-8 first; only allocate on invalid UTF-8
+        let content_str: std::borrow::Cow<'_, str> = match std::str::from_utf8(content) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(_) => String::from_utf8_lossy(content),
+        };
 
         let mut results = Vec::new();
         for (i, line) in content_str.lines().enumerate() {
