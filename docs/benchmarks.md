@@ -8,25 +8,25 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 
 | Query | xg | ripgrep | vs ripgrep |
 |-------|-----|---------|------------|
-| `struct file_operations` | 38ms | 2,236ms | **59x faster** |
-| `printk` | 54ms | 1,795ms | **33x faster** |
-| `EXPORT_SYMBOL` | 70ms | 1,900ms | **27x faster** |
+| `struct file_operations` | 37ms | 1,687ms | **46x faster** |
+| `printk` | 52ms | 1,756ms | **34x faster** |
+| `EXPORT_SYMBOL` | 66ms | 1,773ms | **27x faster** |
 
 ### Medium: ripgrep source (248 files, 4.3MB)
 
 | Query | xg | ripgrep | vs ripgrep |
 |-------|-----|---------|------------|
-| `fn main` | 2.5ms | 7.9ms | **3.1x faster** |
-| `Options` | 2.3ms | 7.7ms | **3.3x faster** |
-| `pub struct` | 2.6ms | 7.8ms | **3.1x faster** |
+| `fn main` | 1.9ms | 7.3ms | **3.9x faster** |
+| `Options` | 2.7ms | 7.2ms | **2.7x faster** |
+| `pub struct` | 2.6ms | 7.5ms | **2.8x faster** |
 
-### Small: xgrep source (17 files)
+### Small: xgrep source (19 files)
 
 | Query | xg | ripgrep | vs ripgrep |
 |-------|-----|---------|------------|
-| `fn main` | 2.1ms | 5.2ms | **2.5x faster** |
-| `SearchResult` | 1.6ms | 4.7ms | **2.9x faster** |
-| `Matcher` | 2.2ms | 5.0ms | **2.3x faster** |
+| `fn main` | 2.6ms | 5.0ms | **1.9x faster** |
+| `SearchResult` | 2.5ms | 4.8ms | **1.9x faster** |
+| `Matcher` | 2.6ms | 5.2ms | **2.0x faster** |
 
 ## File discovery benchmarks
 
@@ -34,15 +34,15 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 
 | Query | xg --find | fd | find | vs fd |
 |-------|-----------|-----|------|-------|
-| `*.rs` (769 files) | 2.4ms | 8.9ms | 7.9ms | **3.7x faster** |
-| `config` (substring) | 1.9ms | 8.1ms | 8.3ms | **4.3x faster** |
+| `*.rs` (769 files) | 1.9ms | 7.7ms | 6.5ms | **4.1x faster** |
+| `config` (substring) | 1.6ms | 7.2ms | 6.5ms | **4.5x faster** |
 
-### next.js (26,424 files, React framework)
+### next.js (26,464 files, React framework)
 
 | Query | xg --find | fd | find | vs fd |
 |-------|-----------|-----|------|-------|
-| `*.ts` (4,639 files) | 12.9ms | 289.7ms | 606.5ms | **22x faster** |
-| `config` (substring) | 6.4ms | 228.9ms | 637.0ms | **36x faster** |
+| `*.ts` (4,643 files) | 8.9ms | 190.9ms | 558.7ms | **21x faster** |
+| `config` (substring) | 5.5ms | 189.0ms | 559.4ms | **34x faster** |
 
 `xg --find` reads file paths from the in-memory index (mmap), while fd/find walk the filesystem. The gap widens with repository size.
 

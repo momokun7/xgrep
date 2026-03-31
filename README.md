@@ -10,8 +10,8 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 
 ## Features
 
-- **Indexed search** — trigram inverted index makes repeated searches 2-59x faster than ripgrep
-- **File discovery** — `--find` mode locates files 4-36x faster than fd/find
+- **Indexed search** — trigram inverted index makes repeated searches 2-46x faster than ripgrep
+- **File discovery** — `--find` mode locates files 4-34x faster than fd/find
 - **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io/) server for AI coding tools (Claude Code, Cursor, etc.)
 - **LLM-optimized output** — `--format llm` produces Markdown with language tags, context lines, and token-aware truncation
 - **Git-aware** — search only changed files (`--changed`), recent commits (`--since 1h`), respects `.gitignore`
@@ -24,8 +24,8 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 |---|---------|-------|-------|
 | Setup | None | Server required | None (`cargo install`) |
 | First search | Instant | After server start | Auto-builds index |
-| Repeated search (Linux kernel) | 2,236ms | 170ms (server) | 38ms |
-| File discovery (next.js, 26K files) | N/A | N/A | 13ms (fd: 290ms) |
+| Repeated search (Linux kernel) | 1,687ms | 170ms (server) | 37ms |
+| File discovery (next.js, 26K files) | N/A | N/A | 9ms (fd: 191ms) |
 | Index size | N/A | 155% of source | 8% of source |
 | AI agent integration | None | None | MCP server built-in |
 | Memory (search) | 11MB | 288MB | 208MB |
@@ -100,16 +100,16 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 
 | Query | xg | ripgrep | vs ripgrep |
 |-------|-----|---------|------------|
-| `struct file_operations` | 38ms | 2,236ms | **59x faster** |
-| `printk` | 54ms | 1,795ms | **33x faster** |
-| `EXPORT_SYMBOL` | 70ms | 1,900ms | **27x faster** |
+| `struct file_operations` | 37ms | 1,687ms | **46x faster** |
+| `printk` | 52ms | 1,756ms | **34x faster** |
+| `EXPORT_SYMBOL` | 66ms | 1,773ms | **27x faster** |
 
 ### File discovery: next.js (26,424 files)
 
 | Query | xg --find | fd | vs fd |
 |-------|-----------|-----|-------|
-| `*.ts` (4,639 files) | 12.9ms | 289.7ms | **22x faster** |
-| `config` (substring) | 6.4ms | 228.9ms | **36x faster** |
+| `*.ts` (4,643 files) | 8.9ms | 190.9ms | **21x faster** |
+| `config` (substring) | 5.5ms | 189.0ms | **34x faster** |
 
 ### Index cost
 
