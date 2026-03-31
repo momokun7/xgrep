@@ -145,7 +145,7 @@ fn parse_duration(duration: &str) -> Result<Option<String>> {
     if duration.ends_with(".commits") {
         let n = duration.strip_suffix(".commits").unwrap();
         if n.parse::<u32>().is_err() {
-            return Err(XgrepError::InvalidPattern(format!(
+            return Err(XgrepError::InvalidArgument(format!(
                 "invalid commit count: {}",
                 n
             )));
@@ -162,7 +162,7 @@ fn parse_duration(duration: &str) -> Result<Option<String>> {
     } else if let Some(stripped) = duration.strip_suffix('w') {
         (stripped, "week")
     } else {
-        return Err(XgrepError::InvalidPattern(format!(
+        return Err(XgrepError::InvalidArgument(format!(
             "invalid duration format: {}. Use Nh, Nm, Nd, Nw, or N.commits",
             duration
         )));
@@ -170,7 +170,7 @@ fn parse_duration(duration: &str) -> Result<Option<String>> {
 
     let n: u32 = num_str
         .parse()
-        .map_err(|_| XgrepError::InvalidPattern(format!("invalid number: {}", num_str)))?;
+        .map_err(|_| XgrepError::InvalidArgument(format!("invalid number: {}", num_str)))?;
     let plural = if n == 1 { "" } else { "s" };
     Ok(Some(format!("{} {}{} ago", n, unit, plural)))
 }

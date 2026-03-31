@@ -63,7 +63,8 @@ impl IndexReader {
                     libc::MADV_WILLNEED,
                 )
             };
-            if ret != 0 && !crate::mcp::is_quiet() {
+            #[cfg(debug_assertions)]
+            if ret != 0 {
                 eprintln!(
                     "xgrep: madvise warning: {}",
                     std::io::Error::last_os_error()
@@ -136,7 +137,8 @@ impl IndexReader {
         })
     }
 
-    pub fn header(&self) -> Header {
+    #[cfg(test)]
+    pub(crate) fn header(&self) -> Header {
         self.cached_header
     }
 

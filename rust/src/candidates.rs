@@ -77,10 +77,11 @@ pub(crate) fn resolve_regex_candidates(
     reader: &IndexReader,
     pattern: &str,
     case_insensitive: bool,
+    quiet: bool,
 ) -> Vec<u32> {
     if case_insensitive {
         let query = trigram_query::regex_to_query(pattern);
-        if query.is_all() {
+        if query.is_all() && !quiet {
             eprintln!(
                 "xgrep: warning: regex '{}' cannot be optimized with trigram index (full scan)",
                 pattern
@@ -90,7 +91,7 @@ pub(crate) fn resolve_regex_candidates(
         query.evaluate(reader)
     } else {
         let query = trigram_query::regex_to_query(pattern);
-        if query.is_all() {
+        if query.is_all() && !quiet {
             eprintln!(
                 "xgrep: warning: regex '{}' cannot be optimized with trigram index (full scan)",
                 pattern

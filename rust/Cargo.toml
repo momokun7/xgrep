@@ -10,6 +10,7 @@ repository = "https://github.com/momokun7/xgrep"
 keywords = ["search", "grep", "trigram", "index", "code-search"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["fuzz/"]
+autobenches = false
 
 [[bin]]
 name = "xg"

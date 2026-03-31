@@ -122,7 +122,6 @@ impl Xgrep {
     /// Set the configuration using builder pattern.
     pub fn with_config(mut self, config: Config) -> Self {
         self.config = config;
-        mcp::set_quiet(self.config.quiet);
         self
     }
 
@@ -196,9 +195,21 @@ impl Xgrep {
             if self.index_path.exists() {
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
                 let results = if opts.regex {
-                    search::search_regex(&reader, &self.root, pattern, opts.case_insensitive)
+                    search::search_regex(
+                        &reader,
+                        &self.root,
+                        pattern,
+                        opts.case_insensitive,
+                        self.config.quiet,
+                    )
                 } else {
-                    search::search(&reader, &self.root, pattern, opts.case_insensitive)
+                    search::search(
+                        &reader,
+                        &self.root,
+                        pattern,
+                        opts.case_insensitive,
+                        self.config.quiet,
+                    )
                 };
                 // Background rebuild: spawn a detached process to update the index
                 // The current search uses the existing index; next search will use the updated one
@@ -214,9 +225,21 @@ impl Xgrep {
             index::updater::IndexStatus::Fresh => {
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
                 if opts.regex {
-                    search::search_regex(&reader, &self.root, pattern, opts.case_insensitive)
+                    search::search_regex(
+                        &reader,
+                        &self.root,
+                        pattern,
+                        opts.case_insensitive,
+                        self.config.quiet,
+                    )
                 } else {
-                    search::search(&reader, &self.root, pattern, opts.case_insensitive)
+                    search::search(
+                        &reader,
+                        &self.root,
+                        pattern,
+                        opts.case_insensitive,
+                        self.config.quiet,
+                    )
                 }
             }
             index::updater::IndexStatus::Stale { changed_files } => {
@@ -224,9 +247,21 @@ impl Xgrep {
 
                 // Search from index (results for changed files may be stale)
                 let mut index_results = if opts.regex {
-                    search::search_regex(&reader, &self.root, pattern, opts.case_insensitive)?
+                    search::search_regex(
+                        &reader,
+                        &self.root,
+                        pattern,
+                        opts.case_insensitive,
+                        self.config.quiet,
+                    )?
                 } else {
-                    search::search(&reader, &self.root, pattern, opts.case_insensitive)?
+                    search::search(
+                        &reader,
+                        &self.root,
+                        pattern,
+                        opts.case_insensitive,
+                        self.config.quiet,
+                    )?
                 };
 
                 // Exclude results from changed files (may be stale data)
@@ -243,6 +278,7 @@ impl Xgrep {
                         &changed_files,
                         pattern,
                         opts.case_insensitive,
+                        self.config.quiet,
                     )?
                 } else {
                     search::search_files(
@@ -250,6 +286,7 @@ impl Xgrep {
                         &changed_files,
                         pattern,
                         opts.case_insensitive,
+                        self.config.quiet,
                     )?
                 };
 
@@ -272,9 +309,21 @@ impl Xgrep {
 
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
                 if opts.regex {
-                    search::search_regex(&reader, &self.root, pattern, opts.case_insensitive)
+                    search::search_regex(
+                        &reader,
+                        &self.root,
+                        pattern,
+                        opts.case_insensitive,
+                        self.config.quiet,
+                    )
                 } else {
-                    search::search(&reader, &self.root, pattern, opts.case_insensitive)
+                    search::search(
+                        &reader,
+                        &self.root,
+                        pattern,
+                        opts.case_insensitive,
+                        self.config.quiet,
+                    )
                 }
             }
         }
@@ -310,6 +359,40 @@ impl Xgrep {
             .spawn();
     }
 
+    /// Search specific files directly without using the index.
+    ///
+    /// Useful when the caller already knows which files to search (e.g., a single file path).
+    pub fn search_files(
+        &self,
+        files: &[PathBuf],
+        pattern: &str,
+        opts: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        let mut results = if opts.regex {
+            search::search_files_regex(
+                &self.root,
+                files,
+                pattern,
+                opts.case_insensitive,
+                self.config.quiet,
+            )?
+        } else {
+            search::search_files(
+                &self.root,
+                files,
+                pattern,
+                opts.case_insensitive,
+                self.config.quiet,
+            )?
+        };
+
+        if let Some(max) = opts.max_count {
+            results.truncate(max);
+        }
+
+        Ok(results)
+    }
+
     /// Search only git-changed files. Returns error if not a git repository.
     fn search_changed(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
         if !git::is_git_repo(&self.root) {
@@ -327,9 +410,21 @@ impl Xgrep {
         files.dedup();
 
         if opts.regex {
-            search::search_files_regex(&self.root, &files, pattern, opts.case_insensitive)
+            search::search_files_regex(
+                &self.root,
+                &files,
+                pattern,
+                opts.case_insensitive,
+                self.config.quiet,
+            )
         } else {
-            search::search_files(&self.root, &files, pattern, opts.case_insensitive)
+            search::search_files(
+                &self.root,
+                &files,
+                pattern,
+                opts.case_insensitive,
+                self.config.quiet,
+            )
         }
     }
 
@@ -741,5 +836,24 @@ mod tests {
         };
         let err = xg.search("[invalid", &opts).unwrap_err();
         assert!(matches!(err, XgrepError::InvalidPattern(_)));
+    }
+
+    #[test]
+    fn test_invalid_duration_returns_invalid_argument() {
+        // git.rs の parse_duration が InvalidArgument を返すことを確認
+        // since_files() 経由でテストする
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let err = git::since_files(root, "badformat").unwrap_err();
+        assert!(
+            matches!(err, XgrepError::InvalidArgument(_)),
+            "expected InvalidArgument, got {:?}",
+            err
+        );
     }
 }

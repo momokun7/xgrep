@@ -9,15 +9,19 @@ pub enum XgrepError {
     NotGitRepo,
 
     /// Invalid search pattern (regex syntax error, invalid glob, etc.)
-    #[error("invalid pattern: {0}")]
+    #[error("{0}")]
     InvalidPattern(String),
 
+    /// Invalid CLI argument (duration format, commit count, etc.)
+    #[error("{0}")]
+    InvalidArgument(String),
+
     /// Index-related error (corrupt, version mismatch, truncated, build failure).
-    #[error("index error: {0}")]
+    #[error("{0}")]
     IndexError(String),
 
     /// Failed to acquire or create a lock file.
-    #[error("lock error: {0}")]
+    #[error("{0}")]
     LockError(String),
 
     /// Underlying I/O error.

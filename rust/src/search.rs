@@ -5,6 +5,7 @@ use crate::trigram;
 use memchr::memmem;
 use rayon::prelude::*;
 use regex::RegexBuilder;
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -118,41 +119,32 @@ struct CaseInsensitiveMatcher {
 impl Matcher for CaseInsensitiveMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
         let pattern_bytes = self.pattern_lower.as_bytes();
+        let finder = memmem::Finder::new(pattern_bytes);
 
-        // Early rejection: check if first byte of pattern exists (either case)
-        if !pattern_bytes.is_empty() {
-            let first = pattern_bytes[0];
-            let first_upper = first.to_ascii_uppercase();
-            if first == first_upper {
-                // Non-alphabetic first byte
-                if memchr::memchr(first, content).is_none() {
-                    return vec![];
-                }
-            } else if memchr::memchr2(first, first_upper, content).is_none() {
-                return vec![];
-            }
+        // Hybrid approach: lowercase the entire file once for fast SIMD rejection,
+        // then per-line processing only for files that actually match.
+        let mut lowered = content.to_vec();
+        lowered.make_ascii_lowercase();
+        if finder.find(&lowered).is_none() {
+            return vec![];
         }
 
-        // Per-line lowercasing: avoid copying the entire file content.
-        // Only lowercase one line at a time and search within it.
-        let finder = memmem::Finder::new(pattern_bytes);
+        // Match found — scan lowered content line by line to identify matching lines,
+        // but return the original (non-lowered) line text.
         let mut results = Vec::new();
         let mut line_num = 0usize;
         let mut start = 0usize;
 
-        while start < content.len() {
+        while start < lowered.len() {
             line_num += 1;
-            let line_end = content[start..]
+            let line_end = lowered[start..]
                 .iter()
                 .position(|&b| b == b'\n')
-                .map_or(content.len(), |p| start + p);
+                .map_or(lowered.len(), |p| start + p);
 
-            let line_bytes = &content[start..line_end];
-            let mut lowered_line = line_bytes.to_vec();
-            lowered_line.make_ascii_lowercase();
-
-            if finder.find(&lowered_line).is_some() {
-                let line = std::str::from_utf8(line_bytes).unwrap_or("<binary>");
+            if finder.find(&lowered[start..line_end]).is_some() {
+                let original_line = &content[start..line_end];
+                let line = std::str::from_utf8(original_line).unwrap_or("<binary>");
                 results.push(SearchResult {
                     file: rel_path.to_string(),
                     line_number: line_num,
@@ -174,10 +166,15 @@ struct RegexMatcher {
 impl Matcher for RegexMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
         // Try zero-copy UTF-8 first; only allocate on invalid UTF-8
-        let content_str: std::borrow::Cow<'_, str> = match std::str::from_utf8(content) {
-            Ok(s) => std::borrow::Cow::Borrowed(s),
+        let content_str: Cow<'_, str> = match std::str::from_utf8(content) {
+            Ok(s) => Cow::Borrowed(s),
             Err(_) => String::from_utf8_lossy(content),
         };
+
+        // Early return: reject files with no match via single DFA pass
+        if !self.re.is_match(&content_str) {
+            return vec![];
+        }
 
         let mut results = Vec::new();
         for (i, line) in content_str.lines().enumerate() {
@@ -203,6 +200,7 @@ fn scan_indexed<M: Matcher>(
     root: &Path,
     candidate_ids: &[u32],
     matcher: &M,
+    quiet: bool,
 ) -> Vec<SearchResult> {
     let mut results: Vec<SearchResult> = candidate_ids
         .par_iter()
@@ -212,7 +210,7 @@ fn scan_indexed<M: Matcher>(
             let content = match fs::read(&full_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    if !crate::mcp::is_mcp_mode() {
+                    if !quiet {
                         eprintln!("xgrep: {}: {}", full_path.display(), e);
                     }
                     return vec![];
@@ -226,7 +224,12 @@ fn scan_indexed<M: Matcher>(
 }
 
 /// Scan files directly from a file path list (skipping binary files).
-fn scan_direct<M: Matcher>(root: &Path, files: &[PathBuf], matcher: &M) -> Vec<SearchResult> {
+fn scan_direct<M: Matcher>(
+    root: &Path,
+    files: &[PathBuf],
+    matcher: &M,
+    quiet: bool,
+) -> Vec<SearchResult> {
     let mut results: Vec<SearchResult> = files
         .par_iter()
         .flat_map(|rel_path| {
@@ -234,7 +237,7 @@ fn scan_direct<M: Matcher>(root: &Path, files: &[PathBuf], matcher: &M) -> Vec<S
             let content = match fs::read(&full_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    if !crate::mcp::is_mcp_mode() {
+                    if !quiet {
                         eprintln!("xgrep: {}: {}", full_path.display(), e);
                     }
                     return vec![];
@@ -256,21 +259,22 @@ fn scan_direct<M: Matcher>(root: &Path, files: &[PathBuf], matcher: &M) -> Vec<S
 // Public API (signature preserved)
 // ---------------------------------------------------------------------------
 
-pub fn search(
+pub(crate) fn search(
     reader: &IndexReader,
     root: &Path,
     pattern: &str,
     case_insensitive: bool,
+    quiet: bool,
 ) -> Result<Vec<SearchResult>> {
     let pattern_bytes = pattern.as_bytes();
-    if pattern_bytes.len() < 3 && !pattern_bytes.is_empty() && !crate::mcp::is_mcp_mode() {
+    if pattern_bytes.len() < 3 && !pattern_bytes.is_empty() && !quiet {
         eprintln!(
             "xgrep: warning: pattern '{}' is shorter than 3 characters, index not used (full scan)",
             pattern
         );
     }
 
-    if case_insensitive && pattern.bytes().any(|b| b > 127) && !crate::mcp::is_mcp_mode() {
+    if case_insensitive && pattern.bytes().any(|b| b > 127) && !quiet {
         eprintln!(
             "xgrep: warning: case-insensitive search with non-ASCII pattern '{}' uses ASCII-only folding",
             pattern
@@ -297,25 +301,26 @@ pub fn search(
         let matcher = CaseInsensitiveMatcher {
             pattern_lower: search_pattern,
         };
-        scan_indexed(reader, root, &candidate_ids, &matcher)
+        scan_indexed(reader, root, &candidate_ids, &matcher, quiet)
     } else {
         let matcher = LiteralMatcher {
             pattern: pattern.as_bytes().to_vec(),
         };
-        scan_indexed(reader, root, &candidate_ids, &matcher)
+        scan_indexed(reader, root, &candidate_ids, &matcher, quiet)
     };
 
     Ok(results)
 }
 
 /// Search specified files directly without using the index
-pub fn search_files(
+pub(crate) fn search_files(
     root: &Path,
     files: &[PathBuf],
     pattern: &str,
     case_insensitive: bool,
+    quiet: bool,
 ) -> Result<Vec<SearchResult>> {
-    if case_insensitive && pattern.bytes().any(|b| b > 127) && !crate::mcp::is_mcp_mode() {
+    if case_insensitive && pattern.bytes().any(|b| b > 127) && !quiet {
         eprintln!(
             "xgrep: warning: case-insensitive search with non-ASCII pattern '{}' uses ASCII-only folding",
             pattern
@@ -326,12 +331,12 @@ pub fn search_files(
         let matcher = CaseInsensitiveMatcher {
             pattern_lower: pattern.to_lowercase(),
         };
-        scan_direct(root, files, &matcher)
+        scan_direct(root, files, &matcher, quiet)
     } else {
         let matcher = LiteralMatcher {
             pattern: pattern.as_bytes().to_vec(),
         };
-        scan_direct(root, files, &matcher)
+        scan_direct(root, files, &matcher, quiet)
     };
 
     Ok(results)
@@ -339,31 +344,33 @@ pub fn search_files(
 
 /// Regex search: extract literal trigrams from pattern for index lookup,
 /// then verify with full regex on candidate files
-pub fn search_regex(
+pub(crate) fn search_regex(
     reader: &IndexReader,
     root: &Path,
     pattern: &str,
     case_insensitive: bool,
+    quiet: bool,
 ) -> Result<Vec<SearchResult>> {
     let re = RegexBuilder::new(pattern)
         .case_insensitive(case_insensitive)
         .build()
         .map_err(|e| XgrepError::InvalidPattern(e.to_string()))?;
 
-    let candidate_ids = resolve_regex_candidates(reader, pattern, case_insensitive);
+    let candidate_ids = resolve_regex_candidates(reader, pattern, case_insensitive, quiet);
 
     let matcher = RegexMatcher { re };
-    let results = scan_indexed(reader, root, &candidate_ids, &matcher);
+    let results = scan_indexed(reader, root, &candidate_ids, &matcher, quiet);
 
     Ok(results)
 }
 
 /// Also add search_files_regex for --changed/--since with regex
-pub fn search_files_regex(
+pub(crate) fn search_files_regex(
     root: &Path,
     files: &[PathBuf],
     pattern: &str,
     case_insensitive: bool,
+    quiet: bool,
 ) -> Result<Vec<SearchResult>> {
     let re = RegexBuilder::new(pattern)
         .case_insensitive(case_insensitive)
@@ -371,7 +378,7 @@ pub fn search_files_regex(
         .map_err(|e| XgrepError::InvalidPattern(e.to_string()))?;
 
     let matcher = RegexMatcher { re };
-    let results = scan_direct(root, files, &matcher);
+    let results = scan_direct(root, files, &matcher, quiet);
 
     Ok(results)
 }
@@ -421,7 +428,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "handle_auth", false).unwrap();
+        let results = search(&reader, root, "handle_auth", false, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].file.contains("a.rs"));
         assert_eq!(results[0].line_number, 1);
@@ -435,7 +442,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "nonexistent_xyz", false).unwrap();
+        let results = search(&reader, root, "nonexistent_xyz", false, false).unwrap();
         assert_eq!(results.len(), 0);
     }
 
@@ -447,7 +454,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "ok", false).unwrap();
+        let results = search(&reader, root, "ok", false, false).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -461,7 +468,7 @@ mod tests {
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
 
-        let results = search(&reader, root, "fn", false).unwrap();
+        let results = search(&reader, root, "fn", false, false).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.file.contains("has_fn.rs")));
     }
@@ -475,7 +482,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "zq", false).unwrap();
+        let results = search(&reader, root, "zq", false, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].file.contains("a.txt"));
     }
@@ -488,7 +495,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "zq", false).unwrap();
+        let results = search(&reader, root, "zq", false, false).unwrap();
         assert_eq!(results.len(), 0);
     }
 
@@ -516,7 +523,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "handleauth", true).unwrap();
+        let results = search(&reader, root, "handleauth", true, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].line.contains("HandleAuth"));
     }
@@ -528,7 +535,7 @@ mod tests {
         fs::write(root.join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
         fs::write(root.join("b.rs"), "fn other() {}").unwrap();
         let files = vec![PathBuf::from("a.rs")];
-        let results = search_files(root, &files, "hello", false).unwrap();
+        let results = search_files(root, &files, "hello", false, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].file.contains("a.rs"));
     }
@@ -539,7 +546,7 @@ mod tests {
         let root = dir.path();
         fs::write(root.join("a.rs"), "fn HandleAuth() {}").unwrap();
         let files = vec![PathBuf::from("a.rs")];
-        let results = search_files(root, &files, "handleauth", true).unwrap();
+        let results = search_files(root, &files, "handleauth", true, false).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -563,7 +570,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search_regex(&reader, root, "handle_\\w+", false).unwrap();
+        let results = search_regex(&reader, root, "handle_\\w+", false, false).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -575,7 +582,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search_regex(&reader, root, "handleauth", true).unwrap();
+        let results = search_regex(&reader, root, "handleauth", true, false).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -587,7 +594,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "", false).unwrap();
+        let results = search(&reader, root, "", false, false).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -604,6 +611,7 @@ mod tests {
             root,
             "this is much longer than the file content",
             false,
+            false,
         )
         .unwrap();
         assert_eq!(results.len(), 0);
@@ -617,7 +625,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "foo", false).unwrap();
+        let results = search(&reader, root, "foo", false, false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line_number, 1);
     }
@@ -630,7 +638,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "line3", false).unwrap();
+        let results = search(&reader, root, "line3", false, false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line_number, 3);
     }
@@ -643,7 +651,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "$100.00", false).unwrap();
+        let results = search(&reader, root, "$100.00", false, false).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -655,7 +663,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let result = search_regex(&reader, root, "[invalid", false);
+        let result = search_regex(&reader, root, "[invalid", false, false);
         assert!(result.is_err());
     }
 
@@ -667,7 +675,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search_regex(&reader, root, ".*", false).unwrap();
+        let results = search_regex(&reader, root, ".*", false, false).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -681,7 +689,7 @@ mod tests {
         builder::build_index(root, &index_path).unwrap();
         fs::remove_file(root.join("a.txt")).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "hello", false).unwrap();
+        let results = search(&reader, root, "hello", false, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].file.contains("b.txt"));
     }
@@ -698,7 +706,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "テスト", false).unwrap();
+        let results = search(&reader, root, "テスト", false, false).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -710,7 +718,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "THIS IS UPPERCASE", true).unwrap();
+        let results = search(&reader, root, "THIS IS UPPERCASE", true, false).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -719,7 +727,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let files = vec![PathBuf::from("nonexistent.txt")];
-        let results = search_files(root, &files, "hello", false).unwrap();
+        let results = search_files(root, &files, "hello", false, false).unwrap();
         assert_eq!(results.len(), 0);
     }
 
@@ -728,7 +736,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let files: Vec<PathBuf> = vec![];
-        let results = search_files(root, &files, "hello", false).unwrap();
+        let results = search_files(root, &files, "hello", false, false).unwrap();
         assert_eq!(results.len(), 0);
     }
 
@@ -742,7 +750,7 @@ mod tests {
         )
         .unwrap();
         let files = vec![PathBuf::from("a.rs")];
-        let results = search_files_regex(root, &files, "handle_\\w+", false).unwrap();
+        let results = search_files_regex(root, &files, "handle_\\w+", false, false).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -757,7 +765,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "hello world", true).unwrap();
+        let results = search(&reader, root, "hello world", true, false).unwrap();
         assert_eq!(results.len(), 3);
         let mut files: Vec<&str> = results.iter().map(|r| r.file.as_str()).collect();
         files.sort();
@@ -772,7 +780,7 @@ mod tests {
         let root = dir.path();
         fs::write(root.join("a.rs"), "hello").unwrap();
         let files = vec![PathBuf::from("a.rs")];
-        let result = search_files_regex(root, &files, "[invalid", false);
+        let result = search_files_regex(root, &files, "[invalid", false, false);
         assert!(result.is_err());
     }
 
@@ -792,7 +800,7 @@ mod tests {
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
 
-        let results = search(&reader, root, "handleauth", true).unwrap();
+        let results = search(&reader, root, "handleauth", true, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].line.contains("HandleAuth"));
     }
@@ -805,7 +813,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "x", false).unwrap();
+        let results = search(&reader, root, "x", false, false).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -817,7 +825,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search_regex(&reader, root, ".*", false).unwrap();
+        let results = search_regex(&reader, root, ".*", false, false).unwrap();
         assert!(results.len() >= 1);
     }
 
@@ -835,7 +843,7 @@ mod tests {
         let reader = IndexReader::open(&index_path).unwrap();
 
         let start = std::time::Instant::now();
-        let results = search(&reader, root, "abcdefghijklmnop", true).unwrap();
+        let results = search(&reader, root, "abcdefghijklmnop", true, false).unwrap();
         let elapsed = start.elapsed();
 
         assert!(
@@ -854,7 +862,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "xyznonexistent", true).unwrap();
+        let results = search(&reader, root, "xyznonexistent", true, false).unwrap();
         assert_eq!(results.len(), 0);
     }
 
@@ -876,7 +884,7 @@ mod tests {
         fs::write(root.join("text.txt"), "hello world").unwrap();
 
         let files = vec![PathBuf::from("binary.bin"), PathBuf::from("text.txt")];
-        let results = search_files(root, &files, "hello", false).unwrap();
+        let results = search_files(root, &files, "hello", false, false).unwrap();
 
         assert_eq!(results.len(), 1);
         assert!(results[0].file.contains("text.txt"));
@@ -890,7 +898,7 @@ mod tests {
         fs::write(root.join("text.txt"), "hello world").unwrap();
 
         let files = vec![PathBuf::from("binary.bin"), PathBuf::from("text.txt")];
-        let results = search_files_regex(root, &files, "hello", false).unwrap();
+        let results = search_files_regex(root, &files, "hello", false, false).unwrap();
 
         assert_eq!(results.len(), 1);
         assert!(results[0].file.contains("text.txt"));
@@ -904,7 +912,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let results = search(&reader, root, "hello world", true).unwrap();
+        let results = search(&reader, root, "hello world", true, false).unwrap();
         assert_eq!(results.len(), 1);
     }
 

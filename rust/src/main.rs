@@ -364,21 +364,14 @@ fn run() -> Result<()> {
                 }
                 ResolvedPath::File { dir, file } => {
                     let rel_path = file.strip_prefix(&dir).unwrap_or(&file).to_path_buf();
-                    let results = if cli.regex {
-                        xgrep_search::search::search_files_regex(
-                            &dir,
-                            &[rel_path],
-                            &pattern,
-                            cli.case_insensitive,
-                        )?
-                    } else {
-                        xgrep_search::search::search_files(
-                            &dir,
-                            &[rel_path],
-                            &pattern,
-                            cli.case_insensitive,
-                        )?
+                    let xg = Xgrep::open(&dir)?;
+                    let opts = SearchOptions {
+                        case_insensitive: cli.case_insensitive,
+                        regex: cli.regex,
+                        max_count: cli.max_count,
+                        ..Default::default()
                     };
+                    let results = xg.search_files(&[rel_path], &pattern, &opts)?;
                     (dir, results)
                 }
             };
