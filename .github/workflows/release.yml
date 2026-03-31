@@ -16,12 +16,25 @@ jobs:
       contents: write
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
       - id: tag
         run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+      - id: version
+        name: Extract and verify version
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          CARGO_VERSION=$(grep '^version' rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          EXPECTED="v${CARGO_VERSION}"
+          if [ "$RELEASE_TAG" != "$EXPECTED" ]; then
+            echo "ERROR: Tag '$RELEASE_TAG' does not match Cargo.toml version '$CARGO_VERSION'"
+            exit 1
+          fi
+          echo "version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -88,6 +101,101 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
+
+  build-npm:
+    name: Build npm (${{ matrix.target }})
+    needs: [create-release]
+    if: always() && needs.create-release.result == 'success'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        working-directory: npm
+        run: npm ci
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build native module
+        working-directory: npm
+        run: npx napi build --release --platform --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || contains(matrix.os, 'macos') && matrix.target == 'aarch64-apple-darwin'
+        working-directory: npm
+        run: node __test__/index.mjs
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: npm/xgrep.*.node
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish to npm
+    needs: [create-release, build-npm]
+    if: always() && needs.create-release.result == 'success' && needs.build-npm.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: npm/artifacts
+      - name: Move binaries
+        working-directory: npm
+        run: |
+          for dir in artifacts/bindings-*/; do
+            cp "$dir"/*.node . 2>/dev/null || true
+          done
+          ls -la *.node
+      - name: Sync version from Cargo.toml
+        working-directory: npm
+        env:
+          RELEASE_VERSION: ${{ needs.create-release.outputs.version }}
+        run: npm version "$RELEASE_VERSION" --no-git-tag-version
+      - name: Install dependencies
+        working-directory: npm
+        run: npm ci
+      - name: Publish
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-release:
     name: Publish Release
