@@ -1,5 +1,21 @@
 //! # xgrep Index Binary Format (Version 2)
 //!
+//! ## Design Note: Existence-Only Trigrams
+//!
+//! The current format stores **existence-only** trigrams: each posting list records
+//! which files contain a given trigram, but not the byte offsets where it appears.
+//! This keeps the index small (~8% of source size) at the cost of higher false
+//! positive rates during candidate resolution -- every candidate file must be read
+//! and verified with a full content match.
+//!
+//! **Positional trigrams** (as used by zoekt) store per-file byte offsets alongside
+//! file IDs, enabling distance verification at the index level. This dramatically
+//! reduces false positives (estimated 90-99% reduction for medium-length queries)
+//! but increases index size to ~20-35% of source.
+//!
+//! Positional trigrams are planned for index format v3. See
+//! `docs/positional-trigrams-design.md` for the full design document.
+//!
 //! ```text
 //! ┌──────────────────────────────────────────┐
 //! │ Header (24 bytes)                        │
