@@ -38,6 +38,14 @@ struct Cli {
     #[arg(short = 'C')]
     context: Option<usize>,
 
+    /// Lines of context after each match (overrides -C)
+    #[arg(short = 'A', long = "after-context", value_name = "NUM")]
+    after_context: Option<usize>,
+
+    /// Lines of context before each match (overrides -C)
+    #[arg(short = 'B', long = "before-context", value_name = "NUM")]
+    before_context: Option<usize>,
+
     /// Search only in git changed files (unstaged + staged)
     #[arg(long)]
     changed: bool,
@@ -449,17 +457,31 @@ fn run() -> Result<()> {
             } else {
                 let output_str = match cli.format.as_str() {
                     "llm" => {
-                        let ctx = cli.context.unwrap_or_else(|| {
+                        let base = cli.context.unwrap_or_else(|| {
                             std::env::var("XGREP_LLM_CONTEXT")
                                 .ok()
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(3)
                         });
-                        output::format_llm(&results, &dir, ctx, None, use_absolute)?
+                        let before = cli.before_context.unwrap_or(base);
+                        let after = cli.after_context.unwrap_or(base);
+                        output::format_llm(&results, &dir, before, after, None, use_absolute)?
                     }
                     _ => {
-                        if let Some(ctx) = cli.context {
-                            output::format_default_context(&results, &dir, ctx, use_absolute)?
+                        let has_context = cli.context.is_some()
+                            || cli.before_context.is_some()
+                            || cli.after_context.is_some();
+                        if has_context {
+                            let base = cli.context.unwrap_or(0);
+                            let before = cli.before_context.unwrap_or(base);
+                            let after = cli.after_context.unwrap_or(base);
+                            output::format_default_context(
+                                &results,
+                                &dir,
+                                before,
+                                after,
+                                use_absolute,
+                            )?
                         } else if use_absolute {
                             let abs_results: Vec<_> = results
                                 .iter()

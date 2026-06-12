@@ -64,7 +64,8 @@ fn estimate_tokens(text: &str) -> usize {
 pub fn format_llm(
     results: &[SearchResult],
     root: &Path,
-    context_lines: usize,
+    before_context: usize,
+    after_context: usize,
     max_tokens: Option<usize>,
     absolute_paths: bool,
 ) -> Result<String> {
@@ -104,8 +105,8 @@ pub fn format_llm(
         // Calculate context ranges and merge overlapping
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for &line_num in line_numbers {
-            let start = line_num.saturating_sub(context_lines).max(1);
-            let end = (line_num + context_lines).min(total_lines);
+            let start = line_num.saturating_sub(before_context).max(1);
+            let end = (line_num + after_context).min(total_lines);
 
             if let Some(last) = ranges.last_mut() {
                 if start <= last.1 + 1 {
@@ -167,7 +168,8 @@ pub fn format_llm(
 pub fn format_default_context(
     results: &[SearchResult],
     root: &Path,
-    context_lines: usize,
+    before_context: usize,
+    after_context: usize,
     absolute_paths: bool,
 ) -> Result<String> {
     if results.is_empty() {
@@ -195,8 +197,8 @@ pub fn format_default_context(
 
         let mut ranges: Vec<(usize, usize, Vec<usize>)> = Vec::new();
         for &ln in line_numbers {
-            let start = ln.saturating_sub(context_lines).max(1);
-            let end = (ln + context_lines).min(total_lines);
+            let start = ln.saturating_sub(before_context).max(1);
+            let end = (ln + after_context).min(total_lines);
             if let Some(last) = ranges.last_mut() {
                 if start <= last.1 + 1 {
                     last.1 = last.1.max(end);
@@ -329,7 +331,7 @@ mod tests {
             line_number: 3,
             line: "fn hello() {}".to_string(),
         }];
-        let output = format_llm(&results, root, 2, None, false).unwrap();
+        let output = format_llm(&results, root, 2, 2, None, false).unwrap();
         assert!(output.contains("## test.rs:"));
         assert!(output.contains("```rust"));
         assert!(output.contains("fn hello() {}"));
@@ -354,7 +356,7 @@ mod tests {
                 line: "l5".to_string(),
             },
         ];
-        let output = format_llm(&results, root, 1, None, false).unwrap();
+        let output = format_llm(&results, root, 1, 1, None, false).unwrap();
         let block_count = output.matches("```rust").count();
         assert_eq!(block_count, 1); // merged into one block
     }
@@ -373,7 +375,7 @@ mod tests {
             line_number: 3,
             line: "match_line".to_string(),
         }];
-        let output = format_default_context(&results, root, 1, false).unwrap();
+        let output = format_default_context(&results, root, 1, 1, false).unwrap();
         assert!(output.contains("test.rs-2-line2")); // context line uses -
         assert!(output.contains("test.rs:3:match_line")); // match line uses :
         assert!(output.contains("test.rs-4-line4")); // context line uses -
@@ -388,7 +390,7 @@ mod tests {
     #[test]
     fn test_format_llm_empty() {
         let dir = tempdir().unwrap();
-        let output = format_llm(&[], dir.path(), 3, None, false).unwrap();
+        let output = format_llm(&[], dir.path(), 3, 3, None, false).unwrap();
         assert_eq!(output, "");
     }
 
@@ -402,7 +404,7 @@ mod tests {
             line_number: 2,
             line: "\techo hello".to_string(),
         }];
-        let output = format_llm(&results, root, 1, None, false).unwrap();
+        let output = format_llm(&results, root, 1, 1, None, false).unwrap();
         // No extension = empty language
         assert!(output.contains("```\n")); // no language after ```
         assert!(output.contains("echo hello"));
@@ -418,7 +420,7 @@ mod tests {
             line_number: 3,
             line: "line3".to_string(),
         }];
-        let output = format_llm(&results, root, 0, None, false).unwrap();
+        let output = format_llm(&results, root, 0, 0, None, false).unwrap();
         assert!(output.contains("line3"));
         assert!(!output.contains("line2")); // no context
         assert!(!output.contains("line4"));
@@ -427,7 +429,7 @@ mod tests {
     #[test]
     fn test_format_default_context_empty() {
         let dir = tempdir().unwrap();
-        let output = format_default_context(&[], dir.path(), 3, false).unwrap();
+        let output = format_default_context(&[], dir.path(), 3, 3, false).unwrap();
         assert_eq!(output, "");
     }
 
@@ -453,7 +455,7 @@ mod tests {
         }
 
         // With very low token limit, should truncate after first file
-        let output = format_llm(&results, root, 1, Some(50), false).unwrap();
+        let output = format_llm(&results, root, 1, 1, Some(50), false).unwrap();
         assert!(output.contains("truncated"));
         assert!(output.contains("more matches"));
         assert!(output.contains("more files"));
@@ -499,8 +501,48 @@ mod tests {
             line: "line2".to_string(),
         }];
 
-        let output = format_llm(&results, root, 1, None, false).unwrap();
+        let output = format_llm(&results, root, 1, 1, None, false).unwrap();
         assert!(!output.contains("truncated"));
         assert!(output.contains("line2"));
+    }
+
+    #[test]
+    fn test_format_default_context_asymmetric() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("test.rs"),
+            "line1\nline2\nmatch_line\nline4\nline5",
+        )
+        .unwrap();
+        let results = vec![SearchResult {
+            file: "test.rs".to_string(),
+            line_number: 3,
+            line: "match_line".to_string(),
+        }];
+        // before=0, after=2: no lines before, two lines after
+        let output = format_default_context(&results, root, 0, 2, false).unwrap();
+        assert!(!output.contains("line2"));
+        assert!(output.contains("test.rs:3:match_line"));
+        assert!(output.contains("test.rs-4-line4"));
+        assert!(output.contains("test.rs-5-line5"));
+    }
+
+    #[test]
+    fn test_format_llm_asymmetric() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("test.rs"), "l1\nl2\nl3\nl4\nl5").unwrap();
+        let results = vec![SearchResult {
+            file: "test.rs".to_string(),
+            line_number: 3,
+            line: "l3".to_string(),
+        }];
+        // before=2, after=0
+        let output = format_llm(&results, root, 2, 0, None, false).unwrap();
+        assert!(output.contains("l1"));
+        assert!(output.contains("l2"));
+        assert!(output.contains("l3"));
+        assert!(!output.contains("l4"));
     }
 }
