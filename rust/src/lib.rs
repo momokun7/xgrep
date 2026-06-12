@@ -46,6 +46,39 @@ pub use filetype::extensions_for_type;
 pub use filetype::list_all_types;
 pub use search::SearchResult;
 
+/// Returns true if the pattern contains an uppercase ASCII letter.
+///
+/// Used to implement smart-case: a pattern with no uppercase letters is
+/// searched case-insensitively unless the caller forces sensitivity.
+/// In regex mode, characters that form an escape sequence (e.g. `\W`, `\D`)
+/// are not treated as uppercase literals. `\\D` (escaped backslash followed
+/// by `D`) does count.
+///
+/// # Examples
+///
+/// ```
+/// use xgrep_search::pattern_has_uppercase;
+/// assert!(!pattern_has_uppercase("hello", false));
+/// assert!(pattern_has_uppercase("Hello", false));
+/// assert!(!pattern_has_uppercase(r"\W+foo", true));
+/// ```
+pub fn pattern_has_uppercase(pattern: &str, regex: bool) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if regex && bytes[i] == b'\\' {
+            // Skip the escape sequence (backslash + next byte)
+            i += 2;
+            continue;
+        }
+        if bytes[i].is_ascii_uppercase() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Return git changed files (unstaged + staged) relative to the given root.
 ///
 /// Returns paths relative to `root`. Includes unstaged changes, staged changes,
@@ -902,5 +935,41 @@ mod tests {
         xg.build_index().unwrap();
         let results = xg.search("zq", &SearchOptions::default()).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_pattern_has_uppercase_literal() {
+        assert!(!pattern_has_uppercase("hello", false));
+        assert!(pattern_has_uppercase("Hello", false));
+        assert!(!pattern_has_uppercase("123!", false));
+        // Literal mode: backslash is a literal character, W counts as uppercase
+        assert!(pattern_has_uppercase(r"\W", false));
+    }
+
+    #[test]
+    fn test_pattern_has_uppercase_regex_skips_escapes() {
+        // \W is a regex escape, not an uppercase literal
+        assert!(!pattern_has_uppercase(r"\W+foo", true));
+        assert!(pattern_has_uppercase(r"\W+Foo", true));
+        assert!(!pattern_has_uppercase(r"foo\d", true));
+        // Escaped backslash followed by uppercase: \\ is literal backslash, D is uppercase
+        assert!(pattern_has_uppercase(r"\\D", true));
+    }
+
+    /// Smart-case behavior verified at the library level via explicit flag:
+    /// the CLI maps (no -i, no -s, all-lowercase pattern) to case_insensitive=true.
+    #[test]
+    fn test_search_case_insensitive_finds_mixed_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn HandleAuth() {}\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let opts = SearchOptions {
+            case_insensitive: true,
+            ..Default::default()
+        };
+        let results = xg.search("handleauth", &opts).unwrap();
+        assert_eq!(results.len(), 1);
     }
 }

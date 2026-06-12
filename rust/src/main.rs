@@ -25,9 +25,14 @@ struct Cli {
     #[arg(long, default_value = "default")]
     format: String,
 
-    /// Case-insensitive search
+    /// Case-insensitive search (default: smart-case — insensitive unless
+    /// the pattern contains an uppercase letter)
     #[arg(short = 'i')]
     case_insensitive: bool,
+
+    /// Force case-sensitive search (disables smart-case)
+    #[arg(short = 's', long = "case-sensitive")]
+    case_sensitive: bool,
 
     /// Context lines (default: 3 for --format llm, none for default)
     #[arg(short = 'C')]
@@ -345,12 +350,20 @@ fn run() -> Result<()> {
                 return Ok(());
             }
 
+            let case_insensitive = if cli.case_insensitive {
+                true
+            } else if cli.case_sensitive {
+                false
+            } else {
+                !xgrep_search::pattern_has_uppercase(&pattern, cli.regex)
+            };
+
             let resolved = resolve_path(cli.path.as_deref())?;
             let (dir, results) = match resolved {
                 ResolvedPath::Dir(dir) => {
                     let xg = Xgrep::open(&dir)?;
                     let opts = SearchOptions {
-                        case_insensitive: cli.case_insensitive,
+                        case_insensitive,
                         regex: cli.regex,
                         file_type: cli.file_type,
                         max_count: cli.max_count,
@@ -366,7 +379,7 @@ fn run() -> Result<()> {
                     let rel_path = file.strip_prefix(&dir).unwrap_or(&file).to_path_buf();
                     let xg = Xgrep::open(&dir)?;
                     let opts = SearchOptions {
-                        case_insensitive: cli.case_insensitive,
+                        case_insensitive,
                         regex: cli.regex,
                         max_count: cli.max_count,
                         ..Default::default()
