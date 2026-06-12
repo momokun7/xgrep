@@ -464,6 +464,12 @@ impl Xgrep {
             )?
         };
 
+        // glob filter (-g)
+        if !opts.globs.is_empty() {
+            let filter = globfilter::GlobFilter::new(&opts.globs)?;
+            results.retain(|r| filter.matches(&r.file));
+        }
+
         if let Some(max) = opts.max_count {
             results.truncate(max);
         }
@@ -1067,5 +1073,23 @@ mod tests {
         };
         let results = xg.search("handleauth", &opts).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    /// -g must be honored on the explicit-file search path too.
+    #[test]
+    fn test_search_files_applies_glob_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.py"), "needle\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let opts = SearchOptions {
+            globs: vec!["*.rs".to_string()],
+            ..Default::default()
+        };
+        let results = xg
+            .search_files(&[std::path::PathBuf::from("a.py")], "needle", &opts)
+            .unwrap();
+        assert!(results.is_empty(), "-g '*.rs' must filter out a .py file");
     }
 }

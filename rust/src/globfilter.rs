@@ -20,6 +20,9 @@ impl GlobFilter {
                 Some(rest) => (true, rest),
                 None => (false, g.as_str()),
             };
+            if body.is_empty() {
+                return Err(XgrepError::InvalidPattern(format!("empty glob '{}'", g)));
+            }
             let mut patterns = vec![compile(body, g)?];
             if !body.contains('/') {
                 patterns.push(compile(&format!("**/{}", body), g)?);
@@ -89,5 +92,11 @@ mod tests {
     #[test]
     fn invalid_glob_is_error() {
         assert!(GlobFilter::new(&["[invalid".to_string()]).is_err());
+    }
+
+    #[test]
+    fn empty_glob_is_error() {
+        assert!(GlobFilter::new(&["".to_string()]).is_err());
+        assert!(GlobFilter::new(&["!".to_string()]).is_err());
     }
 }
