@@ -105,6 +105,8 @@ xg serve --root /path/to/repo   # Specific directory
 
 **Available tools:** `search`, `find_definitions`, `read_file`, `index_status`, `build_index`
 
+See [docs/agents.md](docs/agents.md) for agent-oriented usage patterns.
+
 ## Performance
 
 Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 32GB RAM, macOS. All numbers are warm cache, after index build.

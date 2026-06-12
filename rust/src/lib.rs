@@ -7,7 +7,12 @@
 //!
 //! let xg = Xgrep::open(".").unwrap();
 //! xg.build_index().unwrap();
-//! let results = xg.search("fn main", &SearchOptions::default()).unwrap();
+//!
+//! // Build options fluently — no exhaustive struct literal required.
+//! let opts = SearchOptions::new()
+//!     .with_file_type("rs")
+//!     .with_max_count(20);
+//! let results = xg.search("fn main", &opts).unwrap();
 //! for r in &results {
 //!     println!("{}:{}: {}", r.file, r.line_number, r.line);
 //! }
@@ -54,6 +59,10 @@ pub use search::SearchResult;
 /// In regex mode, characters that form an escape sequence (e.g. `\W`, `\D`)
 /// are not treated as uppercase literals. `\\D` (escaped backslash followed
 /// by `D`) does count.
+///
+/// Non-ASCII letters never count as uppercase, matching the engine's
+/// ASCII-only case folding. In regex mode a trailing backslash is treated as
+/// an incomplete escape and contributes no uppercase.
 ///
 /// # Examples
 ///
@@ -113,11 +122,80 @@ pub struct SearchOptions {
     /// Check index freshness and use hybrid search for changed files.
     /// When false (default), uses existing index as-is for maximum speed.
     pub fresh: bool,
-    /// Match only at word boundaries (wraps the pattern in `\b(?:...)\b`)
+    /// Match only at word boundaries (wraps the pattern in `\b(?:...)\b`).
+    /// Note: enabling this always runs the regex engine, even for literal patterns.
     pub word: bool,
     /// Include/exclude result paths by glob (ripgrep -g compatible).
     /// Prefix a glob with `!` to exclude. Empty = no filtering.
     pub globs: Vec<String>,
+}
+
+impl SearchOptions {
+    /// Create default search options (case-sensitive literal search, no filters).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xgrep_search::SearchOptions;
+    /// let opts = SearchOptions::new()
+    ///     .with_case_insensitive(true)
+    ///     .with_file_type("rs")
+    ///     .with_max_count(10);
+    /// assert!(opts.case_insensitive);
+    /// assert_eq!(opts.file_type.as_deref(), Some("rs"));
+    /// assert_eq!(opts.max_count, Some(10));
+    /// ```
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set case-insensitive search (ASCII folding only).
+    pub fn with_case_insensitive(mut self, value: bool) -> Self {
+        self.case_insensitive = value;
+        self
+    }
+
+    /// Treat the pattern as a regex instead of a literal string.
+    pub fn with_regex(mut self, value: bool) -> Self {
+        self.regex = value;
+        self
+    }
+
+    /// Filter results by file type (e.g. `"rs"`, `"py"`, `"js"`).
+    pub fn with_file_type(mut self, file_type: impl Into<String>) -> Self {
+        self.file_type = Some(file_type.into());
+        self
+    }
+
+    /// Limit the number of results returned.
+    pub fn with_max_count(mut self, max: usize) -> Self {
+        self.max_count = Some(max);
+        self
+    }
+
+    /// Match only at word boundaries (always runs the regex engine).
+    pub fn with_word(mut self, value: bool) -> Self {
+        self.word = value;
+        self
+    }
+
+    /// Add an include/exclude glob (prefix with `!` to exclude). Repeatable.
+    pub fn with_glob(mut self, glob: impl Into<String>) -> Self {
+        self.globs.push(glob.into());
+        self
+    }
+
+    /// Restrict the search to files with uncommitted git changes.
+    pub fn with_changed_only(mut self, value: bool) -> Self {
+        self.changed_only = value;
+        self
+    }
+
+    /// Check index freshness and use hybrid search for changed files.
+    pub fn with_fresh(mut self, value: bool) -> Self {
+        self.fresh = value;
+        self
+    }
 }
 
 /// Configuration for the search engine.
@@ -131,6 +209,79 @@ pub struct Config {
     pub quiet: bool,
 }
 
+/// Index freshness state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexState {
+    /// Index is up to date.
+    Fresh,
+    /// Index exists but some files changed since the last build.
+    Stale {
+        /// Number of files changed since the last index build.
+        changed_files: usize,
+    },
+    /// No index has been built yet.
+    Missing,
+}
+
+/// Structured index status, returned by [`Xgrep::index_status`].
+///
+/// The [`Display`](std::fmt::Display) impl renders the human-readable status
+/// text used by the `xg status` CLI command.
+///
+/// # Examples
+///
+/// ```no_run
+/// use xgrep_search::{Xgrep, IndexState};
+///
+/// let xg = Xgrep::open(".").unwrap();
+/// let info = xg.index_status().unwrap();
+/// match info.state {
+///     IndexState::Fresh => println!("up to date ({} files)", info.indexed_files),
+///     IndexState::Stale { changed_files } => println!("{} files changed", changed_files),
+///     IndexState::Missing => println!("no index at {}", info.index_path.display()),
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct IndexStatusInfo {
+    /// Freshness state of the index.
+    pub state: IndexState,
+    /// Number of files in the index (0 if missing).
+    pub indexed_files: usize,
+    /// Index file size in bytes (0 if missing).
+    pub index_size_bytes: u64,
+    /// Path to the index file.
+    pub index_path: PathBuf,
+}
+
+impl std::fmt::Display for IndexStatusInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let status_str = match &self.state {
+            IndexState::Fresh => "fresh".to_string(),
+            IndexState::Stale { changed_files } => {
+                format!("stale ({} changed files)", changed_files)
+            }
+            IndexState::Missing => "no index".to_string(),
+        };
+        if matches!(self.state, IndexState::Missing) {
+            write!(
+                f,
+                "Status: {}\nIndex path: {}",
+                status_str,
+                self.index_path.display()
+            )
+        } else {
+            write!(
+                f,
+                "Status: {}\nIndexed files: {}\nIndex size: {} bytes\nIndex path: {}",
+                status_str,
+                self.indexed_files,
+                self.index_size_bytes,
+                self.index_path.display()
+            )
+        }
+    }
+}
+
 /// Main entry point for the search engine.
 ///
 /// Use `open()` to specify a directory, then `search()` to execute queries.
@@ -142,7 +293,7 @@ pub struct Xgrep {
 }
 
 impl Xgrep {
-    /// Open a directory. Index path is auto-resolved (.xgrep/index or ~/.cache/xgrep/<hash>/index).
+    /// Open a directory. Index path is auto-resolved (`.xgrep/index` or `~/.cache/xgrep/<hash>/index`).
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = resolve_index_path(&root)?;
@@ -198,6 +349,8 @@ impl Xgrep {
 
     /// Apply word-boundary wrapping. Returns the effective pattern and
     /// whether it must be executed as a regex.
+    ///
+    /// Callees must use the returned bool instead of `opts.regex`.
     fn effective_pattern<'a>(
         pattern: &'a str,
         opts: &SearchOptions,
@@ -559,37 +712,41 @@ impl Xgrep {
         Ok(matched)
     }
 
-    /// Return index status information.
-    pub fn index_status(&self) -> Result<String> {
+    /// Return structured index status information.
+    ///
+    /// Use the [`IndexStatusInfo`] fields directly, or its
+    /// [`Display`](std::fmt::Display) impl for the human-readable text.
+    pub fn index_status(&self) -> Result<IndexStatusInfo> {
         let status = index::updater::check_index_status(&self.root, &self.index_path)?;
-        let status_str = match &status {
-            index::updater::IndexStatus::Fresh => "fresh".to_string(),
-            index::updater::IndexStatus::Stale { changed_files } => {
-                format!("stale ({} changed files)", changed_files.len())
-            }
-            index::updater::IndexStatus::NeedsFullBuild => "no index".to_string(),
+        let state = match &status {
+            index::updater::IndexStatus::Fresh => IndexState::Fresh,
+            index::updater::IndexStatus::Stale { changed_files } => IndexState::Stale {
+                changed_files: changed_files.len(),
+            },
+            index::updater::IndexStatus::NeedsFullBuild => IndexState::Missing,
         };
 
-        let index_info = if self.index_path.exists() {
-            let meta = std::fs::metadata(&self.index_path).ok();
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let reader = index::reader::IndexReader::open(&self.index_path).ok();
-            let file_count = reader.map(|r| r.file_count()).unwrap_or(0);
-            format!(
-                "Status: {}\nIndexed files: {}\nIndex size: {} bytes\nIndex path: {}",
-                status_str,
-                file_count,
-                size,
-                self.index_path.display()
-            )
+        if self.index_path.exists() {
+            let size = std::fs::metadata(&self.index_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let file_count = index::reader::IndexReader::open(&self.index_path)
+                .map(|r| r.file_count() as usize)
+                .unwrap_or(0);
+            Ok(IndexStatusInfo {
+                state,
+                indexed_files: file_count,
+                index_size_bytes: size,
+                index_path: self.index_path.clone(),
+            })
         } else {
-            format!(
-                "Status: {}\nIndex path: {}",
-                status_str,
-                self.index_path.display()
-            )
-        };
-        Ok(index_info)
+            Ok(IndexStatusInfo {
+                state: IndexState::Missing,
+                indexed_files: 0,
+                index_size_bytes: 0,
+                index_path: self.index_path.clone(),
+            })
+        }
     }
 }
 
@@ -988,6 +1145,41 @@ mod tests {
     }
 
     #[test]
+    fn test_search_options_builder() {
+        let opts = SearchOptions::new()
+            .with_case_insensitive(true)
+            .with_regex(true)
+            .with_file_type("rs")
+            .with_max_count(10)
+            .with_word(true)
+            .with_glob("*.rs")
+            .with_glob("!*_test.rs");
+        assert!(opts.case_insensitive);
+        assert!(opts.regex);
+        assert_eq!(opts.file_type.as_deref(), Some("rs"));
+        assert_eq!(opts.max_count, Some(10));
+        assert!(opts.word);
+        assert_eq!(opts.globs.len(), 2);
+    }
+
+    #[test]
+    fn test_index_status_structured() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let info = xg.index_status().unwrap();
+        assert_eq!(info.state, IndexState::Fresh);
+        assert_eq!(info.indexed_files, 1);
+        assert!(info.index_size_bytes > 0);
+        // Display preserves the human-readable format
+        let text = info.to_string();
+        assert!(text.contains("Status: fresh"));
+        assert!(text.contains("Indexed files: 1"));
+    }
+
+    #[test]
     fn test_pattern_has_uppercase_literal() {
         assert!(!pattern_has_uppercase("hello", false));
         assert!(pattern_has_uppercase("Hello", false));
@@ -1004,6 +1196,8 @@ mod tests {
         assert!(!pattern_has_uppercase(r"foo\d", true));
         // Escaped backslash followed by uppercase: \\ is literal backslash, D is uppercase
         assert!(pattern_has_uppercase(r"\\D", true));
+        // Trailing backslash is an incomplete escape and contributes no uppercase
+        assert!(!pattern_has_uppercase("foo\\", true));
     }
 
     /// Smart-case behavior verified at the library level via explicit flag:
