@@ -545,4 +545,29 @@ mod tests {
         assert!(output.contains("l3"));
         assert!(!output.contains("l4"));
     }
+
+    #[test]
+    fn test_format_llm_asymmetric_merge() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("test.rs"), "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8").unwrap();
+        let results = vec![
+            SearchResult {
+                file: "test.rs".to_string(),
+                line_number: 2,
+                line: "l2".to_string(),
+            },
+            SearchResult {
+                file: "test.rs".to_string(),
+                line_number: 5,
+                line: "l5".to_string(),
+            },
+        ];
+        // before=0, after=3: match at 2 covers 2-5, match at 5 covers 5-8 -> one merged block 2-8
+        let output = format_llm(&results, root, 0, 3, None, false).unwrap();
+        let block_count = output.matches("```rust").count();
+        assert_eq!(block_count, 1, "overlapping asymmetric ranges must merge");
+        assert!(output.contains("## test.rs:2-8"));
+        assert!(!output.contains("l1"));
+    }
 }
