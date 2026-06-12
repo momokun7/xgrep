@@ -58,6 +58,10 @@ struct Cli {
     #[arg(short = 'e')]
     regex: bool,
 
+    /// Only show matches surrounded by word boundaries
+    #[arg(short = 'w', long = "word-regexp")]
+    word_regexp: bool,
+
     /// Filter by file type (e.g., rs, py, js)
     #[arg(long = "type", short = 't')]
     file_type: Option<String>,
@@ -379,6 +383,7 @@ fn run() -> Result<()> {
                         since: cli.since,
                         path_pattern: None,
                         fresh: cli.fresh,
+                        word: cli.word_regexp,
                     };
                     let results = xg.search(&pattern, &opts)?;
                     (dir, results)
@@ -390,6 +395,7 @@ fn run() -> Result<()> {
                         case_insensitive,
                         regex: cli.regex,
                         max_count: cli.max_count,
+                        word: cli.word_regexp,
                         ..Default::default()
                     };
                     let results = xg.search_files(&[rel_path], &pattern, &opts)?;

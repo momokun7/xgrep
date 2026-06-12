@@ -112,6 +112,8 @@ pub struct SearchOptions {
     /// Check index freshness and use hybrid search for changed files.
     /// When false (default), uses existing index as-is for maximum speed.
     pub fresh: bool,
+    /// Match only at word boundaries (wraps the pattern in `\b(?:...)\b`)
+    pub word: bool,
 }
 
 /// Configuration for the search engine.
@@ -190,12 +192,32 @@ impl Xgrep {
         Ok(())
     }
 
+    /// Apply word-boundary wrapping. Returns the effective pattern and
+    /// whether it must be executed as a regex.
+    fn effective_pattern<'a>(
+        pattern: &'a str,
+        opts: &SearchOptions,
+    ) -> (std::borrow::Cow<'a, str>, bool) {
+        if opts.word {
+            let inner = if opts.regex {
+                pattern.to_string()
+            } else {
+                regex::escape(pattern)
+            };
+            (format!(r"\b(?:{})\b", inner).into(), true)
+        } else {
+            (pattern.into(), opts.regex)
+        }
+    }
+
     /// Execute a search. Auto-build, hybrid search, and git-changed-file search are handled internally.
     pub fn search(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
+        let (pattern, regex) = Self::effective_pattern(pattern, opts);
+        let pattern = pattern.as_ref();
         let mut results = if opts.changed_only || opts.since.is_some() {
-            self.search_changed(pattern, opts)?
+            self.search_changed(pattern, regex, opts)?
         } else {
-            self.search_indexed(pattern, opts)?
+            self.search_indexed(pattern, regex, opts)?
         };
 
         // file_type filter
@@ -228,12 +250,17 @@ impl Xgrep {
     /// Index-based search. When `opts.fresh` is true, checks index freshness
     /// and uses hybrid search for changed files. When false (default), uses
     /// existing index as-is for maximum speed.
-    fn search_indexed(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
+    fn search_indexed(
+        &self,
+        pattern: &str,
+        regex: bool,
+        opts: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
         if !opts.fresh {
             // Fast path: use index as-is without freshness check
             if self.index_path.exists() {
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
-                let results = if opts.regex {
+                let results = if regex {
                     search::search_regex(
                         &reader,
                         &self.root,
@@ -263,7 +290,7 @@ impl Xgrep {
         match status {
             index::updater::IndexStatus::Fresh => {
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
-                if opts.regex {
+                if regex {
                     search::search_regex(
                         &reader,
                         &self.root,
@@ -285,7 +312,7 @@ impl Xgrep {
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
 
                 // Search from index (results for changed files may be stale)
-                let mut index_results = if opts.regex {
+                let mut index_results = if regex {
                     search::search_regex(
                         &reader,
                         &self.root,
@@ -311,7 +338,7 @@ impl Xgrep {
                 index_results.retain(|r| !changed_set.contains(&r.file));
 
                 // Directly scan changed files
-                let direct_results = if opts.regex {
+                let direct_results = if regex {
                     search::search_files_regex(
                         &self.root,
                         &changed_files,
@@ -347,7 +374,7 @@ impl Xgrep {
                 }
 
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
-                if opts.regex {
+                if regex {
                     search::search_regex(
                         &reader,
                         &self.root,
@@ -407,7 +434,9 @@ impl Xgrep {
         pattern: &str,
         opts: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        let mut results = if opts.regex {
+        let (pattern, regex) = Self::effective_pattern(pattern, opts);
+        let pattern = pattern.as_ref();
+        let mut results = if regex {
             search::search_files_regex(
                 &self.root,
                 files,
@@ -433,7 +462,12 @@ impl Xgrep {
     }
 
     /// Search only git-changed files. Returns error if not a git repository.
-    fn search_changed(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
+    fn search_changed(
+        &self,
+        pattern: &str,
+        regex: bool,
+        opts: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
         if !git::is_git_repo(&self.root) {
             return Err(XgrepError::NotGitRepo);
         }
@@ -448,7 +482,7 @@ impl Xgrep {
         files.sort();
         files.dedup();
 
-        if opts.regex {
+        if regex {
             search::search_files_regex(
                 &self.root,
                 &files,
@@ -958,6 +992,40 @@ mod tests {
 
     /// Smart-case behavior verified at the library level via explicit flag:
     /// the CLI maps (no -i, no -s, all-lowercase pattern) to case_insensitive=true.
+    #[test]
+    fn test_word_boundary_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "cat\nconcatenate\nthe cat, sat\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let opts = SearchOptions {
+            word: true,
+            ..Default::default()
+        };
+        let results = xg.search("cat", &opts).unwrap();
+        // Matches line 1 ("cat") and line 3 ("the cat, sat"), not "concatenate"
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.line != "concatenate"));
+    }
+
+    #[test]
+    fn test_word_boundary_with_regex_metachars_in_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "foo.bar baz\nfooxbar\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let opts = SearchOptions {
+            word: true,
+            ..Default::default()
+        };
+        // "." must be escaped: literal "foo.bar" must not match "fooxbar"
+        let results = xg.search("foo.bar", &opts).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].line.contains("foo.bar"));
+    }
+
     #[test]
     fn test_search_case_insensitive_finds_mixed_case() {
         let dir = tempfile::tempdir().unwrap();
