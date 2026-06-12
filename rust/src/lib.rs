@@ -12,6 +12,12 @@
 //!     println!("{}:{}: {}", r.file, r.line_number, r.line);
 //! }
 //! ```
+//!
+//! # Limitations
+//!
+//! Files smaller than 3 bytes contain no trigrams and are invisible to
+//! content search (they still appear in `--find` results). This is an
+//! intentional index design trade-off.
 
 pub(crate) mod candidates;
 pub mod error;
@@ -855,5 +861,46 @@ mod tests {
             "expected InvalidArgument, got {:?}",
             err
         );
+    }
+
+    /// Regression: a 2-char pattern occurring at EOF (no trailing byte) must be found.
+    /// Trigram "ab?" does not exist for the final "ab" in "xxab", but "xab" does.
+    /// A second file provides a non-empty prefix candidate set so the EOF case
+    /// cannot be masked by the full-scan fallback.
+    #[test]
+    fn test_two_char_pattern_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No trailing newline: "ab" is the last 2 bytes (only "xab" trigram exists)
+        std::fs::write(root.join("tail.txt"), b"xxab").unwrap();
+        // Provides the "ab?" prefix trigram so the prefix lookup is non-empty
+        std::fs::write(root.join("other.txt"), b"abc def\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let results = xg.search("ab", &SearchOptions::default()).unwrap();
+        let files: Vec<&str> = results.iter().map(|r| r.file.as_str()).collect();
+        assert!(
+            files.iter().any(|f| f.ends_with("tail.txt")),
+            "2-char pattern at EOF must be found, got {:?}",
+            files
+        );
+        assert!(
+            files.iter().any(|f| f.ends_with("other.txt")),
+            "2-char pattern in prefix position must be found, got {:?}",
+            files
+        );
+    }
+
+    /// A 2-char pattern that exists nowhere must return no results
+    /// (and must not fall back to a full scan).
+    #[test]
+    fn test_two_char_pattern_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), b"hello world\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let results = xg.search("zq", &SearchOptions::default()).unwrap();
+        assert!(results.is_empty());
     }
 }

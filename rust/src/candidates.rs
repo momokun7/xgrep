@@ -54,13 +54,16 @@ pub(crate) fn resolve_literal_candidates(
         }
     } else if trigrams.is_empty() {
         if pattern_bytes.len() == 2 {
-            let prefix = [pattern_bytes[0], pattern_bytes[1]];
-            let candidates = reader.lookup_trigram_prefix(prefix);
-            if candidates.is_empty() {
-                (0..reader.file_count()).collect()
-            } else {
-                candidates
-            }
+            // A 2-byte pattern in any file of >= 3 bytes must produce either
+            // trigram "ab?" (prefix) or "?ab" (suffix). Files smaller than
+            // 3 bytes have no trigrams and are invisible to content search
+            // (documented index design limitation).
+            let pair = [pattern_bytes[0], pattern_bytes[1]];
+            let mut candidates = reader.lookup_trigram_prefix(pair);
+            candidates.extend(reader.lookup_trigram_suffix(pair));
+            candidates.sort_unstable();
+            candidates.dedup();
+            candidates
         } else {
             (0..reader.file_count()).collect()
         }

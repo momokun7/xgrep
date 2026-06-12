@@ -280,6 +280,45 @@ impl IndexReader {
         seen.into_iter().collect()
     }
 
+    /// Return the union of posting lists for all trigrams `t` where
+    /// `t[1] == suffix[0] && t[2] == suffix[1]`.
+    ///
+    /// Used for 2-byte patterns: an occurrence of "ab" in a file of >= 3 bytes
+    /// is guaranteed to produce either trigram "ab?" (byte after) or "?ab"
+    /// (byte before). Because the trigram table is sorted by the full 3-byte
+    /// value, suffix-matching entries are not contiguous, so a linear scan over
+    /// the dictionary is used. This is acceptable because 2-byte queries are a
+    /// rare path. The returned vector is sorted and deduplicated.
+    pub(crate) fn lookup_trigram_suffix(&self, suffix: [u8; 2]) -> Vec<u32> {
+        let count = self.cached_header.trigram_count as usize;
+        if count == 0 {
+            return vec![];
+        }
+
+        let trigram_table_start = Header::SIZE;
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..count {
+            let offset = trigram_table_start + i * TrigramEntry::SIZE;
+            if offset + TrigramEntry::SIZE > self.mmap.len() {
+                break;
+            }
+            let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
+            if entry.trigram[1] != suffix[0] || entry.trigram[2] != suffix[1] {
+                continue;
+            }
+            let pl_start = self.posting_lists_start + entry.posting_offset as usize;
+            let pl_end = pl_start + entry.posting_len as usize;
+            if pl_end > self.mmap.len() {
+                continue; // skip corrupted entry
+            }
+            let data = &self.mmap[pl_start..pl_end];
+            for fid in Self::decode_posting_list(data) {
+                seen.insert(fid);
+            }
+        }
+        seen.into_iter().collect()
+    }
+
     pub fn file_path(&self, file_id: u32) -> &str {
         if file_id >= self.cached_header.file_count {
             return "<invalid file_id>";
