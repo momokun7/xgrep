@@ -23,6 +23,7 @@ pub(crate) mod candidates;
 pub mod error;
 pub(crate) mod filetype;
 pub(crate) mod git;
+pub(crate) mod globfilter;
 pub mod hints;
 pub(crate) mod index;
 pub(crate) mod mcp;
@@ -114,6 +115,9 @@ pub struct SearchOptions {
     pub fresh: bool,
     /// Match only at word boundaries (wraps the pattern in `\b(?:...)\b`)
     pub word: bool,
+    /// Include/exclude result paths by glob (ripgrep -g compatible).
+    /// Prefix a glob with `!` to exclude. Empty = no filtering.
+    pub globs: Vec<String>,
 }
 
 /// Configuration for the search engine.
@@ -237,6 +241,12 @@ impl Xgrep {
         // path_pattern filter
         if let Some(ref pp) = opts.path_pattern {
             results.retain(|r| r.file.contains(pp));
+        }
+
+        // glob filter (-g)
+        if !opts.globs.is_empty() {
+            let filter = globfilter::GlobFilter::new(&opts.globs)?;
+            results.retain(|r| filter.matches(&r.file));
         }
 
         // max_count
@@ -1024,6 +1034,24 @@ mod tests {
         let results = xg.search("foo.bar", &opts).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].line.contains("foo.bar"));
+    }
+
+    #[test]
+    fn test_search_with_glob_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("src/b.py"), "needle\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let opts = SearchOptions {
+            globs: vec!["*.rs".to_string()],
+            ..Default::default()
+        };
+        let results = xg.search("needle", &opts).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].file.ends_with("a.rs"));
     }
 
     #[test]

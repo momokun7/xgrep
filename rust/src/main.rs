@@ -105,6 +105,10 @@ struct Cli {
     /// Exclude files matching path substring (can be repeated)
     #[arg(long, value_name = "PATTERN")]
     exclude: Vec<String>,
+
+    /// Include or exclude files by glob (prefix with ! to exclude; repeatable)
+    #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+    globs: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -384,6 +388,7 @@ fn run() -> Result<()> {
                         path_pattern: None,
                         fresh: cli.fresh,
                         word: cli.word_regexp,
+                        globs: cli.globs.clone(),
                     };
                     let results = xg.search(&pattern, &opts)?;
                     (dir, results)
@@ -396,6 +401,7 @@ fn run() -> Result<()> {
                         regex: cli.regex,
                         max_count: cli.max_count,
                         word: cli.word_regexp,
+                        globs: cli.globs.clone(),
                         ..Default::default()
                     };
                     let results = xg.search_files(&[rel_path], &pattern, &opts)?;
