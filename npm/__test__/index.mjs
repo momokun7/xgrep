@@ -43,9 +43,23 @@ try {
   assert.strictEqual(noResults.length, 0, 'should return empty for no match');
   console.log('ok: empty results');
 
-  // Index status
+  // Word-boundary search
+  const wordResults = xg.search('hello', { word: true });
+  assert.ok(wordResults.length > 0, 'word search should match standalone "hello"');
+  console.log('ok: word-boundary search');
+
+  // Glob filter (include only .rs)
+  const globResults = xg.search('fn', { globs: ['*.rs'] });
+  assert.ok(globResults.every(r => r.file.endsWith('.rs')), 'glob should restrict to .rs');
+  console.log('ok: glob filter');
+
+  // Index status (structured object)
   const status = xg.indexStatus();
-  assert.ok(status.includes('Index path:'), 'status should contain index path');
+  assert.strictEqual(typeof status, 'object', 'status should be an object');
+  assert.strictEqual(status.state, 'fresh', 'state should be fresh after build');
+  assert.ok(status.indexedFiles >= 1, 'indexedFiles should count built files');
+  assert.ok(status.indexSizeBytes > 0, 'indexSizeBytes should be positive');
+  assert.ok(status.indexPath.length > 0, 'indexPath should be set');
   console.log('ok: indexStatus');
 
   // Error handling: search on non-indexed repo should still work (fallback)

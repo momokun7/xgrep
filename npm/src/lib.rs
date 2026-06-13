@@ -31,6 +31,27 @@ pub struct SearchOptions {
     pub path_pattern: Option<String>,
     /// Check index freshness before searching.
     pub fresh: Option<bool>,
+    /// Match only at word boundaries (wraps the pattern in `\b(?:...)\b`).
+    /// Enabling this always runs the regex engine, even for literal patterns.
+    pub word: Option<bool>,
+    /// Include/exclude result paths by glob (ripgrep -g compatible).
+    /// Prefix a glob with `!` to exclude. Empty/omitted = no filtering.
+    pub globs: Option<Vec<String>>,
+}
+
+/// Index status returned from xgrep.
+#[napi(object)]
+pub struct IndexStatus {
+    /// Freshness state: "fresh", "stale", or "missing".
+    pub state: String,
+    /// Number of files changed since the last build. Present only when state is "stale".
+    pub changed_files: Option<u32>,
+    /// Number of files in the index (0 if missing).
+    pub indexed_files: u32,
+    /// Index file size in bytes (0 if missing).
+    pub index_size_bytes: i64,
+    /// Path to the index file.
+    pub index_path: String,
 }
 
 /// Ultra-fast indexed code search engine.
@@ -80,12 +101,14 @@ impl Xgrep {
         Ok(results.into_iter().map(to_js_result).collect())
     }
 
-    /// Get the current index status.
+    /// Get the current index status as a structured object.
     #[napi]
-    pub fn index_status(&self) -> Result<String> {
-        self.inner
+    pub fn index_status(&self) -> Result<IndexStatus> {
+        let info = self
+            .inner
             .index_status()
-            .map_err(|e| Error::from_reason(e.to_string()))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(to_js_status(info))
     }
 
     /// Get the root directory path.
@@ -113,7 +136,26 @@ fn to_rust_opts(opts: Option<SearchOptions>) -> xgrep_search::SearchOptions {
             since: o.since,
             path_pattern: o.path_pattern,
             fresh: o.fresh.unwrap_or(false),
+            word: o.word.unwrap_or(false),
+            globs: o.globs.unwrap_or_default(),
         },
+    }
+}
+
+fn to_js_status(info: xgrep_search::IndexStatusInfo) -> IndexStatus {
+    let (state, changed_files) = match info.state {
+        xgrep_search::IndexState::Fresh => ("fresh".to_string(), None),
+        xgrep_search::IndexState::Stale { changed_files } => {
+            ("stale".to_string(), Some(changed_files as u32))
+        }
+        xgrep_search::IndexState::Missing => ("missing".to_string(), None),
+    };
+    IndexStatus {
+        state,
+        changed_files,
+        indexed_files: info.indexed_files as u32,
+        index_size_bytes: info.index_size_bytes as i64,
+        index_path: info.index_path.to_string_lossy().to_string(),
     }
 }
 

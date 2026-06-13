@@ -30,6 +30,29 @@ export interface SearchOptions {
   pathPattern?: string
   /** Check index freshness before searching. */
   fresh?: boolean
+  /**
+   * Match only at word boundaries (wraps the pattern in `(?:...)`).
+   * Enabling this always runs the regex engine, even for literal patterns.
+   */
+  word?: boolean
+  /**
+   * Include/exclude result paths by glob (ripgrep -g compatible).
+   * Prefix a glob with `!` to exclude. Empty/omitted = no filtering.
+   */
+  globs?: Array<string>
+}
+/** Index status returned from xgrep. */
+export interface IndexStatus {
+  /** Freshness state: "fresh", "stale", or "missing". */
+  state: string
+  /** Number of files changed since the last build. Present only when state is "stale". */
+  changedFiles?: number
+  /** Number of files in the index (0 if missing). */
+  indexedFiles: number
+  /** Index file size in bytes (0 if missing). */
+  indexSizeBytes: number
+  /** Path to the index file. */
+  indexPath: string
 }
 /** Ultra-fast indexed code search engine. */
 export declare class Xgrep {
@@ -41,8 +64,8 @@ export declare class Xgrep {
   buildIndex(): void
   /** Search for a pattern in the indexed codebase. */
   search(pattern: string, opts?: SearchOptions | undefined | null): Array<SearchResult>
-  /** Get the current index status. */
-  indexStatus(): string
+  /** Get the current index status as a structured object. */
+  indexStatus(): IndexStatus
   /** Get the root directory path. */
   get root(): string
   /** Get the index file path. */
