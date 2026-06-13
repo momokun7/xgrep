@@ -102,7 +102,7 @@ pub fn tools_list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "index_status",
-            "description": "Check the status of the search index. Returns a JSON object: state (\"fresh\", \"stale (N changed files)\", or \"missing\"), indexed_files (count), index_size_bytes, and index_path.",
+            "description": "Check the status of the search index. Returns a JSON object: state (\"fresh\", \"stale\", or \"missing\"), changed_files (count, present only when state is \"stale\"), indexed_files (count), index_size_bytes, and index_path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -281,19 +281,20 @@ pub fn handle_index_status(xg: &Xgrep) -> (String, bool) {
     use crate::IndexState;
     match xg.index_status() {
         Ok(info) => {
-            let state = match info.state {
-                IndexState::Fresh => "fresh".to_string(),
-                IndexState::Stale { changed_files } => {
-                    format!("stale ({} changed files)", changed_files)
-                }
-                IndexState::Missing => "missing".to_string(),
+            let (state, changed_files) = match info.state {
+                IndexState::Fresh => ("fresh", None),
+                IndexState::Stale { changed_files } => ("stale", Some(changed_files)),
+                IndexState::Missing => ("missing", None),
             };
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "state": state,
                 "indexed_files": info.indexed_files,
                 "index_size_bytes": info.index_size_bytes,
                 "index_path": info.index_path.to_string_lossy(),
             });
+            if let Some(c) = changed_files {
+                json["changed_files"] = c.into();
+            }
             (json.to_string(), false)
         }
         Err(e) => (format!("Status check error: {}", e), true),
@@ -470,6 +471,25 @@ mod tests {
         assert!(json["indexed_files"].as_u64().unwrap() >= 1);
         assert!(json["index_size_bytes"].as_u64().unwrap() > 0);
         assert!(json["index_path"].as_str().unwrap().contains("index"));
+        // Fresh index has no changed_files field.
+        assert!(json.get("changed_files").is_none());
+    }
+
+    #[test]
+    fn test_handle_index_status_stale_reports_changed_files() {
+        let (dir, xg) = setup_test_repo();
+        // Modify a tracked file after the index was built so the index goes stale.
+        fs::write(
+            dir.path().join("hello.rs"),
+            "fn hello() {\n    println!(\"changed\");\n}\n",
+        )
+        .unwrap();
+        let (output, is_error) = handle_index_status(&xg);
+        assert!(!is_error, "output was: {}", output);
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        // Agents branch on the bare state string, not prose.
+        assert_eq!(json["state"], "stale");
+        assert!(json["changed_files"].as_u64().unwrap() >= 1);
     }
 
     #[test]
