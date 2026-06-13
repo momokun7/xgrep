@@ -72,7 +72,7 @@ Register it with Claude Code (`.mcp.json` or settings):
 | `search` | Trigram-indexed pattern search returning matching lines with context. | `pattern` (required), `regex`, `case_insensitive`, `file_type`, `path_pattern`, `max_results` (default 20), `context_lines` (default 3), `max_tokens` (default 4000) |
 | `find_definitions` | Locate likely symbol definitions via regex heuristics (`fn`/`struct`/`class`/`def`…). Not AST-based; may include false positives. | `symbol` (required), `file_type`, `path_pattern` |
 | `read_file` | Read a file (optionally a line range) with line numbers. Use after `search` for full context. | `path` (required, relative to project root), `start_line`, `end_line` |
-| `index_status` | Report index health. Returns JSON: `state` (`"fresh"`, `"stale (N changed files)"`, or `"missing"`), `indexed_files`, `index_size_bytes`, `index_path`. | none |
+| `index_status` | Report index health. Returns JSON: `state` (`"fresh"`, `"stale"`, or `"missing"`), `changed_files` (count, present only when `state` is `"stale"`), `indexed_files`, `index_size_bytes`, `index_path`. | none |
 | `build_index` | Build or rebuild the search index for the codebase. | none |
 
 The `index_status` JSON lets an agent branch on freshness without parsing prose:
