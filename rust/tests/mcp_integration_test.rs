@@ -129,12 +129,15 @@ fn test_mcp_build_index() {
         .unwrap();
     assert!(text.contains("Index built"));
 
-    // index_status
+    // index_status returns structured JSON
     assert_eq!(responses[2]["id"], 3);
     let status_text = responses[2]["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(status_text.contains("Index path:"));
+    let status: serde_json::Value = serde_json::from_str(status_text).unwrap();
+    assert!(status["state"].as_str().unwrap().contains("fresh"));
+    assert!(status["indexed_files"].as_u64().unwrap() >= 1);
+    assert!(status["index_path"].as_str().unwrap().contains("index"));
 }
 
 #[test]

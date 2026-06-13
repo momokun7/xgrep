@@ -102,7 +102,7 @@ pub fn tools_list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "index_status",
-            "description": "Check the status of the search index (freshness, file count).",
+            "description": "Check the status of the search index. Returns a JSON object: state (\"fresh\", \"stale\", or \"missing\"), changed_files (count, present only when state is \"stale\"), indexed_files (count), index_size_bytes, and index_path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -192,7 +192,14 @@ pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
             } else {
                 format!("Found {} matches in {} files\n\n", total, file_count)
             };
-            match output::format_llm(&results, xg.root(), context_lines, Some(max_tokens), false) {
+            match output::format_llm(
+                &results,
+                xg.root(),
+                context_lines,
+                context_lines,
+                Some(max_tokens),
+                false,
+            ) {
                 Ok(body) => (format!("{}{}", header, body), false),
                 Err(e) => (format!("Format error: {}", e), true),
             }
@@ -238,7 +245,7 @@ pub fn handle_find_definitions(xg: &Xgrep, params: &Value) -> (String, bool) {
                 symbol,
                 file_count
             );
-            match output::format_llm(&results, xg.root(), 3, None, false) {
+            match output::format_llm(&results, xg.root(), 3, 3, None, false) {
                 Ok(body) => (format!("{}{}", header, body), false),
                 Err(e) => (format!("Format error: {}", e), true),
             }
@@ -268,10 +275,28 @@ pub fn handle_build_index(xg: &Xgrep) -> (String, bool) {
     }
 }
 
-/// Handler for the `index_status` tool.
+/// Handler for the `index_status` tool. Returns a structured JSON object so
+/// agents can branch on the index state without parsing prose.
 pub fn handle_index_status(xg: &Xgrep) -> (String, bool) {
+    use crate::IndexState;
     match xg.index_status() {
-        Ok(msg) => (msg, false),
+        Ok(info) => {
+            let (state, changed_files) = match info.state {
+                IndexState::Fresh => ("fresh", None),
+                IndexState::Stale { changed_files } => ("stale", Some(changed_files)),
+                IndexState::Missing => ("missing", None),
+            };
+            let mut json = serde_json::json!({
+                "state": state,
+                "indexed_files": info.indexed_files,
+                "index_size_bytes": info.index_size_bytes,
+                "index_path": info.index_path.to_string_lossy(),
+            });
+            if let Some(c) = changed_files {
+                json["changed_files"] = c.into();
+            }
+            (json.to_string(), false)
+        }
         Err(e) => (format!("Status check error: {}", e), true),
     }
 }
@@ -434,6 +459,37 @@ mod tests {
         assert!(!is_error);
         assert!(output.contains("hello"));
         assert!(output.contains("definitions"));
+    }
+
+    #[test]
+    fn test_handle_index_status_structured_json() {
+        let (_dir, xg) = setup_test_repo();
+        let (output, is_error) = handle_index_status(&xg);
+        assert!(!is_error, "output was: {}", output);
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["state"], "fresh");
+        assert!(json["indexed_files"].as_u64().unwrap() >= 1);
+        assert!(json["index_size_bytes"].as_u64().unwrap() > 0);
+        assert!(json["index_path"].as_str().unwrap().contains("index"));
+        // Fresh index has no changed_files field.
+        assert!(json.get("changed_files").is_none());
+    }
+
+    #[test]
+    fn test_handle_index_status_stale_reports_changed_files() {
+        let (dir, xg) = setup_test_repo();
+        // Modify a tracked file after the index was built so the index goes stale.
+        fs::write(
+            dir.path().join("hello.rs"),
+            "fn hello() {\n    println!(\"changed\");\n}\n",
+        )
+        .unwrap();
+        let (output, is_error) = handle_index_status(&xg);
+        assert!(!is_error, "output was: {}", output);
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        // Agents branch on the bare state string, not prose.
+        assert_eq!(json["state"], "stale");
+        assert!(json["changed_files"].as_u64().unwrap() >= 1);
     }
 
     #[test]

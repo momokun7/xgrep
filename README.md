@@ -11,7 +11,7 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 ## Features
 
 - **Indexed search** — trigram inverted index makes repeated searches 2-46x faster than ripgrep
-- **File discovery** — `--find` mode locates files 4-34x faster than fd/find
+- **File discovery** — `--find` mode locates files 2-15x faster than fd
 - **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io/) server for AI coding tools (Claude Code, Cursor, etc.)
 - **LLM-optimized output** — `--format llm` produces Markdown with language tags, context lines, and token-aware truncation
 - **Git-aware** — search only changed files (`--changed`), recent commits (`--since 1h`), respects `.gitignore`
@@ -55,11 +55,18 @@ cp target/release/xg ~/.local/bin/
 ## Usage
 
 ```bash
-xg "pattern"                  # Fixed string search
+xg "pattern"                  # Smart-case search (all-lowercase = case-insensitive)
+xg "Pattern"                  # Mixed/upper case in pattern = case-sensitive
+xg "pattern" -i               # Force case-insensitive
+xg "pattern" -s               # Force case-sensitive (disable smart-case)
 xg "pattern" /path/to/repo    # Search a specific directory
 xg -e "handle_\w+"            # Regex search
+xg "pattern" -w               # Match whole words only
 xg "pattern" -t rs            # Filter by file type
-xg "pattern" -C 3             # Context lines
+xg "pattern" -C 3             # Context lines (symmetric)
+xg "pattern" -A 2 -B 1        # 2 lines after, 1 line before
+xg "pattern" -g "*.rs"        # Include only paths matching glob (repeatable)
+xg "pattern" -g "!*_test.rs"  # Exclude paths matching glob (! prefix)
 xg "pattern" --format llm     # Markdown output for LLMs
 xg "pattern" --changed        # Only git changed files
 xg "pattern" --exclude vendor  # Exclude paths containing "vendor"
@@ -70,6 +77,8 @@ xg --list-types               # Show supported file types
 xg status                     # Show index status
 xg init                       # Explicitly rebuild index
 ```
+
+Search is **smart-case** by default: an all-lowercase pattern matches case-insensitively, while any uppercase letter makes the search case-sensitive. Use `-i` or `-s` to override (priority: `-i` > `-s` > smart-case).
 
 ### Environment Variables
 
@@ -105,6 +114,8 @@ xg serve --root /path/to/repo   # Specific directory
 
 **Available tools:** `search`, `find_definitions`, `read_file`, `index_status`, `build_index`
 
+See [docs/agents.md](docs/agents.md) for agent-oriented usage patterns.
+
 ## Performance
 
 Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 32GB RAM, macOS. All numbers are warm cache, after index build.
@@ -117,12 +128,12 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 | `printk` | 52ms | 1,756ms | **34x faster** |
 | `EXPORT_SYMBOL` | 66ms | 1,773ms | **27x faster** |
 
-### File discovery: next.js (26,424 files)
+### File discovery: next.js (27,332 files)
 
 | Query | xg --find | fd | vs fd |
 |-------|-----------|-----|-------|
-| `*.ts` (4,643 files) | 8.9ms | 190.9ms | **21x faster** |
-| `config` (substring) | 5.5ms | 189.0ms | **34x faster** |
+| `*.ts` (4,838 files) | 20.8ms | 187.3ms | **9x faster** |
+| `config` (substring) | 12.7ms | 188.1ms | **15x faster** |
 
 ### Index cost
 
@@ -137,6 +148,7 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 ## Limitations
 
 - **Short queries (< 3 chars)** bypass the index — no speed advantage over ripgrep
+- **Tiny files (< 3 bytes)** hold no trigrams and are invisible to indexed content search — a deliberate trade-off of the trigram index
 - **Index staleness** — background rebuild runs every ~30s. Use `--fresh` for up-to-date results
 - **find_definitions** uses regex heuristics, not AST analysis — false positives expected
 

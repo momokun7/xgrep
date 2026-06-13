@@ -25,13 +25,26 @@ struct Cli {
     #[arg(long, default_value = "default")]
     format: String,
 
-    /// Case-insensitive search
+    /// Case-insensitive search (default: smart-case — insensitive unless
+    /// the pattern contains an uppercase letter)
     #[arg(short = 'i')]
     case_insensitive: bool,
+
+    /// Force case-sensitive search (disables smart-case)
+    #[arg(short = 's', long = "case-sensitive")]
+    case_sensitive: bool,
 
     /// Context lines (default: 3 for --format llm, none for default)
     #[arg(short = 'C')]
     context: Option<usize>,
+
+    /// Lines of context after each match (overrides -C)
+    #[arg(short = 'A', long = "after-context", value_name = "NUM")]
+    after_context: Option<usize>,
+
+    /// Lines of context before each match (overrides -C)
+    #[arg(short = 'B', long = "before-context", value_name = "NUM")]
+    before_context: Option<usize>,
 
     /// Search only in git changed files (unstaged + staged)
     #[arg(long)]
@@ -44,6 +57,10 @@ struct Cli {
     /// Use regex pattern
     #[arg(short = 'e')]
     regex: bool,
+
+    /// Only show matches surrounded by word boundaries
+    #[arg(short = 'w', long = "word-regexp")]
+    word_regexp: bool,
 
     /// Filter by file type (e.g., rs, py, js)
     #[arg(long = "type", short = 't')]
@@ -88,6 +105,10 @@ struct Cli {
     /// Exclude files matching path substring (can be repeated)
     #[arg(long, value_name = "PATTERN")]
     exclude: Vec<String>,
+
+    /// Include or exclude files by glob (prefix with ! to exclude; repeatable)
+    #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+    globs: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -345,12 +366,20 @@ fn run() -> Result<()> {
                 return Ok(());
             }
 
+            let case_insensitive = if cli.case_insensitive {
+                true
+            } else if cli.case_sensitive {
+                false
+            } else {
+                !xgrep_search::pattern_has_uppercase(&pattern, cli.regex)
+            };
+
             let resolved = resolve_path(cli.path.as_deref())?;
             let (dir, results) = match resolved {
                 ResolvedPath::Dir(dir) => {
                     let xg = Xgrep::open(&dir)?;
                     let opts = SearchOptions {
-                        case_insensitive: cli.case_insensitive,
+                        case_insensitive,
                         regex: cli.regex,
                         file_type: cli.file_type,
                         max_count: cli.max_count,
@@ -358,6 +387,8 @@ fn run() -> Result<()> {
                         since: cli.since,
                         path_pattern: None,
                         fresh: cli.fresh,
+                        word: cli.word_regexp,
+                        globs: cli.globs.clone(),
                     };
                     let results = xg.search(&pattern, &opts)?;
                     (dir, results)
@@ -366,9 +397,11 @@ fn run() -> Result<()> {
                     let rel_path = file.strip_prefix(&dir).unwrap_or(&file).to_path_buf();
                     let xg = Xgrep::open(&dir)?;
                     let opts = SearchOptions {
-                        case_insensitive: cli.case_insensitive,
+                        case_insensitive,
                         regex: cli.regex,
                         max_count: cli.max_count,
+                        word: cli.word_regexp,
+                        globs: cli.globs.clone(),
                         ..Default::default()
                     };
                     let results = xg.search_files(&[rel_path], &pattern, &opts)?;
@@ -436,17 +469,31 @@ fn run() -> Result<()> {
             } else {
                 let output_str = match cli.format.as_str() {
                     "llm" => {
-                        let ctx = cli.context.unwrap_or_else(|| {
+                        let base = cli.context.unwrap_or_else(|| {
                             std::env::var("XGREP_LLM_CONTEXT")
                                 .ok()
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(3)
                         });
-                        output::format_llm(&results, &dir, ctx, None, use_absolute)?
+                        let before = cli.before_context.unwrap_or(base);
+                        let after = cli.after_context.unwrap_or(base);
+                        output::format_llm(&results, &dir, before, after, None, use_absolute)?
                     }
                     _ => {
-                        if let Some(ctx) = cli.context {
-                            output::format_default_context(&results, &dir, ctx, use_absolute)?
+                        let has_context = cli.context.is_some()
+                            || cli.before_context.is_some()
+                            || cli.after_context.is_some();
+                        if has_context {
+                            let base = cli.context.unwrap_or(0);
+                            let before = cli.before_context.unwrap_or(base);
+                            let after = cli.after_context.unwrap_or(base);
+                            output::format_default_context(
+                                &results,
+                                &dir,
+                                before,
+                                after,
+                                use_absolute,
+                            )?
                         } else if use_absolute {
                             let abs_results: Vec<_> = results
                                 .iter()
