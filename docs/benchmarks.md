@@ -37,12 +37,12 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 | `*.rs` (769 files) | 1.9ms | 7.7ms | 6.5ms | **4.1x faster** |
 | `config` (substring) | 1.6ms | 7.2ms | 6.5ms | **4.5x faster** |
 
-### next.js (26,464 files, React framework)
+### next.js (27,332 files, React framework)
 
 | Query | xg --find | fd | find | vs fd |
 |-------|-----------|-----|------|-------|
-| `*.ts` (4,643 files) | 8.9ms | 190.9ms | 558.7ms | **21x faster** |
-| `config` (substring) | 5.5ms | 189.0ms | 559.4ms | **34x faster** |
+| `*.ts` (4,838 files) | 20.8ms | 187.3ms | 632.8ms | **9x faster** |
+| `config` (substring) | 12.7ms | 188.1ms | 521.1ms | **15x faster** |
 
 `xg --find` reads file paths from the in-memory index (mmap), while fd/find walk the filesystem. The gap widens with repository size.
 

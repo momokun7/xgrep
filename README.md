@@ -11,7 +11,7 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 ## Features
 
 - **Indexed search** — trigram inverted index makes repeated searches 2-46x faster than ripgrep
-- **File discovery** — `--find` mode locates files 4-34x faster than fd/find
+- **File discovery** — `--find` mode locates files 2-15x faster than fd
 - **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io/) server for AI coding tools (Claude Code, Cursor, etc.)
 - **LLM-optimized output** — `--format llm` produces Markdown with language tags, context lines, and token-aware truncation
 - **Git-aware** — search only changed files (`--changed`), recent commits (`--since 1h`), respects `.gitignore`
@@ -128,12 +128,12 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 | `printk` | 52ms | 1,756ms | **34x faster** |
 | `EXPORT_SYMBOL` | 66ms | 1,773ms | **27x faster** |
 
-### File discovery: next.js (26,424 files)
+### File discovery: next.js (27,332 files)
 
 | Query | xg --find | fd | vs fd |
 |-------|-----------|-----|-------|
-| `*.ts` (4,643 files) | 8.9ms | 190.9ms | **21x faster** |
-| `config` (substring) | 5.5ms | 189.0ms | **34x faster** |
+| `*.ts` (4,838 files) | 20.8ms | 187.3ms | **9x faster** |
+| `config` (substring) | 12.7ms | 188.1ms | **15x faster** |
 
 ### Index cost
 
