@@ -55,11 +55,18 @@ cp target/release/xg ~/.local/bin/
 ## Usage
 
 ```bash
-xg "pattern"                  # Fixed string search
+xg "pattern"                  # Smart-case search (all-lowercase = case-insensitive)
+xg "Pattern"                  # Mixed/upper case in pattern = case-sensitive
+xg "pattern" -i               # Force case-insensitive
+xg "pattern" -s               # Force case-sensitive (disable smart-case)
 xg "pattern" /path/to/repo    # Search a specific directory
 xg -e "handle_\w+"            # Regex search
+xg "pattern" -w               # Match whole words only
 xg "pattern" -t rs            # Filter by file type
-xg "pattern" -C 3             # Context lines
+xg "pattern" -C 3             # Context lines (symmetric)
+xg "pattern" -A 2 -B 1        # 2 lines after, 1 line before
+xg "pattern" -g "*.rs"        # Include only paths matching glob (repeatable)
+xg "pattern" -g "!*_test.rs"  # Exclude paths matching glob (! prefix)
 xg "pattern" --format llm     # Markdown output for LLMs
 xg "pattern" --changed        # Only git changed files
 xg "pattern" --exclude vendor  # Exclude paths containing "vendor"
@@ -70,6 +77,8 @@ xg --list-types               # Show supported file types
 xg status                     # Show index status
 xg init                       # Explicitly rebuild index
 ```
+
+Search is **smart-case** by default: an all-lowercase pattern matches case-insensitively, while any uppercase letter makes the search case-sensitive. Use `-i` or `-s` to override (priority: `-i` > `-s` > smart-case).
 
 ### Environment Variables
 
@@ -139,6 +148,7 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 ## Limitations
 
 - **Short queries (< 3 chars)** bypass the index — no speed advantage over ripgrep
+- **Tiny files (< 3 bytes)** hold no trigrams and are invisible to indexed content search — a deliberate trade-off of the trigram index
 - **Index staleness** — background rebuild runs every ~30s. Use `--fresh` for up-to-date results
 - **find_definitions** uses regex heuristics, not AST analysis — false positives expected
 

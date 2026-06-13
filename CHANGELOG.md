@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-13
+
+### Added
+- Smart-case search by default — all-lowercase patterns match case-insensitively, any uppercase letter makes the search case-sensitive
+- `-s` / `--case-sensitive` flag to force case-sensitive search (disables smart-case)
+- `-A` / `--after-context` and `-B` / `--before-context` for asymmetric context lines (ripgrep-compatible)
+- `-w` / `--word-regexp` for whole-word matching
+- `-g` / `--glob` include/exclude path filters — `!` prefix excludes, repeatable (ripgrep-compatible)
+- Fluent builder methods on `SearchOptions` (`new()`, `with_case_insensitive()`, `with_regex()`, `with_file_type()`, `with_max_count()`, `with_word()`, `with_glob()`, `with_changed_only()`, `with_fresh()`) — additive, struct-literal construction still works
+- `IndexStatusInfo` / `IndexState` structured types returned by `index_status()`, so agents can branch on index state without parsing prose
+- `docs/agents.md` guide for AI agent integration (MCP setup, `--format llm`, exit codes, environment variables, recipes)
+- napi (Node.js) bindings expose the `word` and `globs` search options and a structured `indexStatus()` object
+
+### Changed
+- **Breaking:** Search is now smart-case by default instead of always case-sensitive — all-lowercase patterns now match case-insensitively. Pass `-s` to restore strict matching
+- **Breaking:** `Xgrep::index_status()` now returns `Result<IndexStatusInfo>` instead of `Result<String>` — call `.to_string()` on the result for the previous human-readable output
+- **Breaking:** `SearchOptions` gained `word` and `globs` fields — struct-literal construction must initialize them (the new builder methods avoid this)
+- MCP `index_status` tool now returns a structured JSON object (`state`, `indexed_files`, `index_size_bytes`, `index_path`) instead of a prose string
+
+### Fixed
+- 2-char pattern candidate resolution now unions prefix and suffix trigrams, fixing missed matches when a 2-char pattern occurs at end-of-file
+
 ## [0.3.0] - 2026-04-01
 
 ### Added
@@ -123,7 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parallel file scanning with rayon
 - SIMD-accelerated pattern matching via memchr
 
-[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/momokun7/xgrep/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/momokun7/xgrep/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/momokun7/xgrep/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/momokun7/xgrep/compare/v0.1.6...v0.2.0
