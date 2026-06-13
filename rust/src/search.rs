@@ -826,7 +826,7 @@ mod tests {
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
         let results = search_regex(&reader, root, ".*", false, false).unwrap();
-        assert!(results.len() >= 1);
+        assert!(!results.is_empty());
     }
 
     #[test]

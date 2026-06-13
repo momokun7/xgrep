@@ -236,7 +236,7 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","id":null,"method":"test"}"#;
         let msg = parse_message(json).unwrap();
         assert_eq!(msg.id, Some(Value::Null)); // Not None
-        assert!(!msg.id.is_none()); // Treated as request, not notification
+        assert!(msg.id.is_some()); // Treated as request, not notification
     }
 
     #[test]
