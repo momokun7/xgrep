@@ -52,17 +52,25 @@ jobs:
     permissions:
       contents: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: xg-x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: xg-aarch64-unknown-linux-gnu
+            cross: true
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: xg-aarch64-apple-darwin
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: xg-x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: xg-x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -74,20 +82,44 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: rust
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Build release
         working-directory: rust
         run: cargo build --release --target ${{ matrix.target }}
-      - name: Package
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
         run: |
           cd rust/target/${{ matrix.target }}/release
           tar czf ${{ matrix.artifact }}.tar.gz xg
           mv ${{ matrix.artifact }}.tar.gz ../../../../
-      - name: Upload to release
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          cd rust/target/${{ matrix.target }}/release
+          Compress-Archive -Path xg.exe -DestinationPath ${{ matrix.artifact }}.zip
+          Move-Item ${{ matrix.artifact }}.zip ../../../../
+      - name: Upload to release (unix)
+        if: matrix.os != 'windows-latest'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
           ARTIFACT: ${{ matrix.artifact }}
         run: gh release upload "$RELEASE_TAG" "${ARTIFACT}.tar.gz" --clobber
+      - name: Upload to release (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: gh release upload "$env:RELEASE_TAG" "$env:ARTIFACT.zip" --clobber
 
   publish-crate:
     name: Publish to crates.io
