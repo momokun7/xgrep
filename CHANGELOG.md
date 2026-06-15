@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-15
+
+### Added
+- Prebuilt release binaries for `x86_64-pc-windows-msvc` and `aarch64-unknown-linux-gnu`, alongside the existing macOS and x86_64 Linux targets
+- In-tree criterion benchmarks (`cargo bench`) covering literal search, regex search, and file find on a synthetic corpus
+- Continuous fuzzing CI for the `varint`, `posting_list`, and `index_reader` targets (build on every push, weekly timed run)
+- Property-based equivalence tests asserting indexed search returns the same `(file, line)` set as a naive full-scan grep
+
+### Changed
+- npm package is now published via GitHub OIDC trusted publishing, removing the long-lived `NPM_TOKEN` secret from the repository
+- napi (Node.js) bindings are built and tested on every pull request, not only at release time
+
+### Fixed
+- Non-git freshness detection no longer counts the index's own `.meta`/`.cache` sidecars as source changes. The exclusion list previously looked for `.xgrep.meta`/`.xgrep.cache`, but `with_extension` replaces the extension (`index.xgrep` -> `index.meta`), so the sidecars were never excluded — causing spurious full rebuilds when the sidecar mtime crossed a second boundary after the index (surfaced as a Windows test failure)
+
 ## [0.4.0] - 2026-06-13
 
 ### Added
@@ -145,7 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parallel file scanning with rayon
 - SIMD-accelerated pattern matching via memchr
 
-[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/momokun7/xgrep/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/momokun7/xgrep/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/momokun7/xgrep/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/momokun7/xgrep/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/momokun7/xgrep/compare/v0.2.0...v0.2.1
