@@ -466,7 +466,7 @@ mod tests {
         let text = "hello world this is a test";
         let tokens = estimate_tokens(text);
         // ~26 bytes / 4 = ~6-7 tokens
-        assert!(tokens >= 5 && tokens <= 10);
+        assert!((5..=10).contains(&tokens));
     }
 
     #[test]
@@ -474,7 +474,7 @@ mod tests {
         let text = "こんにちは世界";
         let tokens = estimate_tokens(text);
         // 21 bytes, all non-ASCII, / 2 = ~10-11 tokens
-        assert!(tokens >= 8 && tokens <= 15);
+        assert!((8..=15).contains(&tokens));
     }
 
     #[test]

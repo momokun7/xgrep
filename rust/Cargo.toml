@@ -55,6 +55,10 @@ harness = false
 name = "bench_candidates"
 harness = false
 
+[[bench]]
+name = "search_bench"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

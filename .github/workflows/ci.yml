@@ -162,6 +162,34 @@ jobs:
         working-directory: rust
         run: cargo check
 
+  npm-bindings:
+    name: npm bindings
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: npm
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        working-directory: npm
+        run: npm ci
+      - name: Build native module
+        working-directory: npm
+        run: npx napi build --platform
+      - name: Test
+        working-directory: npm
+        run: node __test__/index.mjs
+
   release:
     name: Release build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
