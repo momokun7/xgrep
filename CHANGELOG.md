@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - npm package is now published via GitHub OIDC trusted publishing, removing the long-lived `NPM_TOKEN` secret from the repository
 - napi (Node.js) bindings are built and tested on every pull request, not only at release time
 
+### Fixed
+- Non-git freshness detection no longer counts the index's own `.meta`/`.cache` sidecars as source changes. The exclusion list previously looked for `.xgrep.meta`/`.xgrep.cache`, but `with_extension` replaces the extension (`index.xgrep` -> `index.meta`), so the sidecars were never excluded — causing spurious full rebuilds when the sidecar mtime crossed a second boundary after the index (surfaced as a Windows test failure)
+
 ## [0.4.0] - 2026-06-13
 
 ### Added

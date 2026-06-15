@@ -112,19 +112,24 @@ fn current_commit_hash(root: &Path) -> Option<String> {
 }
 
 /// Get the newest file mtime in the directory (UNIX epoch seconds).
-fn newest_file_mtime(root: &Path) -> Option<u64> {
+///
+/// The index file and its sidecars (`.meta`, `.cache`) are excluded so that
+/// writing the index itself never makes the source tree look "newer than the
+/// index". These sidecars are derived with `with_extension`, so they replace
+/// the index extension (`index.xgrep` -> `index.meta`), not append to it.
+fn newest_file_mtime(root: &Path, index_path: &Path) -> Option<u64> {
+    let sidecars = [
+        index_path.to_path_buf(),
+        index_path.with_extension("meta"),
+        index_path.with_extension("cache"),
+    ];
     let mut newest = 0u64;
     for entry in WalkBuilder::new(root).build().flatten() {
         if entry.file_type().is_some_and(|ft| ft.is_file()) {
-            // Skip index-related files (.xgrep, .meta, .cache) so they don't
-            // affect freshness detection for the source tree.
-            if let Some(name) = entry.path().file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".xgrep")
-                    || name.ends_with(".xgrep.meta")
-                    || name.ends_with(".xgrep.cache")
-                {
-                    continue;
-                }
+            // Skip the index and its sidecars so they don't affect freshness
+            // detection for the source tree.
+            if sidecars.iter().any(|s| s == entry.path()) {
+                continue;
             }
             if let Ok(meta) = entry.metadata() {
                 if let Ok(mtime) = meta.modified() {
@@ -319,7 +324,7 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
                 .unwrap_or_default()
                 .as_secs();
 
-            if let Some(newest) = newest_file_mtime(root) {
+            if let Some(newest) = newest_file_mtime(root, index_path) {
                 if index_mtime >= newest {
                     return Ok(IndexStatus::Fresh);
                 }
@@ -405,7 +410,7 @@ pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
-            let needs_rebuild = match newest_file_mtime(root) {
+            let needs_rebuild = match newest_file_mtime(root, index_path) {
                 Some(newest) => index_mtime < newest,
                 None => true,
             };
