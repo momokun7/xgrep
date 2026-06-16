@@ -68,9 +68,9 @@ pub struct Header {
 /// Trigram Table entry: 16 bytes
 /// trigram(3) + padding(1) + posting_offset(8) + posting_len(4) = 16
 ///
-/// WARNING: Do NOT use `unsafe { ptr::read_unaligned(... as *const TrigramEntry) }` or similar
-/// pointer casts on this struct. Always use `to_bytes()` for serialization.
-/// The packed repr exists only to define the exact byte layout.
+/// `packed` is required here: without it `repr(C)` inserts 4 bytes of alignment
+/// padding before `posting_offset`, making `SIZE` 24 instead of 16.
+/// All access goes through `to_bytes()` — never cast a pointer to this struct.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrigramEntry {
@@ -83,9 +83,9 @@ pub struct TrigramEntry {
 /// File Table entry: 28 bytes
 /// path_offset(4) + mtime(8) + size(8) + content_hash(8) = 28
 ///
-/// WARNING: Do NOT use `unsafe { ptr::read_unaligned(... as *const FileEntry) }` or similar
-/// pointer casts on this struct. Always use `to_bytes()` for serialization.
-/// The packed repr exists only to define the exact byte layout.
+/// `packed` is required here: without it `repr(C)` inserts 4 bytes of alignment
+/// padding after `path_offset`, making `SIZE` 32 instead of 28.
+/// All access goes through `to_bytes()` — never cast a pointer to this struct.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct FileEntry {
