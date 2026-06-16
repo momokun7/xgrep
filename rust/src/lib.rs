@@ -25,6 +25,7 @@
 //! intentional index design trade-off.
 
 pub(crate) mod candidates;
+pub mod cli;
 pub mod error;
 pub(crate) mod filetype;
 pub(crate) mod git;
