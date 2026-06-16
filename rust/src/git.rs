@@ -14,7 +14,7 @@ pub fn is_git_repo(root: &Path) -> bool {
 }
 
 /// Get the git repository root directory.
-fn git_toplevel(root: &Path) -> Option<PathBuf> {
+pub(crate) fn git_toplevel(root: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(root)

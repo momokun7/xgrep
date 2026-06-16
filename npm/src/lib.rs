@@ -161,7 +161,7 @@ fn to_js_status(info: xgrep_search::IndexStatusInfo) -> IndexStatus {
 
 fn to_js_result(r: xgrep_search::search::SearchResult) -> SearchResult {
     SearchResult {
-        file: r.file,
+        file: r.file.to_string(),
         line_number: r.line_number as u32,
         line: r.line,
     }

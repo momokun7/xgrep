@@ -202,9 +202,17 @@ fn is_quantifier(s: &str) -> bool {
 
 /// `(?:...)`, `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`
 fn detect_lookaround(pattern: &str) -> Option<String> {
+    let bytes = pattern.as_bytes();
     for prefix in &["(?:", "(?=", "(?!", "(?<=", "(?<!"] {
-        if pattern.contains(prefix) {
-            return Some(prefix.to_string());
+        let mut start = 0;
+        while let Some(rel_pos) = pattern[start..].find(prefix) {
+            let pos = start + rel_pos;
+            let escaped =
+                pos > 0 && bytes[pos - 1] == b'\\' && !is_escaped_backslash(bytes, pos - 1);
+            if !escaped {
+                return Some(prefix.to_string());
+            }
+            start = pos + 1;
         }
     }
     None
@@ -288,6 +296,10 @@ mod tests {
         assert!(detect_regex_hint("(?!baz)").is_some());
         assert!(detect_regex_hint("(?<=x)").is_some());
         assert!(detect_regex_hint("(?<!y)").is_some());
+        // \(?:foo) — '(' is escaped by unescaped '\', not a lookaround
+        assert!(detect_lookaround(r"\(?:foo)").is_none());
+        // \\(?:foo) — '\\' is an escaped backslash (literal), '(?:' IS a lookaround
+        assert!(detect_lookaround(r"\\(?:foo)").is_some());
     }
 
     #[test]

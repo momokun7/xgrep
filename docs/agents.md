@@ -107,7 +107,7 @@ Add the crate and drive it directly. Options use a fluent builder, so you never
 need an exhaustive struct literal:
 
 ```rust
-use xgrep_search::{Xgrep, SearchOptions, IndexState};
+use xgrep_search::{Xgrep, SearchOptions};
 
 let xg = Xgrep::open(".")?;
 xg.build_index()?;

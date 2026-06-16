@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
+use crate::git::git_toplevel;
 use ignore::WalkBuilder;
 
 /// Index freshness check result.
@@ -38,22 +39,6 @@ impl IndexMeta {
         let content = commit_hash.unwrap_or("");
         fs::write(&meta_path, content)?;
         Ok(())
-    }
-}
-
-/// Get the git repository root directory (via `git rev-parse --show-toplevel`).
-fn git_toplevel(root: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(PathBuf::from(
-            String::from_utf8_lossy(&output.stdout).trim(),
-        ))
-    } else {
-        None
     }
 }
 

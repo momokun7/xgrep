@@ -139,7 +139,7 @@ fn test_search_changed_requires_git() {
 #[test]
 fn test_search_result_debug_clone() {
     let r = xgrep_search::SearchResult {
-        file: "a.rs".to_string(),
+        file: std::sync::Arc::from("a.rs"),
         line_number: 1,
         line: "hello".to_string(),
     };

@@ -196,6 +196,18 @@ impl SearchOptions {
         self.fresh = value;
         self
     }
+
+    /// Only search files changed within a time duration (e.g. `"1h"`, `"2d"`, `"3.commits"`).
+    pub fn with_since(mut self, since: impl Into<String>) -> Self {
+        self.since = Some(since.into());
+        self
+    }
+
+    /// Filter results by path substring match (e.g. `"src/auth"`, `"tests/"`).
+    pub fn with_path_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.path_pattern = Some(pattern.into());
+        self
+    }
 }
 
 /// Configuration for the search engine.
@@ -381,7 +393,7 @@ impl Xgrep {
         if let Some(ref ft) = opts.file_type {
             if let Some(exts) = filetype::extensions_for_type(ft) {
                 results.retain(|r| {
-                    Path::new(&r.file)
+                    Path::new(&*r.file)
                         .extension()
                         .and_then(|e| e.to_str())
                         .is_some_and(|e| exts.contains(&e))
@@ -498,7 +510,7 @@ impl Xgrep {
                     .iter()
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
-                index_results.retain(|r| !changed_set.contains(&r.file));
+                index_results.retain(|r| !changed_set.contains(r.file.as_ref()));
 
                 // Directly scan changed files
                 let direct_results = if regex {
@@ -1118,7 +1130,7 @@ mod tests {
         let xg = Xgrep::open_local(root).unwrap();
         xg.build_index().unwrap();
         let results = xg.search("ab", &SearchOptions::default()).unwrap();
-        let files: Vec<&str> = results.iter().map(|r| r.file.as_str()).collect();
+        let files: Vec<&str> = results.iter().map(|r| r.file.as_ref()).collect();
         assert!(
             files.iter().any(|f| f.ends_with("tail.txt")),
             "2-char pattern at EOF must be found, got {:?}",
