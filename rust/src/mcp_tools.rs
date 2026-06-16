@@ -1,36 +1,51 @@
 //! MCP tool handlers for xgrep search operations.
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{output, SearchOptions, Xgrep};
 
-/// Validate that a JSON value, if present, is a non-negative integer.
-fn param_u64(params: &Value, key: &str) -> Result<Option<u64>, String> {
-    match params.get(key) {
-        None => Ok(None),
-        Some(v) if v.is_u64() => Ok(Some(v.as_u64().unwrap())),
-        Some(v) if v.is_i64() => {
-            let n = v.as_i64().unwrap();
-            if n >= 0 {
-                Ok(Some(n as u64))
-            } else {
-                Err(format!(
-                    "Parameter '{}' must be non-negative, got {}",
-                    key, n
-                ))
-            }
-        }
-        Some(v) => Err(format!("Parameter '{}' must be an integer, got {}", key, v)),
-    }
+fn default_max_results() -> usize {
+    20
+}
+fn default_context_lines() -> usize {
+    3
+}
+fn default_max_tokens() -> usize {
+    4000
 }
 
-/// Validate that a JSON value, if present, is a boolean.
-fn param_bool(params: &Value, key: &str) -> Result<Option<bool>, String> {
-    match params.get(key) {
-        None => Ok(None),
-        Some(v) if v.is_boolean() => Ok(Some(v.as_bool().unwrap())),
-        Some(v) => Err(format!("Parameter '{}' must be a boolean, got {}", key, v)),
-    }
+#[derive(Deserialize)]
+struct SearchParams {
+    pattern: String,
+    #[serde(default)]
+    regex: bool,
+    #[serde(default)]
+    case_insensitive: bool,
+    file_type: Option<String>,
+    path_pattern: Option<String>,
+    #[serde(default = "default_max_results")]
+    max_results: usize,
+    #[serde(default = "default_context_lines")]
+    context_lines: usize,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+}
+
+#[derive(Deserialize)]
+struct FindDefinitionsParams {
+    symbol: String,
+    file_type: Option<String>,
+    path_pattern: Option<String>,
+    #[serde(default = "default_max_results")]
+    max_results: usize,
+}
+
+#[derive(Deserialize)]
+struct ReadFileParams {
+    path: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
 }
 
 /// Return MCP tool definitions.
@@ -95,6 +110,10 @@ pub fn tools_list() -> Vec<Value> {
                     "path_pattern": {
                         "type": "string",
                         "description": "Filter by path substring"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default: 20)"
                     }
                 },
                 "required": ["symbol"]
@@ -134,48 +153,21 @@ pub fn tools_list() -> Vec<Value> {
 
 /// Handler for the `search` tool.
 pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
-    let pattern = match params.get("pattern").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return ("Missing required parameter: pattern".to_string(), true),
-    };
-
-    let max_results = match param_u64(params, "max_results") {
-        Ok(v) => v.unwrap_or(20) as usize,
-        Err(e) => return (e, true),
-    };
-    let context_lines = match param_u64(params, "context_lines") {
-        Ok(v) => v.unwrap_or(3) as usize,
-        Err(e) => return (e, true),
-    };
-    let max_tokens = match param_u64(params, "max_tokens") {
-        Ok(v) => v.unwrap_or(4000) as usize,
-        Err(e) => return (e, true),
-    };
-    let case_insensitive = match param_bool(params, "case_insensitive") {
-        Ok(v) => v.unwrap_or(false),
-        Err(e) => return (e, true),
-    };
-    let regex = match param_bool(params, "regex") {
-        Ok(v) => v.unwrap_or(false),
-        Err(e) => return (e, true),
+    let p: SearchParams = match serde_json::from_value(params.clone()) {
+        Ok(v) => v,
+        Err(e) => return (format!("Invalid parameters: {}", e), true),
     };
 
     let opts = SearchOptions {
-        case_insensitive,
-        regex,
-        file_type: params
-            .get("file_type")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        max_count: Some(max_results),
-        path_pattern: params
-            .get("path_pattern")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        case_insensitive: p.case_insensitive,
+        regex: p.regex,
+        file_type: p.file_type,
+        max_count: Some(p.max_results),
+        path_pattern: p.path_pattern,
         ..Default::default()
     };
 
-    match xg.search(pattern, &opts) {
+    match xg.search(&p.pattern, &opts) {
         Ok(results) => {
             let file_count = {
                 let mut files = results.iter().map(|r| &r.file).collect::<Vec<_>>();
@@ -184,10 +176,10 @@ pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
                 files.len()
             };
             let total = results.len();
-            let header = if total == max_results {
+            let header = if total == p.max_results {
                 format!(
                     "Found {}+ matches in {} files (limited to {})\n\n",
-                    total, file_count, max_results
+                    total, file_count, p.max_results
                 )
             } else {
                 format!("Found {} matches in {} files\n\n", total, file_count)
@@ -195,9 +187,9 @@ pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
             match output::format_llm(
                 &results,
                 xg.root(),
-                context_lines,
-                context_lines,
-                Some(max_tokens),
+                p.context_lines,
+                p.context_lines,
+                Some(p.max_tokens),
                 false,
             ) {
                 Ok(body) => (format!("{}{}", header, body), false),
@@ -210,24 +202,18 @@ pub fn handle_search(xg: &Xgrep, params: &Value) -> (String, bool) {
 
 /// Handler for the `find_definitions` tool.
 pub fn handle_find_definitions(xg: &Xgrep, params: &Value) -> (String, bool) {
-    let symbol = match params.get("symbol").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return ("Missing required parameter: symbol".to_string(), true),
+    let p: FindDefinitionsParams = match serde_json::from_value(params.clone()) {
+        Ok(v) => v,
+        Err(e) => return (format!("Invalid parameters: {}", e), true),
     };
 
-    let pattern = definition_regex(symbol);
+    let pattern = definition_regex(&p.symbol);
 
     let opts = SearchOptions {
         regex: true,
-        file_type: params
-            .get("file_type")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        path_pattern: params
-            .get("path_pattern")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        max_count: Some(20),
+        file_type: p.file_type,
+        path_pattern: p.path_pattern,
+        max_count: Some(p.max_results),
         ..Default::default()
     };
 
@@ -239,12 +225,18 @@ pub fn handle_find_definitions(xg: &Xgrep, params: &Value) -> (String, bool) {
                 files.dedup();
                 files.len()
             };
-            let header = format!(
-                "Found {} definitions of '{}' in {} files\n\n",
-                results.len(),
-                symbol,
-                file_count
-            );
+            let total = results.len();
+            let header = if total == p.max_results {
+                format!(
+                    "Found {}+ definitions of '{}' in {} files (limited to {}, pass max_results to increase)\n\n",
+                    total, p.symbol, file_count, p.max_results
+                )
+            } else {
+                format!(
+                    "Found {} definitions of '{}' in {} files\n\n",
+                    total, p.symbol, file_count
+                )
+            };
             match output::format_llm(&results, xg.root(), 3, 3, None, false) {
                 Ok(body) => (format!("{}{}", header, body), false),
                 Err(e) => (format!("Format error: {}", e), true),
@@ -303,20 +295,20 @@ pub fn handle_index_status(xg: &Xgrep) -> (String, bool) {
 
 /// Handler for the `read_file` tool.
 pub fn handle_read_file(xg: &Xgrep, params: &Value) -> (String, bool) {
-    let path = match params.get("path").and_then(|p| p.as_str()) {
-        Some(p) => p,
-        None => return ("Missing required parameter: path".to_string(), true),
+    let p: ReadFileParams = match serde_json::from_value(params.clone()) {
+        Ok(v) => v,
+        Err(e) => return (format!("Invalid parameters: {}", e), true),
     };
 
-    let full_path = xg.root().join(path);
+    let full_path = xg.root().join(&p.path);
 
     // Security: prevent path traversal
     let canonical = match full_path.canonicalize() {
-        Ok(p) => p,
-        Err(e) => return (format!("Cannot read file '{}': {}", path, e), true),
+        Ok(c) => c,
+        Err(e) => return (format!("Cannot read file '{}': {}", p.path, e), true),
     };
     let root_canonical = match xg.root().canonicalize() {
-        Ok(p) => p,
+        Ok(c) => c,
         Err(e) => return (format!("Cannot resolve root: {}", e), true),
     };
     if !canonical.starts_with(&root_canonical) {
@@ -328,34 +320,29 @@ pub fn handle_read_file(xg: &Xgrep, params: &Value) -> (String, bool) {
 
     let content = match std::fs::read_to_string(&canonical) {
         Ok(c) => c,
-        Err(e) => return (format!("Cannot read file '{}': {}", path, e), true),
+        Err(e) => return (format!("Cannot read file '{}': {}", p.path, e), true),
     };
 
     let lines: Vec<&str> = content.lines().collect();
 
     if lines.is_empty() {
-        return (format!("## {}\n\nFile is empty.\n", path), false);
+        return (format!("## {}\n\nFile is empty.\n", p.path), false);
     }
 
-    let start = match param_u64(params, "start_line") {
-        Ok(v) => v.unwrap_or(1) as usize,
-        Err(e) => return (e, true),
-    };
-    let end = match param_u64(params, "end_line") {
-        Ok(v) => v.unwrap_or(lines.len() as u64) as usize,
-        Err(e) => return (e, true),
-    };
+    let start = p.start_line.unwrap_or(1).max(1).min(lines.len());
+    let end = p
+        .end_line
+        .unwrap_or(lines.len())
+        .max(start)
+        .min(lines.len());
 
-    let start = start.max(1).min(lines.len());
-    let end = end.max(start).min(lines.len());
-
-    let lang = std::path::Path::new(path)
+    let lang = std::path::Path::new(&p.path)
         .extension()
         .and_then(|e| e.to_str())
         .map(output::lang_from_ext)
         .unwrap_or("");
 
-    let mut output = format!("## {}:{}-{}\n\n```{}\n", path, start, end, lang);
+    let mut output = format!("## {}:{}-{}\n\n```{}\n", p.path, start, end, lang);
     for (i, line) in lines[start - 1..end].iter().enumerate() {
         output.push_str(&format!("{:4} | {}\n", start + i, line));
     }
@@ -397,17 +384,17 @@ mod tests {
         let root = dir.path();
 
         // git init
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["init"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.email", "test@test.com"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.name", "test"])
             .current_dir(root)
             .output()
@@ -425,12 +412,12 @@ mod tests {
         )
         .unwrap();
 
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -459,6 +446,65 @@ mod tests {
         assert!(!is_error);
         assert!(output.contains("hello"));
         assert!(output.contains("definitions"));
+    }
+
+    #[test]
+    fn test_handle_find_definitions_missing_symbol() {
+        let (_dir, xg) = setup_test_repo();
+        let params = serde_json::json!({});
+        let (output, is_error) = handle_find_definitions(&xg, &params);
+        assert!(is_error);
+        assert!(output.contains("Invalid parameters"));
+        assert!(output.contains("symbol"));
+    }
+
+    #[test]
+    fn test_handle_find_definitions_no_truncation() {
+        let (_dir, xg) = setup_test_repo();
+        // max_results=100 >> actual results (1), so no truncation signal
+        let params = serde_json::json!({"symbol": "hello", "max_results": 100});
+        let (output, is_error) = handle_find_definitions(&xg, &params);
+        assert!(!is_error, "unexpected error: {}", output);
+        assert!(output.contains("Found"));
+        assert!(output.contains("definitions"));
+        assert!(!output.contains("limited to"));
+    }
+
+    #[test]
+    fn test_handle_find_definitions_truncation_signal() {
+        let (dir, xg) = setup_test_repo();
+        // Add extra files so there are many fn/struct matches
+        fs::write(
+            dir.path().join("extra.rs"),
+            "fn hello() {}\nfn hello_world() {}\n",
+        )
+        .unwrap();
+        crate::git::git_cmd()
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["commit", "-m", "add extra"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        xg.build_index().unwrap();
+
+        // max_results=1 forces truncation when hello matches in both files
+        let params = serde_json::json!({"symbol": "hello", "max_results": 1});
+        let (output, is_error) = handle_find_definitions(&xg, &params);
+        assert!(!is_error, "unexpected error: {}", output);
+        assert!(
+            output.contains("limited to"),
+            "expected truncation signal in: {}",
+            output
+        );
+        assert!(
+            output.contains("max_results"),
+            "expected max_results hint in: {}",
+            output
+        );
     }
 
     #[test]
@@ -507,7 +553,8 @@ mod tests {
         let params = serde_json::json!({});
         let (output, is_error) = handle_search(&xg, &params);
         assert!(is_error);
-        assert!(output.contains("Missing required parameter: pattern"));
+        assert!(output.contains("Invalid parameters"));
+        assert!(output.contains("pattern"));
     }
 
     #[test]
@@ -516,17 +563,17 @@ mod tests {
         let root = dir.path();
 
         // git init
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["init"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.email", "test@test.com"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.name", "test"])
             .current_dir(root)
             .output()
@@ -539,12 +586,12 @@ mod tests {
             .collect();
         fs::write(root.join("a.rs"), &content).unwrap();
 
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -650,7 +697,7 @@ mod tests {
         let params = serde_json::json!({"pattern": "hello", "max_results": "not_a_number"});
         let (output, is_error) = handle_search(&xg, &params);
         assert!(is_error);
-        assert!(output.contains("must be an integer"));
+        assert!(output.contains("Invalid parameters"));
     }
 
     #[test]
@@ -659,7 +706,7 @@ mod tests {
         let params = serde_json::json!({"pattern": "hello", "regex": "yes"});
         let (output, is_error) = handle_search(&xg, &params);
         assert!(is_error);
-        assert!(output.contains("must be a boolean"));
+        assert!(output.contains("Invalid parameters"));
     }
 
     #[test]
@@ -668,6 +715,6 @@ mod tests {
         let params = serde_json::json!({"pattern": "hello", "max_results": -5});
         let (output, is_error) = handle_search(&xg, &params);
         assert!(is_error);
-        assert!(output.contains("non-negative"));
+        assert!(output.contains("Invalid parameters"));
     }
 }

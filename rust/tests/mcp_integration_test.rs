@@ -178,7 +178,7 @@ fn test_mcp_input_validation_error() {
     let text = responses[1]["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(text.contains("must be an integer"));
+    assert!(text.contains("Invalid parameters"));
     assert_eq!(responses[1]["result"]["isError"], true);
 }
 
