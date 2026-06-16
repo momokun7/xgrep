@@ -1,0 +1,27 @@
+[package]
+name = "xgrep-pyo3"
+version = "0.5.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "_xg"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "xg"
+path = "src/main.rs"
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+xgrep-search = { path = "../rust" }
+pyo3 = "0.22"
+mimalloc = { version = "0.1", default-features = false }
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
