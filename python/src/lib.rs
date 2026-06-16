@@ -4,11 +4,11 @@ use pyo3::prelude::*;
 #[pyclass]
 pub struct SearchResult {
     #[pyo3(get)]
-    pub file: String,
+    file: String,
     #[pyo3(get)]
-    pub line_number: u32,
+    line_number: u32,
     #[pyo3(get)]
-    pub line: String,
+    line: String,
 }
 
 #[pymethods]
@@ -24,24 +24,30 @@ impl SearchResult {
 #[pyclass]
 pub struct IndexStatus {
     #[pyo3(get)]
-    pub state: String,
+    state: String,
     #[pyo3(get)]
-    pub changed_files: Option<u32>,
+    changed_files: Option<u32>,
     #[pyo3(get)]
-    pub indexed_files: u32,
+    indexed_files: u32,
     #[pyo3(get)]
-    pub index_size_bytes: i64,
+    index_size_bytes: i64,
     #[pyo3(get)]
-    pub index_path: String,
+    index_path: String,
 }
 
 #[pymethods]
 impl IndexStatus {
     fn __repr__(&self) -> String {
-        format!(
-            "IndexStatus(state={:?}, indexed_files={})",
-            self.state, self.indexed_files
-        )
+        match self.changed_files {
+            Some(n) => format!(
+                "IndexStatus(state={:?}, indexed_files={}, changed_files={})",
+                self.state, self.indexed_files, n
+            ),
+            None => format!(
+                "IndexStatus(state={:?}, indexed_files={})",
+                self.state, self.indexed_files
+            ),
+        }
     }
 }
 
@@ -116,14 +122,23 @@ impl Xgrep {
             .inner
             .search(pattern, &opts)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(results
+        let py_results = results
             .into_iter()
-            .map(|r| SearchResult {
-                file: r.file.to_string(),
-                line_number: r.line_number as u32,
-                line: r.line,
+            .map(|r| {
+                let line_number = u32::try_from(r.line_number).map_err(|_| {
+                    PyRuntimeError::new_err(format!(
+                        "line_number {} overflows u32",
+                        r.line_number
+                    ))
+                })?;
+                Ok(SearchResult {
+                    file: r.file.to_string(),
+                    line_number,
+                    line: r.line,
+                })
             })
-            .collect())
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(py_results)
     }
 
     pub fn index_status(&self) -> PyResult<IndexStatus> {
@@ -134,15 +149,15 @@ impl Xgrep {
         let (state, changed_files) = match info.state {
             xgrep_search::IndexState::Fresh => ("fresh".to_string(), None),
             xgrep_search::IndexState::Stale { changed_files } => {
-                ("stale".to_string(), Some(changed_files as u32))
+                ("stale".to_string(), Some(u32::try_from(changed_files).unwrap_or(u32::MAX)))
             }
             xgrep_search::IndexState::Missing => ("missing".to_string(), None),
         };
         Ok(IndexStatus {
             state,
             changed_files,
-            indexed_files: info.indexed_files as u32,
-            index_size_bytes: info.index_size_bytes as i64,
+            indexed_files: u32::try_from(info.indexed_files).unwrap_or(u32::MAX),
+            index_size_bytes: i64::try_from(info.index_size_bytes).unwrap_or(i64::MAX),
             index_path: info.index_path.to_string_lossy().to_string(),
         })
     }
