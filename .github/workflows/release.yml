@@ -281,7 +281,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -303,7 +303,7 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-wheels-${{ matrix.target }}
           path: python/target/wheels/*.whl
@@ -321,7 +321,7 @@ jobs:
       name: pypi
       url: https://pypi.org/project/xgrep-search/
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # setup-python v5
@@ -330,7 +330,7 @@ jobs:
       - name: Install maturin
         run: pip install "maturin==1.8.3"
       - name: Download all Python wheels
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: python-wheels-*
           path: python/dist
@@ -339,8 +339,9 @@ jobs:
         run: ls -la python/dist/
       - name: Publish (idempotent, OIDC Trusted Publishing)
         working-directory: python
+        env:
+          RELEASE_VERSION: ${{ needs.create-release.outputs.version }}
         run: |
-          RELEASE_VERSION="${{ needs.create-release.outputs.version }}"
           if pip index versions xgrep-search 2>/dev/null | grep -q "($RELEASE_VERSION)"; then
             echo "::warning::xgrep-search $RELEASE_VERSION already published on PyPI — skipping."
           else
