@@ -259,6 +259,94 @@ jobs:
             npm publish --access public
           fi
 
+  build-python:
+    name: Build Python wheel (${{ matrix.target }})
+    needs: [create-release]
+    if: always() && needs.create-release.result == 'success'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # setup-python v5
+        with:
+          python-version: "3.11"
+      - name: Install maturin
+        run: pip install "maturin==1.8.3"
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build wheel
+        working-directory: python
+        run: maturin build --release --target ${{ matrix.target }} --features extension-module
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: python-wheels-${{ matrix.target }}
+          path: python/target/wheels/*.whl
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [create-release, build-python]
+    if: always() && needs.create-release.result == 'success' && needs.build-python.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/project/xgrep-search/
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # setup-python v5
+        with:
+          python-version: "3.11"
+      - name: Install maturin
+        run: pip install "maturin==1.8.3"
+      - name: Download all Python wheels
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v4
+        with:
+          pattern: python-wheels-*
+          path: python/dist
+          merge-multiple: true
+      - name: List wheels
+        run: ls -la python/dist/
+      - name: Publish (idempotent, OIDC Trusted Publishing)
+        working-directory: python
+        run: |
+          RELEASE_VERSION="${{ needs.create-release.outputs.version }}"
+          if pip index versions xgrep-search 2>/dev/null | grep -q "($RELEASE_VERSION)"; then
+            echo "::warning::xgrep-search $RELEASE_VERSION already published on PyPI — skipping."
+          else
+            maturin upload --skip-existing dist/*.whl
+          fi
+
   publish-release:
     name: Publish Release
     needs: [create-release, build-release]
