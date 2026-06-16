@@ -812,23 +812,21 @@ mod tests {
     /// --fresh search must not double the path (e.g., /repo/sub/sub/file).
     #[test]
     fn test_fresh_search_in_git_subdirectory_no_path_doubling() {
-        use std::process::Command;
-
         let dir = tempfile::tempdir().unwrap();
         let git_root = dir.path();
 
         // Initialize git repo at top level
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["init"])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.email", "test@test.com"])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.name", "test"])
             .current_dir(git_root)
             .output()
@@ -840,12 +838,12 @@ mod tests {
         std::fs::write(sub.join("hello.rs"), "pub fn hello() { }").unwrap();
 
         // Initial commit
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["add", "."])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["commit", "-m", "initial"])
             .current_dir(git_root)
             .output()
@@ -884,22 +882,20 @@ mod tests {
     /// Ensures search_changed also uses correct paths.
     #[test]
     fn test_changed_search_in_git_subdirectory() {
-        use std::process::Command;
-
         let dir = tempfile::tempdir().unwrap();
         let git_root = dir.path();
 
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["init"])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.email", "test@test.com"])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.name", "test"])
             .current_dir(git_root)
             .output()
@@ -909,12 +905,12 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("lib.rs"), "fn original() {}").unwrap();
 
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["add", "."])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        crate::git::git_cmd()
             .args(["commit", "-m", "initial"])
             .current_dir(git_root)
             .output()
@@ -1102,7 +1098,7 @@ mod tests {
         // since_files() 経由でテストする
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["init"])
             .current_dir(root)
             .output()
