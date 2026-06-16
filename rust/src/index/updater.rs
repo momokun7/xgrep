@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
-use crate::git::git_toplevel;
+use crate::git::{git_cmd, git_toplevel};
 use ignore::WalkBuilder;
 
 /// Index freshness check result.
@@ -84,7 +84,7 @@ fn convert_git_path(prefix: &Option<PathBuf>, git_rel_path: &str) -> Option<Path
 
 /// Get the current git HEAD commit hash.
 fn current_commit_hash(root: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = git_cmd()
         .args(["rev-parse", "HEAD"])
         .current_dir(root)
         .output()
@@ -189,7 +189,7 @@ fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<
 
     // Staged + unstaged changes (tracked files only)
     // -uno excludes untracked files to prevent hangs in large repositories
-    let output = std::process::Command::new("git")
+    let output = git_cmd()
         .args(["status", "--porcelain", "-uno"])
         .current_dir(root)
         .output()?;
@@ -204,7 +204,7 @@ fn collect_uncommitted_changes(root: &Path) -> Result<std::collections::HashSet<
     // Untracked files (fast enumeration respecting .gitignore)
     // Using ls-files --others instead of git status --porcelain
     // to stay fast even with large numbers of untracked files like node_modules
-    let output = std::process::Command::new("git")
+    let output = git_cmd()
         .args(["ls-files", "--others", "--exclude-standard"])
         .current_dir(root)
         .output()?;
@@ -229,7 +229,7 @@ fn changed_files_since(root: &Path, old_hash: &str) -> Result<Vec<PathBuf>> {
     let mut files = std::collections::HashSet::new();
 
     // Committed changes: old_hash..HEAD
-    let output = std::process::Command::new("git")
+    let output = git_cmd()
         .args([
             "diff-tree",
             "-r",
@@ -288,7 +288,7 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
                 // Same commit: only check staged/unstaged changes (fast path)
                 // Skip git ls-files --others to save ~170ms
                 let prefix = git_toplevel(root).and_then(|tl| root_prefix_in_git(&tl, root));
-                let output = std::process::Command::new("git")
+                let output = git_cmd()
                     .args(["status", "--porcelain", "-uno"])
                     .current_dir(root)
                     .output()?;
@@ -415,21 +415,16 @@ pub fn ensure_fresh_index(root: &Path, index_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use tempfile::tempdir;
 
     fn init_git_repo(dir: &Path) {
-        Command::new("git")
-            .args(["init"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        Command::new("git")
+        git_cmd().args(["init"]).current_dir(dir).output().unwrap();
+        git_cmd()
             .args(["config", "user.email", "test@test.com"])
             .current_dir(dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["config", "user.name", "test"])
             .current_dir(dir)
             .output()
@@ -456,12 +451,12 @@ mod tests {
         // Add index files to .gitignore so git status does not detect them
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -486,12 +481,12 @@ mod tests {
         let root = dir.path();
         init_git_repo(root);
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -505,12 +500,12 @@ mod tests {
         // Create a new commit
         std::thread::sleep(std::time::Duration::from_millis(100));
         fs::write(root.join("new_file.txt"), "new content").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "add file"])
             .current_dir(root)
             .output()
@@ -546,12 +541,12 @@ mod tests {
         let root = dir.path();
         init_git_repo(root);
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -578,12 +573,12 @@ mod tests {
         let root = dir.path();
         init_git_repo(root);
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -645,12 +640,12 @@ mod tests {
         init_git_repo(root);
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -670,12 +665,12 @@ mod tests {
         init_git_repo(root);
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -713,12 +708,12 @@ mod tests {
         init_git_repo(root);
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -793,12 +788,12 @@ mod tests {
         init_git_repo(root);
         fs::write(root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()
@@ -809,12 +804,12 @@ mod tests {
 
         // New commit
         fs::write(root.join("new_file.txt"), "new content").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "add file"])
             .current_dir(root)
             .output()
@@ -887,12 +882,12 @@ mod tests {
         fs::write(sub_dir.join("file.rs"), "fn main() {}").unwrap();
         fs::write(git_root.join("root_file.txt"), "root").unwrap();
 
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(git_root)
             .output()
@@ -941,12 +936,12 @@ mod tests {
         fs::write(git_root.join(".gitignore"), "*.xgrep\n*.meta\n*.cache\n").unwrap();
         fs::write(sub_dir.join("file.rs"), "fn main() {}").unwrap();
 
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(git_root)
             .output()
@@ -989,12 +984,12 @@ mod tests {
         fs::write(sub_dir.join("a.txt"), "hello").unwrap();
         fs::write(git_root.join("root.txt"), "root").unwrap();
 
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(git_root)
             .output()
@@ -1005,12 +1000,12 @@ mod tests {
         // New commit with changes in both locations
         fs::write(sub_dir.join("a.txt"), "changed").unwrap();
         fs::write(git_root.join("root.txt"), "changed root").unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["add", "."])
             .current_dir(git_root)
             .output()
             .unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["commit", "-m", "changes"])
             .current_dir(git_root)
             .output()

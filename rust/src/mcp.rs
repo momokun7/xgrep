@@ -251,17 +251,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["init"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.email", "test@test.com"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["config", "user.name", "test"])
             .current_dir(root)
             .output()
@@ -274,12 +274,12 @@ mod tests {
         )
         .unwrap();
 
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["commit", "-m", "init"])
             .current_dir(root)
             .output()

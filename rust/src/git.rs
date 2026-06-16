@@ -3,9 +3,23 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Create a git Command with hook-injected GIT_DIR/GIT_INDEX_FILE cleared.
+///
+/// Pre-commit hooks set GIT_DIR and GIT_INDEX_FILE in the environment. Without
+/// this cleanup, git subprocesses spawned from tests during the hook would use
+/// the hook's repository instead of the test's own temp git repo.
+pub(crate) fn git_cmd() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR");
+    cmd
+}
+
 /// Check if the directory is a git repository.
 pub fn is_git_repo(root: &Path) -> bool {
-    Command::new("git")
+    git_cmd()
         .args(["rev-parse", "--git-dir"])
         .current_dir(root)
         .output()
@@ -15,7 +29,7 @@ pub fn is_git_repo(root: &Path) -> bool {
 
 /// Get the git repository root directory.
 pub(crate) fn git_toplevel(root: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
+    let output = git_cmd()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(root)
         .output()
@@ -82,7 +96,7 @@ pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = HashSet::new();
 
     // unstaged changes
-    let output = Command::new("git")
+    let output = git_cmd()
         .args(["diff", "--name-only"])
         .current_dir(root)
         .output()?;
@@ -93,7 +107,7 @@ pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
     ));
 
     // staged changes
-    let output = Command::new("git")
+    let output = git_cmd()
         .args(["diff", "--cached", "--name-only"])
         .current_dir(root)
         .output()?;
@@ -115,7 +129,7 @@ pub fn since_files(root: &Path, duration: &str) -> Result<Vec<PathBuf>> {
     }
 
     let output = if let Some(since_str) = parse_duration(duration)? {
-        Command::new("git")
+        git_cmd()
             .args([
                 "log",
                 &format!("--since={since_str}"),
@@ -127,7 +141,7 @@ pub fn since_files(root: &Path, duration: &str) -> Result<Vec<PathBuf>> {
     } else {
         // commits mode: "3.commits" -> git log -3
         let n: &str = duration.split('.').next().unwrap();
-        Command::new("git")
+        git_cmd()
             .args(["log", &format!("-{n}"), "--name-only", "--pretty=format:"])
             .current_dir(root)
             .output()?

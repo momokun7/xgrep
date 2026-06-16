@@ -560,7 +560,7 @@ mod tests {
         fs::write(root.join("debug.log"), "should be ignored").unwrap();
 
         // Need to init git repo for .gitignore to work
-        std::process::Command::new("git")
+        crate::git::git_cmd()
             .args(["init"])
             .current_dir(root)
             .output()
