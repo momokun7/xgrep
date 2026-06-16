@@ -12,9 +12,9 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
+      release_created: ${{ steps.release.outputs['rust--release_created'] }}
+      tag_name: ${{ steps.release.outputs['rust--tag_name'] }}
+      version: ${{ steps.release.outputs['rust--version'] }}
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
