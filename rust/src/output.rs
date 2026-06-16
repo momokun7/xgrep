@@ -44,7 +44,7 @@ pub fn format_json(results: &[SearchResult]) -> String {
         .iter()
         .map(|r| {
             serde_json::json!({
-                "file": r.file,
+                "file": &*r.file,
                 "line_number": r.line_number,
                 "line": r.line
             })
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn test_format_json() {
         let results = vec![SearchResult {
-            file: "src/main.rs".to_string(),
+            file: "src/main.rs".into(),
             line_number: 42,
             line: "fn handle_auth() {}".to_string(),
         }];
@@ -259,12 +259,12 @@ mod tests {
     fn test_format_json_multiple() {
         let results = vec![
             SearchResult {
-                file: "a.rs".to_string(),
+                file: "a.rs".into(),
                 line_number: 1,
                 line: "foo".to_string(),
             },
             SearchResult {
-                file: "b.rs".to_string(),
+                file: "b.rs".into(),
                 line_number: 2,
                 line: "bar".to_string(),
             },
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn test_format_default() {
         let results = vec![SearchResult {
-            file: "src/main.rs".to_string(),
+            file: "src/main.rs".into(),
             line_number: 42,
             line: "    fn handle_auth() {}".to_string(),
         }];
@@ -290,12 +290,12 @@ mod tests {
     fn test_format_default_multiple() {
         let results = vec![
             SearchResult {
-                file: "a.rs".to_string(),
+                file: "a.rs".into(),
                 line_number: 1,
                 line: "foo".to_string(),
             },
             SearchResult {
-                file: "b.rs".to_string(),
+                file: "b.rs".into(),
                 line_number: 10,
                 line: "bar".to_string(),
             },
@@ -327,7 +327,7 @@ mod tests {
         )
         .unwrap();
         let results = vec![SearchResult {
-            file: "test.rs".to_string(),
+            file: "test.rs".into(),
             line_number: 3,
             line: "fn hello() {}".to_string(),
         }];
@@ -346,12 +346,12 @@ mod tests {
         fs::write(root.join("test.rs"), "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8").unwrap();
         let results = vec![
             SearchResult {
-                file: "test.rs".to_string(),
+                file: "test.rs".into(),
                 line_number: 3,
                 line: "l3".to_string(),
             },
             SearchResult {
-                file: "test.rs".to_string(),
+                file: "test.rs".into(),
                 line_number: 5,
                 line: "l5".to_string(),
             },
@@ -371,7 +371,7 @@ mod tests {
         )
         .unwrap();
         let results = vec![SearchResult {
-            file: "test.rs".to_string(),
+            file: "test.rs".into(),
             line_number: 3,
             line: "match_line".to_string(),
         }];
@@ -400,7 +400,7 @@ mod tests {
         let root = dir.path();
         fs::write(root.join("Makefile"), "all:\n\techo hello\n\techo done").unwrap();
         let results = vec![SearchResult {
-            file: "Makefile".to_string(),
+            file: "Makefile".into(),
             line_number: 2,
             line: "\techo hello".to_string(),
         }];
@@ -416,7 +416,7 @@ mod tests {
         let root = dir.path();
         fs::write(root.join("test.rs"), "line1\nline2\nline3\nline4\nline5").unwrap();
         let results = vec![SearchResult {
-            file: "test.rs".to_string(),
+            file: "test.rs".into(),
             line_number: 3,
             line: "line3".to_string(),
         }];
@@ -447,7 +447,7 @@ mod tests {
         for file in &["a.rs", "b.rs", "c.rs"] {
             for i in (2..=10).step_by(2) {
                 results.push(SearchResult {
-                    file: file.to_string(),
+                    file: (*file).into(),
                     line_number: i,
                     line: format!("line number {}", i),
                 });
@@ -496,7 +496,7 @@ mod tests {
         fs::write(root.join("a.rs"), "line1\nline2\nline3").unwrap();
 
         let results = vec![SearchResult {
-            file: "a.rs".to_string(),
+            file: "a.rs".into(),
             line_number: 2,
             line: "line2".to_string(),
         }];
@@ -516,7 +516,7 @@ mod tests {
         )
         .unwrap();
         let results = vec![SearchResult {
-            file: "test.rs".to_string(),
+            file: "test.rs".into(),
             line_number: 3,
             line: "match_line".to_string(),
         }];
@@ -534,7 +534,7 @@ mod tests {
         let root = dir.path();
         fs::write(root.join("test.rs"), "l1\nl2\nl3\nl4\nl5").unwrap();
         let results = vec![SearchResult {
-            file: "test.rs".to_string(),
+            file: "test.rs".into(),
             line_number: 3,
             line: "l3".to_string(),
         }];
@@ -553,12 +553,12 @@ mod tests {
         fs::write(root.join("test.rs"), "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8").unwrap();
         let results = vec![
             SearchResult {
-                file: "test.rs".to_string(),
+                file: "test.rs".into(),
                 line_number: 2,
                 line: "l2".to_string(),
             },
             SearchResult {
-                file: "test.rs".to_string(),
+                file: "test.rs".into(),
                 line_number: 5,
                 line: "l5".to_string(),
             },

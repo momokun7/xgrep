@@ -8,6 +8,7 @@ use regex::RegexBuilder;
 use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// ASCII-only case-insensitive contains check (for testing).
 /// Uses memmem::Finder internally to verify with the same algorithm as production code.
@@ -53,7 +54,7 @@ fn line_start(line_offsets: &[usize], line_num: usize) -> usize {
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    pub file: String,
+    pub file: Arc<str>,
     pub line_number: usize,
     pub line: String,
 }
@@ -81,6 +82,7 @@ impl Matcher for LiteralMatcher {
         }
 
         // Only build line offsets when we know there's at least one match
+        let file: Arc<str> = Arc::from(rel_path);
         let line_offsets = build_line_offsets(content);
         let mut results = Vec::new();
         let mut pos = 0;
@@ -96,7 +98,7 @@ impl Matcher for LiteralMatcher {
             let line = std::str::from_utf8(&content[ls..line_end]).unwrap_or("<binary>");
 
             results.push(SearchResult {
-                file: rel_path.to_string(),
+                file: Arc::clone(&file),
                 line_number: line_num,
                 line: line.to_string(),
             });
@@ -131,6 +133,7 @@ impl Matcher for CaseInsensitiveMatcher {
 
         // Match found — scan lowered content line by line to identify matching lines,
         // but return the original (non-lowered) line text.
+        let file: Arc<str> = Arc::from(rel_path);
         let mut results = Vec::new();
         let mut line_num = 0usize;
         let mut start = 0usize;
@@ -146,7 +149,7 @@ impl Matcher for CaseInsensitiveMatcher {
                 let original_line = &content[start..line_end];
                 let line = std::str::from_utf8(original_line).unwrap_or("<binary>");
                 results.push(SearchResult {
-                    file: rel_path.to_string(),
+                    file: Arc::clone(&file),
                     line_number: line_num,
                     line: line.to_string(),
                 });
@@ -176,11 +179,12 @@ impl Matcher for RegexMatcher {
             return vec![];
         }
 
+        let file: Arc<str> = Arc::from(rel_path);
         let mut results = Vec::new();
         for (i, line) in content_str.lines().enumerate() {
             if self.re.is_match(line) {
                 results.push(SearchResult {
-                    file: rel_path.to_string(),
+                    file: Arc::clone(&file),
                     line_number: i + 1,
                     line: line.to_string(),
                 });
@@ -767,7 +771,7 @@ mod tests {
         let reader = IndexReader::open(&index_path).unwrap();
         let results = search(&reader, root, "hello world", true, false).unwrap();
         assert_eq!(results.len(), 3);
-        let mut files: Vec<&str> = results.iter().map(|r| r.file.as_str()).collect();
+        let mut files: Vec<&str> = results.iter().map(|r| r.file.as_ref()).collect();
         files.sort();
         assert!(files.iter().any(|f| f.contains("upper.txt")));
         assert!(files.iter().any(|f| f.contains("lower.txt")));

@@ -457,7 +457,7 @@ fn run() -> Result<()> {
                     let abs_results: Vec<_> = results
                         .iter()
                         .map(|r| xgrep_search::SearchResult {
-                            file: make_path(&r.file),
+                            file: make_path(&r.file).into(),
                             line_number: r.line_number,
                             line: r.line.clone(),
                         })
@@ -498,7 +498,7 @@ fn run() -> Result<()> {
                             let abs_results: Vec<_> = results
                                 .iter()
                                 .map(|r| xgrep_search::SearchResult {
-                                    file: make_path(&r.file),
+                                    file: make_path(&r.file).into(),
                                     line_number: r.line_number,
                                     line: r.line.clone(),
                                 })
