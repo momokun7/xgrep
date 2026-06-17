@@ -4,6 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "xgrep-search"
+description = "Ultra-fast indexed code search engine with MCP server for AI coding tools."
+readme = "../README.md"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
