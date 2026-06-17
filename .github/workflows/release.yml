@@ -320,7 +320,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install maturin
-        run: pip install -r python/requirements-build.txt
+        run: pip install --require-hashes -r python/requirements-build.txt
       - name: Build wheel
         working-directory: python
         run: maturin build --release --target ${{ matrix.target }} --features extension-module
@@ -354,7 +354,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install maturin
-        run: pip install -r python/requirements-build.txt
+        run: pip install --require-hashes -r python/requirements-build.txt
       - name: Download all Python wheels
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
