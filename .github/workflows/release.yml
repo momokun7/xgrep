@@ -10,6 +10,8 @@ on:
         description: "Release tag (e.g. v0.4.2)"
         required: true
 
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -254,8 +256,6 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - name: Ensure npm supports trusted publishing (OIDC)
-        run: npm install -g npm@latest
       - name: Download all artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
