@@ -335,7 +335,13 @@ jobs:
       - name: Sync python version with release version
         env:
           RELEASE_VERSION: ${{ needs.create-release.outputs.version }}
-        run: sed -i.bak "s/^version = .*/version = \"$RELEASE_VERSION\"/" python/Cargo.toml && rm -f python/Cargo.toml.bak
+        shell: python3 {0}
+        run: |
+          import re, os
+          path = 'python/Cargo.toml'
+          content = open(path).read()
+          content = re.sub(r'^version\s*=\s*"[^"]+"', 'version = "' + os.environ['RELEASE_VERSION'] + '"', content, flags=re.MULTILINE)
+          open(path, 'w').write(content)
       - name: Install maturin
         run: pip install --require-hashes -r python/requirements-build.txt
       - name: Build wheel
