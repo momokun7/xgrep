@@ -3,16 +3,6 @@
   "release-type": "rust",
   "include-component-in-tag": false,
   "packages": {
-    "rust": {},
-    "python": {
-      "release-type": "python",
-      "extra-files": [
-        {
-          "type": "toml",
-          "path": "python/Cargo.toml",
-          "jsonpath": "$.package.version"
-        }
-      ]
-    }
+    "rust": {}
   }
 }
