@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/momokun7/xgrep/compare/v0.6.0...v0.6.1) (2026-06-17)
+
+
+### Bug Fixes
+
+* RUSTSEC-2026-0097 修正（rand 更新）+ pip install ハッシュ固定 ([#63](https://github.com/momokun7/xgrep/issues/63)) ([4551e4f](https://github.com/momokun7/xgrep/commit/4551e4fbc32c9d47de9e5537fa2ac4b78a98f1b8))
+
 ## [0.6.0](https://github.com/momokun7/xgrep/compare/v0.5.0...v0.6.0) (2026-06-16)
 
 
