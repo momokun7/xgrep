@@ -163,6 +163,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
         id: auth
+      - name: Copy README for crates.io
+        run: cp README.md rust/README.md
       - name: Publish (idempotent)
         working-directory: rust
         env:
