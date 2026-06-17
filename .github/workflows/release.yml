@@ -44,12 +44,18 @@ jobs:
         name: Extract and verify version
         env:
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          CARGO_VERSION=$(grep '^version' rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          EXPECTED="v${CARGO_VERSION}"
-          if [ "$RELEASE_TAG" != "$EXPECTED" ]; then
-            echo "ERROR: Tag '$RELEASE_TAG' does not match Cargo.toml version '$CARGO_VERSION'"
-            exit 1
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            CARGO_VERSION="${RELEASE_TAG#v}"
+            echo "Release $RELEASE_TAG already exists — using version from tag: $CARGO_VERSION"
+          else
+            CARGO_VERSION=$(grep '^version' rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            EXPECTED="v${CARGO_VERSION}"
+            if [ "$RELEASE_TAG" != "$EXPECTED" ]; then
+              echo "ERROR: Tag '$RELEASE_TAG' does not match Cargo.toml version '$CARGO_VERSION'"
+              exit 1
+            fi
           fi
           echo "version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release (idempotent)
@@ -171,10 +177,10 @@ jobs:
         working-directory: rust
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          RELEASE_VERSION: ${{ needs.create-release.outputs.version }}
         run: |
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if cargo search xgrep-search --limit 1 2>/dev/null | grep -q "\"$CARGO_VERSION\""; then
-            echo "::warning::xgrep-search $CARGO_VERSION already published on crates.io — skipping. If the tag was moved to a new commit, bump the version (e.g. v${CARGO_VERSION%.*}.$((${CARGO_VERSION##*.} + 1))) instead of re-tagging."
+          if cargo search xgrep-search --limit 1 2>/dev/null | grep -q "\"$RELEASE_VERSION\""; then
+            echo "::warning::xgrep-search $RELEASE_VERSION already published on crates.io — skipping."
           else
             cargo publish --allow-dirty
           fi
