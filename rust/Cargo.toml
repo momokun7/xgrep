@@ -2,7 +2,7 @@
 name = "xgrep-search"
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.74"
 description = "Ultra-fast indexed code search engine with MCP server for AI coding tools."
 license = "MIT"
 readme = "../README.md"

@@ -122,7 +122,7 @@ pub fn build_index_with_cache(
         .build()
     {
         let entry = entry.map_err(|e| XgrepError::IndexError(e.to_string()))?;
-        if entry.file_type().is_none_or(|ft| !ft.is_file()) {
+        if entry.file_type().map_or(true, |ft| !ft.is_file()) {
             continue;
         }
         let path = entry.path().to_path_buf();
