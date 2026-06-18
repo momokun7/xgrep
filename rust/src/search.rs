@@ -285,6 +285,9 @@ pub(crate) fn search(
         );
     }
 
+    let perf = std::env::var_os("XGREP_PERF_TIMING").is_some();
+    let t0 = perf.then(std::time::Instant::now);
+
     let search_pattern = if case_insensitive {
         pattern.to_lowercase()
     } else {
@@ -301,6 +304,16 @@ pub(crate) fn search(
         case_insensitive,
     );
 
+    if let Some(t) = t0 {
+        eprintln!(
+            "[perf] index_phase: {:.1}ms  candidates={} / total_files={}",
+            t.elapsed().as_secs_f64() * 1000.0,
+            candidate_ids.len(),
+            reader.file_count(),
+        );
+    }
+    let t1 = perf.then(std::time::Instant::now);
+
     let results = if case_insensitive {
         let matcher = CaseInsensitiveMatcher {
             pattern_lower: search_pattern,
@@ -312,6 +325,14 @@ pub(crate) fn search(
         };
         scan_indexed(reader, root, &candidate_ids, &matcher, quiet)
     };
+
+    if let Some(t) = t1 {
+        eprintln!(
+            "[perf] scan_phase:  {:.1}ms  results={}",
+            t.elapsed().as_secs_f64() * 1000.0,
+            results.len(),
+        );
+    }
 
     Ok(results)
 }

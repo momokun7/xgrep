@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -73,5 +73,99 @@ fn bench_candidate_resolution(c: &mut Criterion) {
     );
 }
 
-criterion_group!(benches, bench_candidate_resolution,);
+/// Distributed pattern: needle appears in *every* file (worst-case for index filtering).
+/// Simulates patterns like `devm_kzalloc` that appear across the entire codebase.
+/// Reports candidate count and search time so we can see index_phase vs scan_phase ratio.
+fn create_distributed_corpus(dir: &Path, file_count: usize) {
+    let src_dir = dir.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    // ubiquitous token present in every file (simulates widely-used kernel symbol)
+    let ubiquitous = "pub fn xgrep_distributed_needle(x: usize) -> usize { x }\n";
+    // also include a rare token present in 1/100 files
+    let rare = "pub fn xgrep_rare_needle_unique() -> bool { true }\n";
+
+    for i in 0..file_count {
+        let mut content = format!("// Distributed corpus file {}\n", i);
+        content.push_str("use std::fmt;\npub struct Item {{ id: usize }}\n");
+        content.push_str(ubiquitous);
+        content.push_str(&format!(
+            "pub fn generated_fn_{}() -> usize {{ {} }}\n",
+            i, i
+        ));
+        if i % 100 == 0 {
+            content.push_str(rare);
+        }
+        let filename = format!("dist_{:04}.rs", i);
+        fs::write(src_dir.join(&filename), &content).unwrap();
+    }
+}
+
+fn bench_focused_vs_distributed(c: &mut Criterion) {
+    let file_counts = [500usize, 1000];
+    let mut group = c.benchmark_group("candidate_selectivity");
+
+    for &n in &file_counts {
+        // --- focused: rare needle, appears in 1/100 files ---
+        {
+            let tmp = TempDir::new().unwrap();
+            create_distributed_corpus(tmp.path(), n);
+            let xg = Xgrep::open_local(tmp.path())
+                .unwrap()
+                .with_config(Config { quiet: true });
+            xg.build_index().unwrap();
+
+            let expected_matches = n / 100;
+            group.bench_with_input(BenchmarkId::new("focused_1pct", n), &n, |b, _| {
+                b.iter(|| {
+                    let results = xg
+                        .search("xgrep_rare_needle_unique", &SearchOptions::default())
+                        .unwrap();
+                    criterion::black_box(results.len())
+                });
+            });
+            // Print match stats once outside the bench loop
+            let results = xg
+                .search("xgrep_rare_needle_unique", &SearchOptions::default())
+                .unwrap();
+            eprintln!(
+                "[focused_1pct n={}] expected≈{}, got={}",
+                n,
+                expected_matches,
+                results.len()
+            );
+        }
+
+        // --- distributed: ubiquitous needle, appears in every file ---
+        {
+            let tmp = TempDir::new().unwrap();
+            create_distributed_corpus(tmp.path(), n);
+            let xg = Xgrep::open_local(tmp.path())
+                .unwrap()
+                .with_config(Config { quiet: true });
+            xg.build_index().unwrap();
+
+            group.bench_with_input(BenchmarkId::new("distributed_100pct", n), &n, |b, _| {
+                b.iter(|| {
+                    let results = xg
+                        .search("xgrep_distributed_needle", &SearchOptions::default())
+                        .unwrap();
+                    criterion::black_box(results.len())
+                });
+            });
+            let results = xg
+                .search("xgrep_distributed_needle", &SearchOptions::default())
+                .unwrap();
+            eprintln!("[distributed_100pct n={}] got={}", n, results.len());
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_candidate_resolution,
+    bench_focused_vs_distributed
+);
 criterion_main!(benches);
