@@ -34,11 +34,23 @@ DS_SMALL="$SCRIPT_DIR/../rust/src"
 ZOEKT_IDX_DIR_LARGE="$BENCH_DIR/.zoekt-idx-large"
 ZOEKT_IDX_DIR_MEDIUM="$BENCH_DIR/.zoekt-idx-medium"
 
-# xgrep cache
-XGREP_CACHE="$HOME/Library/Caches/xgrep"
+# xgrep cache (macOS: ~/Library/Caches, Linux: ~/.cache per XDG)
+if [[ "$(uname)" == "Darwin" ]]; then
+    XGREP_CACHE="${HOME}/Library/Caches/xgrep"
+else
+    XGREP_CACHE="${XDG_CACHE_HOME:-${HOME}/.cache}/xgrep"
+fi
 
 # Queries
-QUERIES_LARGE=("struct file_operations" "printk" "EXPORT_SYMBOL")
+# Large: mix of focused (xg wins) and distributed (xg ties/loses) patterns.
+# The label comments show expected behaviour on a warm-cache Linux/SSD machine.
+QUERIES_LARGE=(
+    "CONFIG_PREEMPT_RT"         # focused   ~300 hits  → xg大幅優位
+    "struct file_operations"    # medium  ~2600 hits  → xgやや優位〜互角(環境依存)
+    "EXPORT_SYMBOL_GPL"         # distributed ~21000 hits → xgやや優位
+    "raw_spin_lock_irqsave"     # distributed ~1200 hits  → xg互角
+    "devm_kzalloc"              # distributed ~7400 hits  → xg不利(候補多すぎ)
+)
 QUERIES_MEDIUM=("fn main" "Options" "pub struct")
 QUERIES_SMALL=("fn search" "trigram")
 
@@ -109,14 +121,44 @@ file_count() {
   find "$1" -type f -not -path '*/\.*' -not -path '*/target/*' -not -path '*/node_modules/*' 2>/dev/null | wc -l | tr -d ' '
 }
 
-# Extract max RSS from /usr/bin/time -l output (macOS format)
+# Detect OS and select /usr/bin/time options accordingly.
+# macOS uses BSD time (-l), Linux uses GNU time (-v).
+if [[ "$(uname)" == "Darwin" ]]; then
+    TIME_OPTS="-l"
+    RSS_GREP="maximum resident set size"
+    RSS_FIELD=1
+else
+    TIME_OPTS="-v"
+    RSS_GREP="Maximum resident set size"
+    RSS_FIELD=6
+fi
+
+# Extract max RSS bytes from /usr/bin/time output (cross-platform).
+# macOS: "N maximum resident set size" (bytes)
+# Linux: "Maximum resident set size (kbytes): N" (kilobytes → convert to bytes)
 extract_max_rss() {
-  grep "maximum resident set size" | awk '{print $1}'
+    if [[ "$(uname)" == "Darwin" ]]; then
+        grep "maximum resident set size" | awk '{print $1}'
+    else
+        grep "Maximum resident set size" | awk '{print $NF * 1024}'
+    fi
 }
 
-# Extract wall clock from /usr/bin/time -l output (macOS: real line)
+# Extract wall clock seconds from /usr/bin/time output (cross-platform).
+# macOS: "N.NNN real"
+# Linux: "Elapsed (wall clock) time (h:mm:ss or m:ss): M:SS.ss"
 extract_wall_time() {
-  grep "real" | head -1 | awk '{print $1}'
+    if [[ "$(uname)" == "Darwin" ]]; then
+        grep "real" | head -1 | awk '{print $1}'
+    else
+        grep "wall clock" | awk '{
+            t = $NF
+            # t is [H:]M:SS.ss
+            n = split(t, parts, ":")
+            if (n == 3) { print parts[1]*3600 + parts[2]*60 + parts[3] }
+            else         { print parts[1]*60  + parts[2] }
+        }'
+    fi
 }
 
 ###############################################################################
@@ -145,11 +187,24 @@ log "Section 0: Environment"
   echo ""
   echo "| Item | Value |"
   echo "|------|-------|"
+  OS_NAME="$(sw_vers -productName 2>/dev/null || uname -s)"
+  OS_VER="$(sw_vers -productVersion 2>/dev/null || uname -r)"
+  CPU_MODEL="$(sysctl -n machdep.cpu.brand_string 2>/dev/null \
+    || grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs \
+    || uname -m)"
+  RAM_BYTES="$(sysctl -n hw.memsize 2>/dev/null \
+    || awk '/MemTotal/{print $2 * 1024}' /proc/meminfo 2>/dev/null \
+    || echo 0)"
+  RAM_GB="$(echo "scale=0; $RAM_BYTES / 1073741824" | bc)"
+  DISK_TYPE="$(diskutil info / 2>/dev/null | grep 'Solid State' | awk '{print $NF}' \
+    || (cat /sys/block/$(lsblk -nd -o NAME | head -1)/queue/rotational 2>/dev/null \
+        | awk '{print ($1==0)?"SSD":"HDD"}') \
+    || echo 'unknown')"
   echo "| Date | $(date '+%Y-%m-%d %H:%M:%S %Z') |"
-  echo "| OS | $(sw_vers -productName 2>/dev/null || uname -s) $(sw_vers -productVersion 2>/dev/null || uname -r) |"
-  echo "| CPU | $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m) |"
-  echo "| RAM | $(echo "scale=0; $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824" | bc)GB |"
-  echo "| Disk | $(diskutil info / 2>/dev/null | grep 'Solid State' | awk '{print $NF}' || echo 'unknown') |"
+  echo "| OS | $OS_NAME $OS_VER |"
+  echo "| CPU | $CPU_MODEL |"
+  echo "| RAM | ${RAM_GB}GB |"
+  echo "| Disk | $DISK_TYPE |"
   echo ""
   echo "### Tool Versions"
   echo ""
@@ -243,10 +298,11 @@ log "Section 2: Index build cost"
 log "  xgrep index build (large)..."
 rm -rf "$XGREP_CACHE"
 xgrep_build_out="$RESULTS_DIR/xgrep_build_time.txt"
-/usr/bin/time -l bash -c "cd '$DS_LARGE' && '$XGREP' init" > "$xgrep_build_out" 2>&1
-xgrep_build_wall=$(grep "real" "$xgrep_build_out" | awk '{print $1}')
-xgrep_build_rss=$(grep "maximum resident" "$xgrep_build_out" | awk '{print $1}')
-xgrep_build_footprint=$(grep "peak memory footprint" "$xgrep_build_out" | awk '{print $1}')
+/usr/bin/time $TIME_OPTS bash -c "cd '$DS_LARGE' && '$XGREP' init" > "$xgrep_build_out" 2>&1
+xgrep_build_wall=$(extract_wall_time < "$xgrep_build_out")
+xgrep_build_rss=$(extract_max_rss < "$xgrep_build_out")
+# peak memory footprint is macOS-only; fall back to RSS on Linux
+xgrep_build_footprint=$(grep "peak memory footprint" "$xgrep_build_out" 2>/dev/null | awk '{print $1}')
 xgrep_build_footprint=${xgrep_build_footprint:-$xgrep_build_rss}
 xgrep_idx_size=$(du -sh "$XGREP_CACHE" 2>/dev/null | awk '{print $1}')
 xgrep_idx_bytes=$(dir_size_bytes "$XGREP_CACHE")
@@ -258,9 +314,9 @@ log "  zoekt index build (large)..."
 rm -rf "$ZOEKT_IDX_DIR_LARGE"
 mkdir -p "$ZOEKT_IDX_DIR_LARGE"
 zoekt_build_out="$RESULTS_DIR/zoekt_build_time.txt"
-/usr/bin/time -l "$ZOEKT_INDEX" -index "$ZOEKT_IDX_DIR_LARGE" "$DS_LARGE" > "$zoekt_build_out" 2>&1
-zoekt_build_wall=$(grep "real" "$zoekt_build_out" | awk '{print $1}')
-zoekt_build_rss=$(grep "maximum resident" "$zoekt_build_out" | awk '{print $1}')
+/usr/bin/time $TIME_OPTS "$ZOEKT_INDEX" -index "$ZOEKT_IDX_DIR_LARGE" "$DS_LARGE" > "$zoekt_build_out" 2>&1
+zoekt_build_wall=$(extract_wall_time < "$zoekt_build_out")
+zoekt_build_rss=$(extract_max_rss < "$zoekt_build_out")
 zoekt_idx_size=$(du -sh "$ZOEKT_IDX_DIR_LARGE" 2>/dev/null | awk '{print $1}')
 zoekt_idx_bytes=$(dir_size_bytes "$ZOEKT_IDX_DIR_LARGE")
 zoekt_overhead=$(echo "scale=2; $zoekt_idx_bytes * 100 / $source_bytes" | bc)
@@ -293,31 +349,31 @@ COLD_QUERY="struct file_operations"
 log "  xgrep cold start..."
 rm -rf "$XGREP_CACHE"
 xgrep_cold_out="$RESULTS_DIR/xgrep_cold.txt"
-/usr/bin/time -l bash -c "
+/usr/bin/time $TIME_OPTS bash -c "
   cd '$DS_LARGE'
   '$XGREP' init >/dev/null 2>&1
   '$XGREP' '$COLD_QUERY' >/dev/null 2>&1
 " > "$xgrep_cold_out" 2>&1
-xgrep_cold_wall=$(grep "real" "$xgrep_cold_out" | awk '{print $1}')
+xgrep_cold_wall=$(extract_wall_time < "$xgrep_cold_out")
 
 # ripgrep cold start (no setup needed)
 log "  ripgrep cold start..."
 rg_cold_out="$RESULTS_DIR/rg_cold.txt"
 # Drop filesystem cache as much as possible (purge won't work without sudo, but sync helps)
 sync
-/usr/bin/time -l "$RG" "$COLD_QUERY" "$DS_LARGE" > /dev/null 2> "$rg_cold_out"
-rg_cold_wall=$(grep "real" "$rg_cold_out" | awk '{print $1}')
+/usr/bin/time $TIME_OPTS "$RG" "$COLD_QUERY" "$DS_LARGE" > /dev/null 2> "$rg_cold_out"
+rg_cold_wall=$(extract_wall_time < "$rg_cold_out")
 
 # zoekt cold start
 log "  zoekt cold start..."
 rm -rf "$ZOEKT_IDX_DIR_LARGE"
 mkdir -p "$ZOEKT_IDX_DIR_LARGE"
 zoekt_cold_out="$RESULTS_DIR/zoekt_cold.txt"
-/usr/bin/time -l bash -c "
+/usr/bin/time $TIME_OPTS bash -c "
   '$ZOEKT_INDEX' -index '$ZOEKT_IDX_DIR_LARGE' '$DS_LARGE' >/dev/null 2>&1
   '$ZOEKT' -index_dir '$ZOEKT_IDX_DIR_LARGE' '$COLD_QUERY' >/dev/null 2>&1
 " > "$zoekt_cold_out" 2>&1
-zoekt_cold_wall=$(grep "real" "$zoekt_cold_out" | awk '{print $1}')
+zoekt_cold_wall=$(extract_wall_time < "$zoekt_cold_out")
 
 {
   echo "Query: \`$COLD_QUERY\`"
@@ -529,18 +585,18 @@ rm -rf "$XGREP_CACHE"
 
 # xgrep search memory (cd into target dir, then run directly)
 xgrep_search_mem_out="$RESULTS_DIR/xgrep_search_mem.txt"
-(cd "$DS_LARGE" && /usr/bin/time -l "$XGREP" "$MEM_QUERY" > /dev/null) 2> "$xgrep_search_mem_out"
-xgrep_search_rss=$(grep "maximum resident" "$xgrep_search_mem_out" | awk '{print $1}')
+(cd "$DS_LARGE" && /usr/bin/time $TIME_OPTS "$XGREP" "$MEM_QUERY" > /dev/null) 2> "$xgrep_search_mem_out"
+xgrep_search_rss=$(extract_max_rss < "$xgrep_search_mem_out")
 
 # ripgrep search memory
 rg_search_mem_out="$RESULTS_DIR/rg_search_mem.txt"
-/usr/bin/time -l "$RG" "$MEM_QUERY" "$DS_LARGE" > /dev/null 2> "$rg_search_mem_out"
-rg_search_rss=$(grep "maximum resident" "$rg_search_mem_out" | awk '{print $1}')
+/usr/bin/time $TIME_OPTS "$RG" "$MEM_QUERY" "$DS_LARGE" > /dev/null 2> "$rg_search_mem_out"
+rg_search_rss=$(extract_max_rss < "$rg_search_mem_out")
 
 # zoekt search memory
 zoekt_search_mem_out="$RESULTS_DIR/zoekt_search_mem.txt"
-/usr/bin/time -l "$ZOEKT" -index_dir "$ZOEKT_IDX_DIR_LARGE" "$MEM_QUERY" > /dev/null 2> "$zoekt_search_mem_out"
-zoekt_search_rss=$(grep "maximum resident" "$zoekt_search_mem_out" | awk '{print $1}')
+/usr/bin/time $TIME_OPTS "$ZOEKT" -index_dir "$ZOEKT_IDX_DIR_LARGE" "$MEM_QUERY" > /dev/null 2> "$zoekt_search_mem_out"
+zoekt_search_rss=$(extract_max_rss < "$zoekt_search_mem_out")
 
 {
   echo "### Index Build (Large dataset)"
@@ -600,12 +656,21 @@ m = re.search(r'(\d+\.\d+)\s+real', content)
 if m:
     index_time = float(m.group(1))
 else:
-    # Try format: real X.XXs
+    # macOS alternate: real Xm Y.Zs
     m = re.search(r'real\s+(\d+)m([\d.]+)s', content)
     if m:
         index_time = int(m.group(1)) * 60 + float(m.group(2))
     else:
-        index_time = 0
+        # Linux GNU time: Elapsed (wall clock) time (h:mm:ss or m:ss): H:MM:SS.ss or M:SS.ss
+        m = re.search(r'wall clock\D+([\d:]+\.[\d]+)', content)
+        if m:
+            parts = m.group(1).split(':')
+            if len(parts) == 3:
+                index_time = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            else:
+                index_time = int(parts[0]) * 60 + float(parts[1])
+        else:
+            index_time = 0
 
 diff = rg_search - xgrep_search
 if diff > 0:

@@ -118,15 +118,21 @@ See [docs/agents.md](docs/agents.md) for agent-oriented usage patterns.
 
 ## Performance
 
-Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 32GB RAM, macOS. All numbers are warm cache, after index build.
+> **Measurement environment (tables below):** Apple M4, 32GB RAM, NVMe SSD, macOS 15.
+> Warm filesystem cache, `hyperfine --warmup 5 --runs 20`. Results on other hardware — especially
+> shared Linux machines or HDD — will differ; see [Reproducibility](#reproducibility) below.
 
 ### Search: Linux kernel (92,947 files, 2.0GB)
 
-| Query | xg | ripgrep | vs ripgrep |
-|-------|-----|---------|------------|
-| `struct file_operations` | 37ms | 1,687ms | **46x faster** |
-| `printk` | 52ms | 1,756ms | **34x faster** |
-| `EXPORT_SYMBOL` | 66ms | 1,773ms | **27x faster** |
+| Query | xg | ripgrep | vs ripgrep | Pattern type |
+|-------|-----|---------|------------|--------------|
+| `struct file_operations` | 37ms | 1,687ms | **46x faster** | focused |
+| `printk` | 52ms | 1,756ms | **34x faster** | focused |
+| `EXPORT_SYMBOL` | 66ms | 1,773ms | **27x faster** | focused |
+
+The queries above were selected for xgrep's sweet spot (trigram index filters well).
+For distributed patterns that appear across most files, xgrep approaches ripgrep speed —
+see the [Reproducibility](#reproducibility) section for honest numbers.
 
 ### File discovery: next.js (27,332 files)
 
@@ -144,6 +150,24 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 | Breakeven | ~2 searches | — |
 
 > First run includes a one-time index build. See [docs/benchmarks.md](docs/benchmarks.md) for full results including medium/small repos.
+
+### Reproducibility
+
+The numbers above were measured on the author's Apple M4 with a warm filesystem cache.
+Third-party benchmarks on shared Linux machines (different CPU, spinning disk, cold cache)
+show a different picture depending on pattern type:
+
+| Query | hits | M4 result | Third-party Linux (example) |
+|-------|------|-----------|------------------------------|
+| `CONFIG_PREEMPT_RT` | ~300 | xg wins big | xg wins big (cache fits in L3) |
+| `EXPORT_SYMBOL_GPL` | ~21k | xg wins | xg faster, but gap narrows |
+| `raw_spin_lock_irqsave` | ~1.2k | xg wins | xg ≈ ripgrep (互角) |
+| `devm_kzalloc` | ~7.4k | xg wins | **xg slower than ripgrep** |
+
+The pattern: when trigram intersection leaves many candidate files (widely-used symbols),
+xgrep must scan nearly the whole codebase — the index overhead then outweighs the savings.
+This is a known limitation being investigated. Use `bench/fair-bench.sh` to measure on
+your own hardware; the script runs both focused and distributed queries for a complete picture.
 
 ## Limitations
 

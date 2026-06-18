@@ -83,9 +83,15 @@ if [[ "$MODE" == "large" || "$MODE" == "all" ]]; then
         cd "$LINUX_SRC"
         xg init 2>/dev/null
 
-        for pattern in "struct file_operations" "printk" "EXPORT_SYMBOL"; do
+        # Mix of focused (xg wins) and distributed (xg ties/loses) patterns.
+        for pattern in \
+            "CONFIG_PREEMPT_RT" \
+            "struct file_operations" \
+            "EXPORT_SYMBOL_GPL" \
+            "raw_spin_lock_irqsave" \
+            "devm_kzalloc"; do
             echo "--- Pattern: $pattern ---"
-            hyperfine --warmup 10 --runs 30 \
+            hyperfine --warmup 5 --runs 20 \
                 "xg '$pattern'" \
                 "rg '$pattern'" \
                 --export-json "$RESULTS_DIR/large_$(echo "$pattern" | tr ' ' '_').json" \
