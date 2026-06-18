@@ -1,19 +1,17 @@
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 
 /// Extract trigrams from a byte sequence (deduplicated and sorted).
-///
-/// Uses BTreeSet for ordered deduplication. Benchmarked against HashSet+sort:
-/// BTreeSet is ~1.3x slower on 10K-byte inputs but avoids the HashSet allocation
-/// overhead on small inputs typical of source files. Keeping BTreeSet for simplicity.
 pub fn extract_trigrams(data: &[u8]) -> Vec<[u8; 3]> {
     if data.len() < 3 {
         return vec![];
     }
-    let mut seen = BTreeSet::new();
+    let mut seen: HashSet<[u8; 3]> = HashSet::new();
     for window in data.windows(3) {
         seen.insert([window[0], window[1], window[2]]);
     }
-    seen.into_iter().collect()
+    let mut result: Vec<[u8; 3]> = seen.into_iter().collect();
+    result.sort_unstable();
+    result
 }
 
 /// Encode a trigram ([u8; 3]) to u32 (upper byte is 0).

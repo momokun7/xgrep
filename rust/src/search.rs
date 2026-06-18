@@ -6,9 +6,14 @@ use memchr::memmem;
 use rayon::prelude::*;
 use regex::RegexBuilder;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+thread_local! {
+    static LOWER_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// ASCII-only case-insensitive contains check (for testing).
 /// Uses memmem::Finder internally to verify with the same algorithm as production code.
@@ -67,7 +72,7 @@ trait Matcher: Send + Sync {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult>;
 }
 
-/// Case-sensitive literal string matcher (using memmem::Finder).
+/// Case-sensitive literal string matcher (using memmem SIMD search).
 struct LiteralMatcher {
     pattern: Vec<u8>,
 }
@@ -75,89 +80,84 @@ struct LiteralMatcher {
 impl Matcher for LiteralMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
         let finder = memmem::Finder::new(&self.pattern);
-
-        // Early return if no match at all
         if finder.find(content).is_none() {
             return vec![];
         }
 
-        // Only build line offsets when we know there's at least one match
         let file: Arc<str> = Arc::from(rel_path);
         let line_offsets = build_line_offsets(content);
         let mut results = Vec::new();
-        let mut pos = 0;
+        let mut last_line = 0usize;
 
-        while let Some(match_pos) = finder.find(&content[pos..]) {
-            let abs_pos = pos + match_pos;
+        for abs_pos in finder.find_iter(content) {
             let line_num = line_number_at(&line_offsets, abs_pos);
+            if line_num == last_line {
+                continue;
+            }
+            last_line = line_num;
             let ls = line_start(&line_offsets, line_num);
-            let line_end = content[abs_pos..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(content.len(), |p| abs_pos + p);
-            let line = std::str::from_utf8(&content[ls..line_end]).unwrap_or("<binary>");
-
+            let le = if line_num < line_offsets.len() {
+                line_offsets[line_num].saturating_sub(1)
+            } else {
+                content.len()
+            };
+            let line = std::str::from_utf8(&content[ls..le]).unwrap_or("<binary>");
             results.push(SearchResult {
                 file: Arc::clone(&file),
                 line_number: line_num,
                 line: line.to_string(),
             });
-
-            pos = line_end + 1;
-            if pos >= content.len() {
-                break;
-            }
         }
 
         results
     }
 }
 
-/// Case-insensitive literal string matcher (ASCII-only folding + memmem SIMD search).
+/// Case-insensitive literal string matcher.
+/// Per-file lowercasing reuses a thread-local buffer to avoid repeated allocation.
 struct CaseInsensitiveMatcher {
-    pattern_lower: String,
+    pattern_lower: Vec<u8>,
 }
 
 impl Matcher for CaseInsensitiveMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        let pattern_bytes = self.pattern_lower.as_bytes();
-        let finder = memmem::Finder::new(pattern_bytes);
+        let finder = memmem::Finder::new(&self.pattern_lower);
+        LOWER_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.resize(content.len(), 0);
+            buf.copy_from_slice(content);
+            buf.make_ascii_lowercase();
 
-        // Hybrid approach: lowercase the entire file once for fast SIMD rejection,
-        // then per-line processing only for files that actually match.
-        let mut lowered = content.to_vec();
-        lowered.make_ascii_lowercase();
-        if finder.find(&lowered).is_none() {
-            return vec![];
-        }
-
-        // Match found — scan lowered content line by line to identify matching lines,
-        // but return the original (non-lowered) line text.
-        let file: Arc<str> = Arc::from(rel_path);
-        let mut results = Vec::new();
-        let mut line_num = 0usize;
-        let mut start = 0usize;
-
-        while start < lowered.len() {
-            line_num += 1;
-            let line_end = lowered[start..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(lowered.len(), |p| start + p);
-
-            if finder.find(&lowered[start..line_end]).is_some() {
-                let original_line = &content[start..line_end];
-                let line = std::str::from_utf8(original_line).unwrap_or("<binary>");
-                results.push(SearchResult {
-                    file: Arc::clone(&file),
-                    line_number: line_num,
-                    line: line.to_string(),
-                });
+            if finder.find(&buf).is_none() {
+                return vec![];
             }
 
-            start = line_end + 1;
-        }
-        results
+            let file: Arc<str> = Arc::from(rel_path);
+            let mut results = Vec::new();
+            let mut line_num = 0usize;
+            let mut start = 0usize;
+
+            while start < buf.len() {
+                line_num += 1;
+                let line_end = buf[start..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(buf.len(), |p| start + p);
+
+                if finder.find(&buf[start..line_end]).is_some() {
+                    let original_line = &content[start..line_end];
+                    let line = std::str::from_utf8(original_line).unwrap_or("<binary>");
+                    results.push(SearchResult {
+                        file: Arc::clone(&file),
+                        line_number: line_num,
+                        line: line.to_string(),
+                    });
+                }
+
+                start = line_end + 1;
+            }
+            results
+        })
     }
 }
 
@@ -168,27 +168,34 @@ struct RegexMatcher {
 
 impl Matcher for RegexMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        // Try zero-copy UTF-8 first; only allocate on invalid UTF-8
         let content_str: Cow<'_, str> = match std::str::from_utf8(content) {
             Ok(s) => Cow::Borrowed(s),
             Err(_) => String::from_utf8_lossy(content),
         };
 
-        // Early return: reject files with no match via single DFA pass
-        if !self.re.is_match(&content_str) {
-            return vec![];
-        }
-
+        let line_offsets = build_line_offsets(content);
         let file: Arc<str> = Arc::from(rel_path);
         let mut results = Vec::new();
-        for (i, line) in content_str.lines().enumerate() {
-            if self.re.is_match(line) {
-                results.push(SearchResult {
-                    file: Arc::clone(&file),
-                    line_number: i + 1,
-                    line: line.to_string(),
-                });
+        let mut last_line = 0usize;
+
+        for m in self.re.find_iter(&content_str) {
+            let line_num = line_number_at(&line_offsets, m.start());
+            if line_num == last_line {
+                continue;
             }
+            last_line = line_num;
+            let ls = line_start(&line_offsets, line_num);
+            let le = if line_num < line_offsets.len() {
+                line_offsets[line_num].saturating_sub(1)
+            } else {
+                content.len()
+            };
+            let line = std::str::from_utf8(&content[ls..le]).unwrap_or("<binary>");
+            results.push(SearchResult {
+                file: Arc::clone(&file),
+                line_number: line_num,
+                line: line.to_string(),
+            });
         }
         results
     }
@@ -223,7 +230,7 @@ fn scan_indexed<M: Matcher>(
             matcher.find_matches(&content, rel_path)
         })
         .collect();
-    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
+    results.sort_unstable_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
     results
 }
 
@@ -255,7 +262,7 @@ fn scan_direct<M: Matcher>(
             matcher.find_matches(&content, &rel_str)
         })
         .collect();
-    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
+    results.sort_unstable_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
     results
 }
 
@@ -316,7 +323,7 @@ pub(crate) fn search(
 
     let results = if case_insensitive {
         let matcher = CaseInsensitiveMatcher {
-            pattern_lower: search_pattern,
+            pattern_lower: search_pattern.into_bytes(),
         };
         scan_indexed(reader, root, &candidate_ids, &matcher, quiet)
     } else {
@@ -354,7 +361,7 @@ pub(crate) fn search_files(
 
     let results = if case_insensitive {
         let matcher = CaseInsensitiveMatcher {
-            pattern_lower: pattern.to_lowercase(),
+            pattern_lower: pattern.to_lowercase().into_bytes(),
         };
         scan_direct(root, files, &matcher, quiet)
     } else {

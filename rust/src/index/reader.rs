@@ -191,7 +191,7 @@ impl IndexReader {
         if count > data.len() {
             return vec![];
         }
-        let mut result = Vec::with_capacity(count.min(1024));
+        let mut result = Vec::with_capacity(count);
         let mut prev: u32 = 0;
         for _ in 0..count {
             if pos >= data.len() {
@@ -258,7 +258,7 @@ impl IndexReader {
             return vec![];
         }
 
-        let mut seen = std::collections::BTreeSet::new();
+        let mut result: Vec<u32> = Vec::new();
         for i in lo_idx..hi_idx {
             let offset = trigram_table_start + i * TrigramEntry::SIZE;
             let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
@@ -273,11 +273,11 @@ impl IndexReader {
                 continue; // skip corrupted entry
             }
             let data = &self.mmap[pl_start..pl_end];
-            for fid in Self::decode_posting_list(data) {
-                seen.insert(fid);
-            }
+            result.extend(Self::decode_posting_list(data));
         }
-        seen.into_iter().collect()
+        result.sort_unstable();
+        result.dedup();
+        result
     }
 
     /// Return the union of posting lists for all trigrams `t` where
@@ -296,7 +296,7 @@ impl IndexReader {
         }
 
         let trigram_table_start = Header::SIZE;
-        let mut seen = std::collections::BTreeSet::new();
+        let mut result: Vec<u32> = Vec::new();
         for i in 0..count {
             let offset = trigram_table_start + i * TrigramEntry::SIZE;
             if offset + TrigramEntry::SIZE > self.mmap.len() {
@@ -312,11 +312,11 @@ impl IndexReader {
                 continue; // skip corrupted entry
             }
             let data = &self.mmap[pl_start..pl_end];
-            for fid in Self::decode_posting_list(data) {
-                seen.insert(fid);
-            }
+            result.extend(Self::decode_posting_list(data));
         }
-        seen.into_iter().collect()
+        result.sort_unstable();
+        result.dedup();
+        result
     }
 
     pub fn file_path(&self, file_id: u32) -> &str {
