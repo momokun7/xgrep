@@ -350,14 +350,20 @@ impl Xgrep {
     }
 
     /// Build (or rebuild) the search index.
-    pub fn build_index(&self) -> Result<()> {
+    ///
+    /// Returns `true` if the index was (re)built, `false` if the corpus
+    /// fingerprint matched and no rebuild was needed.
+    pub fn build_index(&self) -> Result<bool> {
         if let Some(parent) = self.index_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let cache = index::cache::cache_path_for(&self.index_path);
-        index::builder::build_index_with_cache(&self.root, &self.index_path, Some(&cache))?;
-        index::updater::save_meta(&self.root, &self.index_path)?;
-        Ok(())
+        let rebuilt =
+            index::builder::build_index_with_cache(&self.root, &self.index_path, Some(&cache))?;
+        if rebuilt {
+            index::updater::save_meta(&self.root, &self.index_path)?;
+        }
+        Ok(rebuilt)
     }
 
     /// Apply word-boundary wrapping. Returns the effective pattern and

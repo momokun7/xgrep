@@ -6,10 +6,97 @@ use std::path::{Path, PathBuf};
 use crate::error::{Result, XgrepError};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use xxhash_rust::xxh64::Xxh64;
 
 use crate::index::cache::{CachedFile, TrigramCache};
 use crate::index::format::*;
 use crate::trigram;
+
+// ============================================================
+// Corpus fingerprint: fast "nothing changed" detection
+// ============================================================
+
+fn fingerprint_path(index_path: &Path) -> PathBuf {
+    let mut s = index_path.as_os_str().to_os_string();
+    s.push(".fp");
+    PathBuf::from(s)
+}
+
+fn read_fingerprint(fp_path: &Path) -> Option<u64> {
+    let data = fs::read(fp_path).ok()?;
+    Some(u64::from_le_bytes(data.get(..8)?.try_into().ok()?))
+}
+
+fn write_fingerprint(fp_path: &Path, fingerprint: u64) -> Result<()> {
+    let mut tmp_s = fp_path.as_os_str().to_os_string();
+    tmp_s.push(".tmp");
+    let tmp = PathBuf::from(tmp_s);
+    fs::write(&tmp, fingerprint.to_le_bytes())?;
+    fs::rename(&tmp, fp_path)?;
+    Ok(())
+}
+
+/// Walk `root` and compute a fingerprint of all file paths + mtimes + sizes.
+///
+/// The fingerprint captures the state of the entire file tree, including
+/// binary files excluded from the index. Any change to the corpus (additions,
+/// deletions, or modifications) produces a different fingerprint and triggers
+/// a rebuild.
+///
+/// Limitation: mtime + size cannot detect content changes that deliberately
+/// preserve both values (e.g., `touch -r oldfile newfile`, certain VCS
+/// operations that manually restore timestamps). Such edits are vanishingly
+/// rare in normal development and CI workflows. Use `xg init` after an
+/// explicit `touch -r` if you need to force a rebuild.
+/// Returns `true` for files and directories that are xgrep internal artefacts
+/// and should never be included in the corpus walk.
+fn is_xgrep_internal(name: &str) -> bool {
+    name == ".xgrep"              // index directory
+        || name.ends_with(".xgrep")   // index file (e.g. index.xgrep)
+        || name.ends_with(".xgrep.fp")    // fingerprint file
+        || name.ends_with(".xgrep.lock")  // build lock file
+        || name.starts_with(".xgrep_tmp_") // atomic write tmp files
+}
+
+fn compute_corpus_fingerprint(root: &Path, lock_path: &Path) -> Option<u64> {
+    let mut entries: Vec<(String, u64, u64)> = Vec::new();
+    for entry in WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|e| !is_xgrep_internal(&e.file_name().to_string_lossy()))
+        .build()
+    {
+        let entry = entry.ok()?;
+        if entry.file_type().map_or(true, |ft| !ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path == lock_path {
+            continue;
+        }
+        let relative = path.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+        let meta = entry.metadata().ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        entries.push((relative, mtime, meta.len()));
+    }
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut h = Xxh64::new(0);
+    for (path, mtime, size) in &entries {
+        h.update(path.as_bytes());
+        h.update(&[0u8]); // NUL separator prevents "ab"+"c" == "a"+"bc"
+        h.update(&mtime.to_le_bytes());
+        h.update(&size.to_le_bytes());
+    }
+    Some(h.digest())
+}
 
 // ============================================================
 // Lock Guard: advisory file lock to prevent concurrent builds
@@ -90,24 +177,60 @@ fn acquire_lock_with_retry(index_path: &Path, retries: u32) -> Result<LockGuard>
 }
 
 #[allow(dead_code)]
-pub fn build_index(root: &Path, index_path: &Path) -> Result<()> {
+pub fn build_index(root: &Path, index_path: &Path) -> Result<bool> {
     build_index_with_cache(root, index_path, None)
 }
 
+/// Build or update the search index.
+///
+/// Returns `true` if the index was (re)built, `false` if the corpus
+/// fingerprint matched the stored value and no rebuild was needed.
 pub fn build_index_with_cache(
     root: &Path,
     index_path: &Path,
     cache_path: Option<&Path>,
-) -> Result<()> {
-    let _lock_guard = acquire_lock(index_path)?;
+) -> Result<bool> {
+    let fp_path = fingerprint_path(index_path);
     let lock_path = index_path.with_extension("lock");
+
+    // Fast path: compare corpus fingerprint before acquiring the build lock.
+    // Checked pre-lock so that concurrent `xg init` on an unchanged corpus
+    // return quickly without serialising behind each other.
+    if index_path.exists() && fp_path.exists() {
+        if let (Some(stored), Some(current)) = (
+            read_fingerprint(&fp_path),
+            compute_corpus_fingerprint(root, &lock_path),
+        ) {
+            if current == stored {
+                return Ok(false);
+            }
+        }
+    }
+
+    let _lock_guard = acquire_lock(index_path)?;
+
+    // Re-check after acquiring the lock: another process may have just
+    // finished a build and written a fresh fingerprint.
+    if index_path.exists() && fp_path.exists() {
+        if let (Some(stored), Some(current)) = (
+            read_fingerprint(&fp_path),
+            compute_corpus_fingerprint(root, &lock_path),
+        ) {
+            if current == stored {
+                return Ok(false);
+            }
+        }
+    }
+
     let mut cache = cache_path
         .map(TrigramCache::load)
         .unwrap_or_else(TrigramCache::new);
     let mut cache_hits = 0usize;
     let mut cache_misses = 0usize;
+
     // ============================================================
-    // Pass 1: collect file paths, fetch metadata, count trigram occurrences
+    // Pass 1: collect file paths via a single-threaded directory walk.
+    // Metadata (mtime/size) is fetched in parallel in Pass 2.
     // ============================================================
     let mut file_paths: Vec<PathBuf> = Vec::new();
     for entry in WalkBuilder::new(root)
@@ -115,10 +238,7 @@ pub fn build_index_with_cache(
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            name != ".xgrep"
-        })
+        .filter_entry(|e| !is_xgrep_internal(&e.file_name().to_string_lossy()))
         .build()
     {
         let entry = entry.map_err(|e| XgrepError::IndexError(e.to_string()))?;
@@ -162,7 +282,7 @@ pub fn build_index_with_cache(
                     .unwrap_or(0);
                 let size = meta.len();
 
-                // Cache hit check: skip file read if path + mtime match
+                // Cache hit: same relative path + same mtime means content unchanged.
                 if let Some(cached) = cache.entries.get(&relative) {
                     if cached.mtime == mtime {
                         return Some(ChunkResult {
@@ -254,11 +374,12 @@ pub fn build_index_with_cache(
 
     if total_pairs == 0 {
         // No trigrams at all: write directly without mmap
-        let result = write_index_no_postings(index_path, &sorted_trigrams, &files);
-        if result.is_ok() {
-            save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
+        write_index_no_postings(index_path, &sorted_trigrams, &files)?;
+        save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
+        if let Some(fp) = compute_corpus_fingerprint(root, &lock_path) {
+            let _ = write_fingerprint(&fp_path, fp);
         }
-        return result;
+        return Ok(true);
     }
 
     let temp_dir = tempfile::tempdir()?;
@@ -420,7 +541,14 @@ pub fn build_index_with_cache(
         eprintln!("[cache: {} hits, {} misses]", cache_hits, cache_misses);
     }
 
-    Ok(())
+    // Persist corpus fingerprint so the next `xg init` can skip the rebuild
+    // if nothing has changed. Computed here (after the build) to reflect the
+    // actual file state that the index was built from, including binary files.
+    if let Some(fp) = compute_corpus_fingerprint(root, &lock_path) {
+        let _ = write_fingerprint(&fp_path, fp);
+    }
+
+    Ok(true)
 }
 
 /// Update and save the cache.
@@ -903,5 +1031,103 @@ mod tests {
         let cache = TrigramCache::load(&cache_path);
         assert_eq!(cache.entries.len(), 1);
         assert!(!cache.entries.contains_key("b.txt"));
+    }
+
+    // ----------------------------------------------------------------
+    // Fingerprint / early-return tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_second_init_unchanged_returns_false() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+        fs::write(root.join("b.txt"), "another file").unwrap();
+
+        let index_path = root.join("index.xgrep");
+
+        let first = build_index(root, &index_path).unwrap();
+        assert!(first, "first build should return true (rebuilt)");
+
+        let second = build_index(root, &index_path).unwrap();
+        assert!(
+            !second,
+            "second build with no changes should return false (up to date)"
+        );
+    }
+
+    #[test]
+    fn test_init_after_file_modification_returns_true() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        // Wait for mtime to advance, then modify the file.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("a.txt"), "modified content xyz").unwrap();
+
+        let rebuilt = build_index(root, &index_path).unwrap();
+        assert!(
+            rebuilt,
+            "build after file change should return true (rebuilt)"
+        );
+    }
+
+    #[test]
+    fn test_init_after_new_file_returns_true() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        fs::write(root.join("b.txt"), "new file content").unwrap();
+
+        let rebuilt = build_index(root, &index_path).unwrap();
+        assert!(rebuilt, "build after new file should return true (rebuilt)");
+    }
+
+    #[test]
+    fn test_init_after_file_deletion_returns_true() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world").unwrap();
+        fs::write(root.join("b.txt"), "will be deleted").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        fs::remove_file(root.join("b.txt")).unwrap();
+
+        let rebuilt = build_index(root, &index_path).unwrap();
+        assert!(
+            rebuilt,
+            "build after file deletion should return true (rebuilt)"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_file_created_after_build() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        let fp_path = fingerprint_path(&index_path);
+        assert!(
+            fp_path.exists(),
+            "fingerprint file should be created after build"
+        );
+        assert_eq!(
+            fs::read(&fp_path).unwrap().len(),
+            8,
+            "fingerprint file should be exactly 8 bytes (u64)"
+        );
     }
 }

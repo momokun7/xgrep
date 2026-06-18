@@ -250,18 +250,20 @@ pub fn handle_find_definitions(xg: &Xgrep, params: &Value) -> (String, bool) {
 pub fn handle_build_index(xg: &Xgrep) -> (String, bool) {
     let start = std::time::Instant::now();
     match xg.build_index() {
-        Ok(()) => {
+        Ok(rebuilt) => {
             let elapsed = start.elapsed().as_secs_f64();
             let size = std::fs::metadata(xg.index_path())
                 .map(|m| m.len())
                 .unwrap_or(0);
-            (
+            let msg = if rebuilt {
                 format!(
                     "Index built successfully in {:.2}s ({} bytes)",
                     elapsed, size
-                ),
-                false,
-            )
+                )
+            } else {
+                format!("Index is up to date ({:.2}s, {} bytes)", elapsed, size)
+            };
+            (msg, false)
         }
         Err(e) => (format!("Build error: {}", e), true),
     }
@@ -543,7 +545,12 @@ mod tests {
         let (_dir, xg) = setup_test_repo();
         let (output, is_error) = handle_build_index(&xg);
         assert!(!is_error);
-        assert!(output.contains("Index built successfully"));
+        // setup_test_repo already built the index, so this call may return
+        // "up to date" rather than "built successfully". Both are valid.
+        assert!(
+            output.contains("Index built successfully") || output.contains("Index is up to date"),
+            "unexpected output: {output}"
+        );
         assert!(output.contains("bytes"));
     }
 
