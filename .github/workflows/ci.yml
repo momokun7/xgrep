@@ -160,6 +160,9 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: rust
+      - name: Remove lock file (v4 format unsupported by 1.74)
+        working-directory: rust
+        run: rm -f Cargo.lock
       - name: Check MSRV
         working-directory: rust
         run: cargo check
