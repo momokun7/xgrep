@@ -157,12 +157,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: "1.74.0"
-      - name: Remove lock file (Cargo.lock v4 is not supported by Cargo 1.74)
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: rust
+      - name: Downgrade lock file format for Cargo 1.74 compatibility
         working-directory: rust
-        run: rm -f Cargo.lock
+        run: sed -i 's/^version = 4$/version = 3/' Cargo.lock
       - name: Check MSRV
         working-directory: rust
-        run: cargo check
+        run: cargo check --locked
 
   npm-bindings:
     name: npm bindings
