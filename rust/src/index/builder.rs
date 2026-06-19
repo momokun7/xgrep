@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,8 @@ use xxhash_rust::xxh64::Xxh64;
 use crate::index::cache::{CachedFile, TrigramCache};
 use crate::index::format::*;
 use crate::trigram;
+
+type NewFileInfo = (String, u64, u64, u64, Vec<[u8; 3]>);
 
 // ============================================================
 // Corpus fingerprint: fast "nothing changed" detection
@@ -193,9 +195,9 @@ pub fn build_index_with_cache(
     let fp_path = fingerprint_path(index_path);
     let lock_path = index_path.with_extension("lock");
 
-    // Fast path: compare corpus fingerprint before acquiring the build lock.
-    // Checked pre-lock so that concurrent `xg init` on an unchanged corpus
-    // return quickly without serialising behind each other.
+    // 高速パス: フィンガープリントが一致すれば即返却 (ロック前 = 競合なし)
+    // compute_corpus_fingerprint はウォーク 1 回 (~1s) で済み、
+    // diff ウォーク (~6s: mmap 初期化 + per-file section スキャン) より速い。
     if index_path.exists() && fp_path.exists() {
         if let (Some(stored), Some(current)) = (
             read_fingerprint(&fp_path),
@@ -209,16 +211,10 @@ pub fn build_index_with_cache(
 
     let _lock_guard = acquire_lock(index_path)?;
 
-    // Re-check after acquiring the lock: another process may have just
-    // finished a build and written a fresh fingerprint.
-    if index_path.exists() && fp_path.exists() {
-        if let (Some(stored), Some(current)) = (
-            read_fingerprint(&fp_path),
-            compute_corpus_fingerprint(root, &lock_path),
-        ) {
-            if current == stored {
-                return Ok(false);
-            }
+    // diff update を試みる (ウォーク内でフィンガープリントを同時計算して末尾ウォークを排除)
+    if index_path.exists() {
+        if let Some(v) = try_build_index_diff(root, index_path, cache_path, &fp_path, &lock_path)? {
+            return Ok(v); // フォールバック不要: diff 更新成功
         }
     }
 
@@ -340,23 +336,6 @@ pub fn build_index_with_cache(
     let mut sorted_trigrams: Vec<[u8; 3]> = trigram_count.keys().copied().collect();
     sorted_trigrams.sort();
 
-    let mut offset_table: Vec<u32> = Vec::with_capacity(sorted_trigrams.len());
-    let mut cumulative: u32 = 0;
-    for t in &sorted_trigrams {
-        offset_table.push(cumulative);
-        cumulative += trigram_count[t];
-    }
-
-    let mut trigram_to_index: HashMap<[u8; 3], usize> = HashMap::new();
-    for (i, t) in sorted_trigrams.iter().enumerate() {
-        trigram_to_index.insert(*t, i);
-    }
-
-    let mut write_positions: Vec<u32> = offset_table.clone();
-
-    // ============================================================
-    // Create temporary file (for posting data)
-    // ============================================================
     if files.len() > u32::MAX as usize {
         return Err(XgrepError::IndexError(format!(
             "too many files: {} (maximum {})",
@@ -374,13 +353,175 @@ pub fn build_index_with_cache(
 
     if total_pairs == 0 {
         // No trigrams at all: write directly without mmap
-        write_index_no_postings(index_path, &sorted_trigrams, &files)?;
+        write_index_no_postings(index_path, &sorted_trigrams, &files, &file_trigrams)?;
         save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
         if let Some(fp) = compute_corpus_fingerprint(root, &lock_path) {
             let _ = write_fingerprint(&fp_path, fp);
         }
         return Ok(true);
     }
+
+    write_full_index_v3(index_path, &files, &file_trigrams)?;
+
+    // Update and save cache
+    save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
+
+    if cache_hits > 0 {
+        eprintln!("[cache: {} hits, {} misses]", cache_hits, cache_misses);
+    }
+
+    // Persist corpus fingerprint so the next `xg init` can skip the rebuild
+    // if nothing has changed. Computed here (after the build) to reflect the
+    // actual file state that the index was built from, including binary files.
+    if let Some(fp) = compute_corpus_fingerprint(root, &lock_path) {
+        let _ = write_fingerprint(&fp_path, fp);
+    }
+
+    Ok(true)
+}
+
+/// Write v3 index from pre-built postings map (differential update path).
+/// Skips the 2-pass temp-mmap sorting phase used by write_full_index_v3.
+#[allow(dead_code)]
+fn write_index_from_postings_v3(
+    index_path: &Path,
+    files: &[FileInfo],
+    per_file_trigrams: &[Vec<[u8; 3]>],
+    postings: &HashMap<[u8; 3], Vec<u32>>,
+) -> Result<()> {
+    let mut sorted_trigrams: Vec<[u8; 3]> = postings.keys().copied().collect();
+    sorted_trigrams.sort();
+
+    let parent = index_path.parent().unwrap_or(std::path::Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp_index_path = parent.join(format!(".xgrep_tmp_{}", std::process::id()));
+    let out_file = fs::File::create(&temp_index_path)?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+
+    let mut header = Header {
+        magic: MAGIC,
+        version: VERSION,
+        trigram_count: sorted_trigrams.len() as u32,
+        file_count: files.len() as u32,
+        posting_total_bytes: 0,
+        per_file_section_offset: 0,
+    };
+    writer.write_all(&header.to_bytes())?;
+    writer.write_all(&vec![0u8; sorted_trigrams.len() * TrigramEntry::SIZE])?;
+
+    let mut trigram_entries: Vec<TrigramEntry> = Vec::with_capacity(sorted_trigrams.len());
+    let mut posting_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut current_posting_offset: u64 = 0;
+
+    for &t in &sorted_trigrams {
+        let file_ids = &postings[&t];
+        posting_buf.clear();
+        encode_varint(&mut posting_buf, file_ids.len() as u32);
+        let mut prev: u32 = 0;
+        for &fid in file_ids {
+            encode_varint(&mut posting_buf, fid - prev);
+            prev = fid;
+        }
+        let len = posting_buf.len() as u32;
+        writer.write_all(&posting_buf)?;
+        trigram_entries.push(TrigramEntry {
+            trigram: t,
+            _padding: 0,
+            posting_offset: current_posting_offset,
+            posting_len: len,
+        });
+        current_posting_offset += len as u64;
+    }
+
+    let mut string_pool = Vec::new();
+    for fi in files {
+        let path_offset = string_pool.len() as u32;
+        string_pool.extend_from_slice(fi.relative_path.as_bytes());
+        string_pool.push(0);
+        writer.write_all(
+            &FileEntry {
+                path_offset,
+                mtime: fi.mtime,
+                size: fi.size,
+                content_hash: fi.content_hash,
+            }
+            .to_bytes(),
+        )?;
+    }
+    writer.write_all(&string_pool)?;
+
+    header.posting_total_bytes = current_posting_offset;
+    writer.flush()?;
+    let mut file = writer
+        .into_inner()
+        .map_err(|e| XgrepError::Io(e.into_error()))?;
+
+    let per_file_section_offset = file.seek(SeekFrom::End(0))?;
+    {
+        let mut pf_writer = BufWriter::with_capacity(256 * 1024, &mut file);
+        pf_writer.write_all(&(files.len() as u32).to_le_bytes())?;
+        for (i, fi) in files.iter().enumerate() {
+            pf_writer.write_all(&fi.mtime.to_le_bytes())?;
+            pf_writer.write_all(&fi.content_hash.to_le_bytes())?;
+            let sorted_trig = if i < per_file_trigrams.len() {
+                trigrams_to_sorted_u32(&per_file_trigrams[i])
+            } else {
+                vec![]
+            };
+            pf_writer.write_all(&(sorted_trig.len() as u32).to_le_bytes())?;
+            for &t_u32 in &sorted_trig {
+                pf_writer.write_all(&t_u32.to_le_bytes())?;
+            }
+        }
+        pf_writer.flush()?;
+    }
+
+    header.per_file_section_offset = per_file_section_offset;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header.to_bytes())?;
+    file.seek(SeekFrom::Start(Header::SIZE as u64))?;
+    let mut trig_writer = BufWriter::with_capacity(64 * 1024, file);
+    for entry in &trigram_entries {
+        trig_writer.write_all(&entry.to_bytes())?;
+    }
+    trig_writer.flush()?;
+    drop(trig_writer);
+
+    fs::rename(&temp_index_path, index_path)?;
+    Ok(())
+}
+
+/// Core index write function (v3 format with per-file section).
+fn write_full_index_v3(
+    index_path: &Path,
+    files: &[FileInfo],
+    file_trigrams: &[Vec<[u8; 3]>],
+) -> Result<()> {
+    let mut trigram_count: HashMap<[u8; 3], u32> = HashMap::new();
+    let mut total_pairs: usize = 0;
+    for trigrams in file_trigrams {
+        for &t in trigrams {
+            *trigram_count.entry(t).or_insert(0) += 1;
+            total_pairs += 1;
+        }
+    }
+
+    let mut sorted_trigrams: Vec<[u8; 3]> = trigram_count.keys().copied().collect();
+    sorted_trigrams.sort();
+
+    let mut offset_table: Vec<u32> = Vec::with_capacity(sorted_trigrams.len());
+    let mut cumulative: u32 = 0;
+    for t in &sorted_trigrams {
+        offset_table.push(cumulative);
+        cumulative += trigram_count[t];
+    }
+
+    let mut trigram_to_index: HashMap<[u8; 3], usize> = HashMap::new();
+    for (i, t) in sorted_trigrams.iter().enumerate() {
+        trigram_to_index.insert(*t, i);
+    }
+
+    let mut write_positions: Vec<u32> = offset_table.clone();
 
     let temp_dir = tempfile::tempdir()?;
     let temp_path = temp_dir.path().join("postings.tmp");
@@ -396,14 +537,10 @@ pub fn build_index_with_cache(
         .read(true)
         .write(true)
         .open(&temp_path)?;
-    // SAFETY: temp_file was just created with a unique name (PID-based) and opened
-    // with read+write. No other process shares this file, and its length was set
-    // via set_len() immediately before this call.
+    // SAFETY: temp_file was just created with a unique name and opened
+    // with read+write. No other process shares this file.
     let mut temp_mmap = unsafe { memmap2::MmapMut::map_mut(&temp_file)? };
 
-    // ============================================================
-    // Pass 2: place file_ids into mmap using trigrams collected in Pass 1
-    // ============================================================
     for (file_id, trigrams) in file_trigrams.iter().enumerate() {
         let file_id = file_id as u32;
         for t in trigrams {
@@ -420,23 +557,20 @@ pub fn build_index_with_cache(
 
     temp_mmap.flush()?;
 
-    // ============================================================
-    // Write final index file (reading from mmap)
-    // Atomic replacement: write to temp file, then rename
-    // ============================================================
     let parent = index_path.parent().unwrap_or(std::path::Path::new("."));
     fs::create_dir_all(parent)?;
     let temp_index_path = parent.join(format!(".xgrep_tmp_{}", std::process::id()));
     let out_file = fs::File::create(&temp_index_path)?;
     let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
 
-    // Write placeholder header (posting_total_bytes will be updated after writing postings)
+    // Write placeholder header
     let mut header = Header {
         magic: MAGIC,
         version: VERSION,
         trigram_count: sorted_trigrams.len() as u32,
         file_count: files.len() as u32,
         posting_total_bytes: 0,
+        per_file_section_offset: 0,
     };
     writer.write_all(&header.to_bytes())?;
 
@@ -497,7 +631,7 @@ pub fn build_index_with_cache(
 
     // Write File Table
     let mut string_pool = Vec::new();
-    for fi in &files {
+    for fi in files {
         let path_offset = string_pool.len() as u32;
         string_pool.extend_from_slice(fi.relative_path.as_bytes());
         string_pool.push(0);
@@ -513,12 +647,42 @@ pub fn build_index_with_cache(
     // Write String Pool
     writer.write_all(&string_pool)?;
 
-    // Overwrite Header's posting_total_bytes with the final value
-    header.posting_total_bytes = current_posting_offset;
+    // Flush and get file handle to write per-file section
     writer.flush()?;
     let mut file = writer
         .into_inner()
         .map_err(|e| XgrepError::Io(e.into_error()))?;
+
+    // Get current position as per_file_section_offset
+    let per_file_section_offset = file.seek(SeekFrom::End(0))?;
+
+    // Write Per-File Section. Wrap in BufWriter to avoid per-4-byte syscalls
+    // (the inner loop writes one u32 at a time; without buffering this causes
+    // ~173M write() syscalls on a 137K-file corpus).
+    {
+        let mut pf_writer = BufWriter::with_capacity(256 * 1024, &mut file);
+        pf_writer.write_all(&(files.len() as u32).to_le_bytes())?;
+        for (i, fi) in files.iter().enumerate() {
+            pf_writer.write_all(&fi.mtime.to_le_bytes())?;
+            pf_writer.write_all(&fi.content_hash.to_le_bytes())?;
+            let sorted_trigrams_u32 = if i < file_trigrams.len() {
+                trigrams_to_sorted_u32(&file_trigrams[i])
+            } else {
+                vec![]
+            };
+            pf_writer.write_all(&(sorted_trigrams_u32.len() as u32).to_le_bytes())?;
+            for &t_u32 in &sorted_trigrams_u32 {
+                pf_writer.write_all(&t_u32.to_le_bytes())?;
+            }
+        }
+        pf_writer.flush()?;
+    }
+
+    // Update header with final values
+    header.posting_total_bytes = current_posting_offset;
+    header.per_file_section_offset = per_file_section_offset;
+
+    // Seek back to beginning and write header
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&header.to_bytes())?;
 
@@ -534,21 +698,7 @@ pub fn build_index_with_cache(
     // Atomic replacement: rename temp file to final path
     fs::rename(&temp_index_path, index_path)?;
 
-    // Update and save cache
-    save_cache(&mut cache, &files, &file_trigrams, cache_path)?;
-
-    if cache_hits > 0 {
-        eprintln!("[cache: {} hits, {} misses]", cache_hits, cache_misses);
-    }
-
-    // Persist corpus fingerprint so the next `xg init` can skip the rebuild
-    // if nothing has changed. Computed here (after the build) to reflect the
-    // actual file state that the index was built from, including binary files.
-    if let Some(fp) = compute_corpus_fingerprint(root, &lock_path) {
-        let _ = write_fingerprint(&fp_path, fp);
-    }
-
-    Ok(true)
+    Ok(())
 }
 
 /// Update and save the cache.
@@ -582,6 +732,7 @@ fn write_index_no_postings(
     index_path: &Path,
     sorted_trigrams: &[[u8; 3]],
     files: &[FileInfo],
+    file_trigrams: &[Vec<[u8; 3]>],
 ) -> Result<()> {
     let parent = index_path.parent().unwrap_or(std::path::Path::new("."));
     fs::create_dir_all(parent)?;
@@ -589,12 +740,13 @@ fn write_index_no_postings(
     let out_file = fs::File::create(&temp_path)?;
     let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
 
-    let header = Header {
+    let mut header = Header {
         magic: MAGIC,
         version: VERSION,
         trigram_count: sorted_trigrams.len() as u32,
         file_count: files.len() as u32,
         posting_total_bytes: 0,
+        per_file_section_offset: 0,
     };
     writer.write_all(&header.to_bytes())?;
 
@@ -618,11 +770,653 @@ fn write_index_no_postings(
 
     writer.write_all(&string_pool)?;
     writer.flush()?;
-    drop(writer);
+    let mut file = writer
+        .into_inner()
+        .map_err(|e| XgrepError::Io(e.into_error()))?;
+
+    // Get current position as per_file_section_offset
+    let per_file_section_offset = file.seek(SeekFrom::End(0))?;
+
+    // Write Per-File Section with BufWriter (same buffering reason as main build path)
+    {
+        let mut pf_writer = BufWriter::with_capacity(256 * 1024, &mut file);
+        pf_writer.write_all(&(files.len() as u32).to_le_bytes())?;
+        for (i, fi) in files.iter().enumerate() {
+            pf_writer.write_all(&fi.mtime.to_le_bytes())?;
+            pf_writer.write_all(&fi.content_hash.to_le_bytes())?;
+            let sorted_trigrams_u32 = if i < file_trigrams.len() {
+                trigrams_to_sorted_u32(&file_trigrams[i])
+            } else {
+                vec![]
+            };
+            pf_writer.write_all(&(sorted_trigrams_u32.len() as u32).to_le_bytes())?;
+            for &t_u32 in &sorted_trigrams_u32 {
+                pf_writer.write_all(&t_u32.to_le_bytes())?;
+            }
+        }
+        pf_writer.flush()?;
+    }
+
+    header.per_file_section_offset = per_file_section_offset;
+
+    // Seek back to beginning and write header
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header.to_bytes())?;
+    file.flush()?;
+    drop(file);
 
     // Atomic replacement: rename temp file to final path
     fs::rename(&temp_path, index_path)?;
 
+    Ok(())
+}
+
+/// Compute byte offsets for each per-file entry in the raw per-file section.
+/// Returns `offsets` of length `file_count + 1`; entry `i` occupies
+/// `pf_raw[offsets[i]..offsets[i+1]]`.
+fn compute_pf_offsets(pf_raw: &[u8]) -> Option<Vec<usize>> {
+    if pf_raw.len() < 4 {
+        return None;
+    }
+    let file_count = u32::from_le_bytes(pf_raw[..4].try_into().ok()?) as usize;
+    let mut offsets = Vec::with_capacity(file_count + 1);
+    let mut pos = 4usize;
+    for _ in 0..file_count {
+        offsets.push(pos);
+        if pos + 20 > pf_raw.len() {
+            return None;
+        }
+        // entry: [mtime:8][content_hash:8][trigram_count:4][trigrams:4*tc]
+        let tc = u32::from_le_bytes(pf_raw[pos + 16..pos + 20].try_into().ok()?) as usize;
+        pos += 20 + tc * 4;
+        if pos > pf_raw.len() {
+            return None;
+        }
+    }
+    offsets.push(pos); // sentinel
+    Some(offsets)
+}
+
+/// Read sorted u32 trigrams from one per-file entry starting at `start`.
+fn read_pf_trigrams(pf_raw: &[u8], start: usize) -> Vec<u32> {
+    if start + 20 > pf_raw.len() {
+        return vec![];
+    }
+    let tc =
+        u32::from_le_bytes(pf_raw[start + 16..start + 20].try_into().unwrap_or([0; 4])) as usize;
+    let trigs_start = start + 20;
+    let trigs_end = trigs_start + tc * 4;
+    if trigs_end > pf_raw.len() {
+        return vec![];
+    }
+    (0..tc)
+        .map(|i| {
+            let b = trigs_start + i * 4;
+            u32::from_le_bytes([pf_raw[b], pf_raw[b + 1], pf_raw[b + 2], pf_raw[b + 3]])
+        })
+        .collect()
+}
+
+/// Per-file section entry for the new index.
+enum PerFileSection<'a> {
+    /// Unchanged file: copy raw bytes (mtime + content_hash + trigrams) from old mmap.
+    Raw(&'a [u8]),
+    /// Changed or new file: write mtime/content_hash from FileInfo + these sorted trigrams.
+    New(Vec<u32>),
+}
+
+/// Try to perform a diff-based index update.
+/// Returns Some(true) on success, None if fallback to full rebuild is needed.
+fn try_build_index_diff(
+    root: &Path,
+    index_path: &Path,
+    cache_path: Option<&Path>,
+    fp_path: &Path,
+    lock_path: &Path,
+) -> Result<Option<bool>> {
+    use crate::index::format::u32_to_trigram;
+    use crate::index::reader::IndexReader;
+
+    let reader = match IndexReader::open(index_path) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+
+    // per_file section raw bytes (no allocation, no parse)
+    let pf_raw = reader.per_file_section_raw();
+    if pf_raw.is_empty() {
+        return Ok(None);
+    }
+    let pf_offsets = match compute_pf_offsets(pf_raw) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+
+    let old_file_count = reader.file_count() as usize;
+
+    // path → file_id / mtime のマップを構築 (regular file table = fixed-size, fast)
+    let mut path_to_file_id: HashMap<String, u32> = HashMap::new();
+    let mut path_to_mtime: HashMap<String, u64> = HashMap::new();
+    for fid in 0..old_file_count as u32 {
+        let path = reader.file_path(fid).to_string();
+        path_to_file_id.insert(path.clone(), fid);
+        if let Some(fe) = reader.file_entry(fid) {
+            path_to_mtime.insert(path, fe.mtime);
+        }
+    }
+
+    // Phase 1: mtime のみ確認 (ファイル内容は読まない)
+    // フォールバック判定をコンテンツ読み込み前に行うことで大量変更時の無駄な I/O を排除。
+    // (大量変更: 68K+ ファイルを読まずにフォールバック判定できる)
+    let mut changed_candidates: Vec<(String, PathBuf, u64)> = Vec::new(); // (rel, abs, mtime)
+    let mut new_candidates: Vec<(String, PathBuf, u64)> = Vec::new(); // (rel, abs, mtime)
+    let mut seen_paths: HashSet<String> = HashSet::new();
+
+    for entry in WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|e| !is_xgrep_internal(&e.file_name().to_string_lossy()))
+        .build()
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.file_type().map_or(true, |ft| !ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path == lock_path {
+            continue;
+        }
+        let relative = match path.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+        seen_paths.insert(relative.clone());
+
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        if path_to_file_id.contains_key(&relative) {
+            let old_mtime = path_to_mtime.get(&relative).copied().unwrap_or(0);
+            if mtime != old_mtime {
+                changed_candidates.push((relative, path.to_path_buf(), mtime));
+            }
+        } else {
+            new_candidates.push((relative, path.to_path_buf(), mtime));
+        }
+    }
+
+    let deleted_paths: Vec<String> = path_to_file_id
+        .keys()
+        .filter(|p| !seen_paths.contains(*p))
+        .cloned()
+        .collect();
+
+    // フォールバック判定: コンテンツ読み込み前に閾値チェック
+    // (大量変更の場合ファイル内容を一切読まずに即座に返却)
+    let total_candidates = changed_candidates.len() + new_candidates.len() + deleted_paths.len();
+    if total_candidates * 2 > old_file_count.max(1) {
+        return Ok(None);
+    }
+
+    // Phase 2: 変更ファイルのコンテンツ読み込みとトライグラム抽出
+    let mut changed_files: Vec<(String, Vec<[u8; 3]>)> = Vec::new();
+    let mut new_files: Vec<NewFileInfo> = Vec::new();
+
+    for (relative, abs_path, _mtime) in changed_candidates {
+        let content = match fs::read(&abs_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if memchr::memchr(0, &content).is_some() {
+            continue;
+        }
+        changed_files.push((relative, trigram::extract_trigrams(&content)));
+    }
+
+    for (relative, abs_path, mtime) in new_candidates {
+        let content = match fs::read(&abs_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if memchr::memchr(0, &content).is_some() {
+            continue;
+        }
+        let size = fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
+        let hash = xxhash_rust::xxh64::xxh64(&content, 0);
+        new_files.push((
+            relative,
+            mtime,
+            size,
+            hash,
+            trigram::extract_trigrams(&content),
+        ));
+    }
+
+    // インデックス関連の変更がなければフィンガープリントのみ更新して終了
+    // (バイナリファイルの変更などでフィンガープリントは変わるがインデックスは変わらない場合)
+    if changed_files.is_empty() && new_files.is_empty() && deleted_paths.is_empty() {
+        if let Some(fp) = compute_corpus_fingerprint(root, lock_path) {
+            let _ = write_fingerprint(fp_path, fp);
+        }
+        return Ok(Some(false));
+    }
+
+    // 50% を超えたらフルリビルドにフォールバック。
+    // これは性能上の最適点ではなく安全側の保守値: diff 更新の追加コスト
+    // (旧 posting list の decode) と全件再構築コストの交差点は CPU のみなら
+    // ~91% (実測で検証予定)。50% はその手前 41pt のマージン。書込コストは
+    // 両パスとも v3 index フル書き直し (~650MB) で同じ。
+    let total_changes = changed_files.len() + new_files.len() + deleted_paths.len();
+    if total_changes * 2 > old_file_count.max(1) {
+        return Ok(None);
+    }
+
+    // ID 削除・remap の構築
+    let deleted_ids: HashSet<u32> = deleted_paths
+        .iter()
+        .filter_map(|p| path_to_file_id.get(p).copied())
+        .collect();
+    let mut old_to_new: HashMap<u32, u32> = HashMap::new();
+    let mut new_id = 0u32;
+    for old_id in 0..old_file_count as u32 {
+        if !deleted_ids.contains(&old_id) {
+            old_to_new.insert(old_id, new_id);
+            new_id += 1;
+        }
+    }
+    let base_new_id = new_id;
+
+    // affected_set: 変更が必要な trigrams のみ
+    // unaffected (affected_set 外) の posting list は old mmap から raw byte コピーする
+    let mut affected_set: HashSet<[u8; 3]> = HashSet::new();
+
+    // 変更ファイルの旧 + 新 trigrams
+    for (path, new_trigs) in &changed_files {
+        if let Some(&fid) = path_to_file_id.get(path) {
+            for &t_u32 in &read_pf_trigrams(pf_raw, pf_offsets[fid as usize]) {
+                affected_set.insert(u32_to_trigram(t_u32));
+            }
+        }
+        for &t in new_trigs {
+            affected_set.insert(t);
+        }
+    }
+    // 削除ファイルの trigrams
+    for path in &deleted_paths {
+        if let Some(&fid) = path_to_file_id.get(path) {
+            for &t_u32 in &read_pf_trigrams(pf_raw, pf_offsets[fid as usize]) {
+                affected_set.insert(u32_to_trigram(t_u32));
+            }
+        }
+    }
+    // 新規ファイルの trigrams
+    for (_, _, _, _, trigs) in &new_files {
+        for &t in trigs {
+            affected_set.insert(t);
+        }
+    }
+    // 削除がある場合: min_deleted_id より大きい file_id を持つファイルの trigrams も
+    // ID remap が必要なため affected_set に追加
+    if !deleted_ids.is_empty() {
+        let min_deleted = deleted_ids.iter().min().copied().unwrap_or(u32::MAX);
+        for fid in (min_deleted + 1)..old_file_count as u32 {
+            for &t_u32 in &read_pf_trigrams(pf_raw, pf_offsets[fid as usize]) {
+                affected_set.insert(u32_to_trigram(t_u32));
+            }
+        }
+    }
+
+    // affected_set の posting list のみデコード（最重要最適化）
+    let mut affected_postings: HashMap<[u8; 3], Vec<u32>> =
+        HashMap::with_capacity(affected_set.len());
+    for &t in &affected_set {
+        let ids = reader.lookup_trigram(t);
+        affected_postings.insert(t, ids);
+    }
+
+    // 削除 + remap を affected_postings に適用
+    for ids in affected_postings.values_mut() {
+        ids.retain(|id| !deleted_ids.contains(id));
+        for id in ids.iter_mut() {
+            if let Some(&mapped) = old_to_new.get(id) {
+                *id = mapped;
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+    }
+
+    // 変更ファイルの旧 trigrams 除去（remap 後の new_fid で）
+    let mut changed_file_new_trigrams: HashMap<String, Vec<[u8; 3]>> = HashMap::new();
+    for (path, new_trigrams) in &changed_files {
+        if let Some(&old_fid) = path_to_file_id.get(path) {
+            if let Some(&new_fid) = old_to_new.get(&old_fid) {
+                for &t_u32 in &read_pf_trigrams(pf_raw, pf_offsets[old_fid as usize]) {
+                    let t = u32_to_trigram(t_u32);
+                    if let Some(ids) = affected_postings.get_mut(&t) {
+                        ids.retain(|&id| id != new_fid);
+                    }
+                }
+                changed_file_new_trigrams.insert(path.clone(), new_trigrams.clone());
+            }
+        }
+    }
+
+    // 変更ファイルの新 trigrams 追加
+    for (path, new_trigrams) in &changed_file_new_trigrams {
+        if let Some(&old_fid) = path_to_file_id.get(path) {
+            if let Some(&new_fid) = old_to_new.get(&old_fid) {
+                for &t in new_trigrams {
+                    affected_postings.entry(t).or_default().push(new_fid);
+                }
+            }
+        }
+    }
+
+    // 新規ファイルの trigrams 追加
+    let mut new_file_infos: Vec<NewFileInfo> = Vec::new();
+    for (i, (path, mtime, size, content_hash, trigs)) in new_files.into_iter().enumerate() {
+        let assigned_id = base_new_id + i as u32;
+        for &t in &trigs {
+            affected_postings.entry(t).or_default().push(assigned_id);
+        }
+        new_file_infos.push((path, mtime, size, content_hash, trigs));
+    }
+
+    // ソート + dedup + 空リスト除去
+    for ids in affected_postings.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    affected_postings.retain(|_, ids| !ids.is_empty());
+
+    // 新 file リストと per-file section data を構築
+    let mut remapped: Vec<(u32, u32)> = old_to_new.iter().map(|(&o, &n)| (n, o)).collect();
+    remapped.sort_by_key(|&(n, _)| n);
+
+    let mut new_files_list: Vec<FileInfo> = Vec::new();
+    // PerFileSection::Raw は pf_raw への参照 (no allocation, no sort)
+    // PerFileSection::New は変更/新規ファイルのみ Vec<u32> を持つ
+    let mut pf_section: Vec<PerFileSection<'_>> = Vec::new();
+    // cache 更新用に trigrams が必要 (lazy: 変更/新規のみ追跡)
+    let mut pf_section_trigrams: Vec<Vec<u32>> = Vec::new(); // per file, for cache
+
+    for (_, old_id) in &remapped {
+        let path = reader.file_path(*old_id).to_string();
+        let fe = reader.file_entry(*old_id);
+        let (mtime, size, content_hash) = match fe {
+            Some(fe) => (fe.mtime, fe.size, fe.content_hash),
+            None => (0, 0, 0),
+        };
+
+        if let Some(new_trigs) = changed_file_new_trigrams.get(&path) {
+            let abs_path = root.join(&path);
+            let new_mtime = fs::metadata(&abs_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(mtime);
+            let new_hash = fs::read(&abs_path)
+                .map(|c| xxhash_rust::xxh64::xxh64(&c, 0))
+                .unwrap_or(content_hash);
+            new_files_list.push(FileInfo {
+                relative_path: path,
+                mtime: new_mtime,
+                size,
+                content_hash: new_hash,
+            });
+            let trigs_u32 = trigrams_to_sorted_u32(new_trigs);
+            pf_section_trigrams.push(trigs_u32.clone());
+            pf_section.push(PerFileSection::New(trigs_u32));
+        } else {
+            // 不変ファイル: raw bytes を per_file section からそのままコピー
+            // Vec<u32> アロケーションも sort も不要
+            let raw_start = pf_offsets[*old_id as usize];
+            let raw_end = pf_offsets[*old_id as usize + 1];
+            new_files_list.push(FileInfo {
+                relative_path: path,
+                mtime,
+                size,
+                content_hash,
+            });
+            pf_section_trigrams.push(vec![]); // placeholder; read lazily for cache
+            pf_section.push(PerFileSection::Raw(&pf_raw[raw_start..raw_end]));
+        }
+    }
+
+    // 新規ファイルを末尾に追加
+    for (path, mtime, size, content_hash, trigs) in new_file_infos {
+        new_files_list.push(FileInfo {
+            relative_path: path,
+            mtime,
+            size,
+            content_hash,
+        });
+        let trigs_u32 = trigrams_to_sorted_u32(&trigs);
+        pf_section_trigrams.push(trigs_u32.clone());
+        pf_section.push(PerFileSection::New(trigs_u32));
+    }
+
+    // smart diff write: affected は再エンコード、unaffected は raw bytes コピー
+    // reader はここで まだ alive (pf_section の Raw エントリが reader.mmap を参照)
+    write_smart_diff_index_v3(
+        index_path,
+        &reader,
+        &new_files_list,
+        &pf_section,
+        &affected_postings,
+        &affected_set,
+    )?;
+
+    drop(reader);
+
+    // キャッシュを更新
+    if let Some(cp) = cache_path {
+        let mut new_entries = HashMap::with_capacity(new_files_list.len());
+        for (i, fi) in new_files_list.iter().enumerate() {
+            // changed/new ファイルは pf_section_trigrams に入っている
+            // unchanged ファイルは placeholder; cache 用に raw bytes から読む
+            let trigrams_u32 = if pf_section_trigrams[i].is_empty() {
+                // unchanged: we need to find old_id by path lookup
+                // Just skip cache update for unchanged (cache already has correct entry)
+                // (cache.entries for unchanged files are still valid)
+                continue;
+            } else {
+                &pf_section_trigrams[i]
+            };
+            let trigrams: Vec<[u8; 3]> = trigrams_u32.iter().map(|&t| u32_to_trigram(t)).collect();
+            new_entries.insert(
+                fi.relative_path.clone(),
+                CachedFile {
+                    mtime: fi.mtime,
+                    content_hash: fi.content_hash,
+                    trigrams,
+                },
+            );
+        }
+        // Merge: keep old cache entries for unchanged files, update changed/new
+        let mut merged_cache = TrigramCache::load(cp);
+        for (k, v) in new_entries {
+            merged_cache.entries.insert(k, v);
+        }
+        // Remove deleted files from cache
+        for path in &deleted_paths {
+            merged_cache.entries.remove(path);
+        }
+        merged_cache.save(cp)?;
+    }
+
+    if let Some(fp) = compute_corpus_fingerprint(root, lock_path) {
+        let _ = write_fingerprint(fp_path, fp);
+    }
+
+    Ok(Some(true))
+}
+
+/// Smart differential index write.
+///
+/// 最適化の3層:
+/// 1. affected_postings のみ再エンコード (decode/encode ~25K vs 100K)
+/// 2. unaffected posting list は old mmap から raw bytes コピー
+/// 3. per-file section は unchanged ファイルを raw bytes コピー
+///    (137K × Vec<u32> alloc を排除 = 274K mmap syscall 削減)
+///
+/// 前提: ID remap が必要な trigrams はすべて affected_set に含まれていること。
+fn write_smart_diff_index_v3<'a>(
+    index_path: &Path,
+    old_reader: &'a crate::index::reader::IndexReader,
+    files: &[FileInfo],
+    pf_section: &[PerFileSection<'a>],
+    affected_postings: &HashMap<[u8; 3], Vec<u32>>,
+    affected_set: &HashSet<[u8; 3]>,
+) -> Result<()> {
+    // old mmap の全 trigram entry (sorted) を raw bytes 付きで取得
+    let old_raw_entries = old_reader.all_trigram_entries_raw();
+    let old_raw_map: HashMap<[u8; 3], &[u8]> =
+        old_raw_entries.iter().map(|&(t, b)| (t, b)).collect();
+
+    // 最終的な trigram リスト: (old - affected) ∪ non-empty affected
+    let final_trigrams: Vec<[u8; 3]> = {
+        let mut v: Vec<[u8; 3]> = old_raw_map
+            .keys()
+            .filter(|t| !affected_set.contains(*t))
+            .copied()
+            .collect();
+        for &t in affected_postings.keys() {
+            v.push(t);
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+
+    let parent = index_path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp_path = parent.join(format!(".xgrep_tmp_{}", std::process::id()));
+    let out_file = fs::File::create(&temp_path)?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, out_file);
+
+    let mut header = Header {
+        magic: MAGIC,
+        version: VERSION,
+        trigram_count: final_trigrams.len() as u32,
+        file_count: files.len() as u32,
+        posting_total_bytes: 0,
+        per_file_section_offset: 0,
+    };
+    writer.write_all(&header.to_bytes())?;
+    writer.write_all(&vec![0u8; final_trigrams.len() * TrigramEntry::SIZE])?;
+
+    let mut trigram_entries: Vec<TrigramEntry> = Vec::with_capacity(final_trigrams.len());
+    let mut posting_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut current_offset: u64 = 0;
+
+    for &t in &final_trigrams {
+        let raw: &[u8] = if let Some(ids) = affected_postings.get(&t) {
+            // 再エンコード
+            posting_buf.clear();
+            encode_varint(&mut posting_buf, ids.len() as u32);
+            let mut prev = 0u32;
+            for &fid in ids {
+                encode_varint(&mut posting_buf, fid - prev);
+                prev = fid;
+            }
+            &posting_buf
+        } else if let Some(&r) = old_raw_map.get(&t) {
+            // raw bytes コピー (decode/encode なし)
+            r
+        } else {
+            continue;
+        };
+
+        let len = raw.len() as u32;
+        writer.write_all(raw)?;
+        trigram_entries.push(TrigramEntry {
+            trigram: t,
+            _padding: 0,
+            posting_offset: current_offset,
+            posting_len: len,
+        });
+        current_offset += len as u64;
+    }
+
+    // File Table + String Pool
+    let mut string_pool = Vec::new();
+    for fi in files {
+        let path_offset = string_pool.len() as u32;
+        string_pool.extend_from_slice(fi.relative_path.as_bytes());
+        string_pool.push(0);
+        writer.write_all(
+            &FileEntry {
+                path_offset,
+                mtime: fi.mtime,
+                size: fi.size,
+                content_hash: fi.content_hash,
+            }
+            .to_bytes(),
+        )?;
+    }
+    writer.write_all(&string_pool)?;
+
+    header.posting_total_bytes = current_offset;
+    writer.flush()?;
+    let mut file = writer
+        .into_inner()
+        .map_err(|e| XgrepError::Io(e.into_error()))?;
+
+    let per_file_section_offset = file.seek(SeekFrom::End(0))?;
+
+    // Per-File Section:
+    // - Unchanged files: bulk memcpy from old mmap (no alloc, no parse)
+    // - Changed/new files: write new entry from FileInfo + Vec<u32> trigrams
+    {
+        let mut pf_writer = BufWriter::with_capacity(256 * 1024, &mut file);
+        pf_writer.write_all(&(files.len() as u32).to_le_bytes())?;
+        for (i, fi) in files.iter().enumerate() {
+            match &pf_section[i] {
+                PerFileSection::Raw(raw) => {
+                    // Copy old entry (mtime + content_hash + trigrams) as-is
+                    pf_writer.write_all(raw)?;
+                }
+                PerFileSection::New(trigrams_u32) => {
+                    pf_writer.write_all(&fi.mtime.to_le_bytes())?;
+                    pf_writer.write_all(&fi.content_hash.to_le_bytes())?;
+                    pf_writer.write_all(&(trigrams_u32.len() as u32).to_le_bytes())?;
+                    for &t_u32 in trigrams_u32.iter() {
+                        pf_writer.write_all(&t_u32.to_le_bytes())?;
+                    }
+                }
+            }
+        }
+        pf_writer.flush()?;
+    }
+
+    header.per_file_section_offset = per_file_section_offset;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header.to_bytes())?;
+    file.seek(SeekFrom::Start(Header::SIZE as u64))?;
+    let mut trig_writer = BufWriter::with_capacity(64 * 1024, file);
+    for entry in &trigram_entries {
+        trig_writer.write_all(&entry.to_bytes())?;
+    }
+    trig_writer.flush()?;
+    drop(trig_writer);
+
+    fs::rename(&temp_path, index_path)?;
     Ok(())
 }
 
@@ -639,6 +1433,46 @@ mod tests {
     use crate::index::cache::cache_path_for;
     use std::fs;
     use tempfile::tempdir;
+
+    fn collect_trigram_to_paths(
+        reader: &crate::index::reader::IndexReader,
+    ) -> std::collections::HashMap<[u8; 3], Vec<String>> {
+        let mut result = std::collections::HashMap::new();
+        for t in reader.all_trigrams() {
+            let file_ids = reader.lookup_trigram(t);
+            let paths: Vec<String> = file_ids
+                .iter()
+                .map(|&fid| reader.file_path(fid).to_string())
+                .collect();
+            result.insert(t, paths);
+        }
+        result
+    }
+
+    fn assert_diff_eq_full(dir: &Path, index_path: &Path) {
+        use crate::index::reader::IndexReader;
+
+        // 差分更新結果を読む
+        let diff_reader = IndexReader::open(index_path).unwrap();
+        let mut diff_map = collect_trigram_to_paths(&diff_reader);
+        // paths をソートして比較可能にする
+        for v in diff_map.values_mut() {
+            v.sort();
+        }
+        drop(diff_reader);
+
+        // フルリビルドを行う
+        let full_index_path = dir.join("full_rebuild.xgrep");
+        build_index(dir, &full_index_path).unwrap();
+
+        let full_reader = IndexReader::open(&full_index_path).unwrap();
+        let mut full_map = collect_trigram_to_paths(&full_reader);
+        for v in full_map.values_mut() {
+            v.sort();
+        }
+
+        assert_eq!(diff_map, full_map, "差分更新結果がフルリビルドと一致しない");
+    }
 
     #[test]
     fn test_build_index_creates_file() {
@@ -1129,5 +1963,139 @@ mod tests {
             8,
             "fingerprint file should be exactly 8 bytes (u64)"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Diff update tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_diff_update_modify_file_eq_full_rebuild() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world foo").unwrap();
+        fs::write(root.join("b.txt"), "another content here").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("b.txt"), "completely different xyz").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        assert_diff_eq_full(root, &index_path);
+    }
+
+    #[test]
+    fn test_diff_update_add_file_eq_full_rebuild() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world foo").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        fs::write(root.join("b.txt"), "new file content xyz").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        assert_diff_eq_full(root, &index_path);
+    }
+
+    #[test]
+    fn test_diff_update_delete_file_eq_full_rebuild() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world foo").unwrap();
+        fs::write(root.join("b.txt"), "another content here").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        fs::remove_file(root.join("b.txt")).unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        assert_diff_eq_full(root, &index_path);
+    }
+
+    #[test]
+    fn test_diff_update_double_modify_eq_full_rebuild() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world foo").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("a.txt"), "first modification abc").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("a.txt"), "second modification def").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        assert_diff_eq_full(root, &index_path);
+    }
+
+    #[test]
+    fn test_diff_update_all_files_changed_uses_fallback() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello world foo").unwrap();
+        fs::write(root.join("b.txt"), "another content here").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("a.txt"), "changed a content xyz").unwrap();
+        fs::write(root.join("b.txt"), "changed b content qrs").unwrap();
+
+        // フォールバック（フルビルド）が走ってもOk(true)を返す
+        let result = build_index_with_cache(root, &index_path, None).unwrap();
+        assert!(result);
+
+        // 正しくインデックスが更新されている
+        use crate::index::reader::IndexReader;
+        let reader = IndexReader::open(&index_path).unwrap();
+        assert!(!reader.lookup_trigram(*b"xyz").is_empty());
+    }
+
+    #[test]
+    fn test_diff_update_noop_trigrams_eq_full_rebuild() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // trigramが増減しないファイル変更（末尾に改行追加、内容は短い）
+        fs::write(root.join("a.txt"), "abcdef").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // 全く同じtrigramになるように同じ内容を書く（mtime変更のみ）
+        // → diff updateはmtimeが変わったと判断するが、trigramは同じ
+        fs::write(root.join("a.txt"), "abcdef").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        assert_diff_eq_full(root, &index_path);
+    }
+
+    #[test]
+    fn test_diff_update_last_file_for_trigram_deleted() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // "zzz" というtrigramを含むのはb.txtだけ
+        fs::write(root.join("a.txt"), "hello world foo").unwrap();
+        fs::write(root.join("b.txt"), "zzz unique trigram").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        use crate::index::reader::IndexReader;
+        {
+            let reader = IndexReader::open(&index_path).unwrap();
+            assert!(!reader.lookup_trigram(*b"zzz").is_empty());
+        }
+
+        fs::remove_file(root.join("b.txt")).unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        let reader = IndexReader::open(&index_path).unwrap();
+        // パニックしないこと + 空リストを返すこと
+        let result = reader.lookup_trigram(*b"zzz");
+        assert!(result.is_empty());
     }
 }
