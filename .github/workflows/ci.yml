@@ -162,7 +162,7 @@ jobs:
           workspaces: rust
       - name: Check MSRV
         working-directory: rust
-        run: cargo check --locked
+        run: cargo check
 
   npm-bindings:
     name: npm bindings
