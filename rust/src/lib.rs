@@ -1118,8 +1118,8 @@ mod tests {
 
     #[test]
     fn test_invalid_duration_returns_invalid_argument() {
-        // git.rs の parse_duration が InvalidArgument を返すことを確認
-        // since_files() 経由でテストする
+        // Verify that parse_duration in git.rs returns InvalidArgument.
+        // Tested indirectly via since_files().
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         crate::git::git_cmd()

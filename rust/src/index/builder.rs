@@ -44,8 +44,8 @@ fn binary_cache_path(index_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// 既知バイナリファイルのキャッシュをロード。
-/// 形式: 各行 `{path}\t{mtime}\t{size}\n`
+/// Load cache of known binary files.
+/// Format: each line `{path}\t{mtime}\t{size}\n`
 fn load_binary_cache(cache_path: &Path) -> HashMap<String, (u64, u64)> {
     let Ok(data) = fs::read_to_string(cache_path) else {
         return HashMap::new();
@@ -248,10 +248,10 @@ pub fn build_index_with_cache(
     let fp_path = fingerprint_path(index_path);
     let lock_path = index_path.with_extension("lock");
 
-    // 高速パス: フィンガープリントが一致すれば即返却 (ロック前 = 競合なし)
-    // compute_corpus_fingerprint はウォーク 1 回 (~1s) で済み、
-    // diff ウォーク (~6s: mmap 初期化 + per-file section スキャン) より速い。
-    // pre-lock fp walk: walkデータを収集して diff path に流用 (Phase1 walkを省略)
+    // Fast path: return immediately if the fingerprint matches (pre-lock = no contention).
+    // compute_corpus_fingerprint requires only one walk (~1s), which is faster than
+    // a diff walk (~6s: mmap init + per-file section scan).
+    // pre-lock fp walk: collect walk data for reuse in the diff path (skip Phase 1 walk).
     let mut pre_walk_data: Option<Vec<(String, u64, u64)>> = None;
     if index_path.exists() && fp_path.exists() {
         if let Some(stored) = read_fingerprint(&fp_path) {
@@ -259,7 +259,7 @@ pub fn build_index_with_cache(
                 if current_fp == stored {
                     return Ok(false);
                 }
-                // fp不一致: walkデータをdiff pathに渡してPhase1 walkを省略
+                // Fingerprint mismatch: pass walk data to the diff path to skip Phase 1 walk.
                 pre_walk_data = Some(walk_data);
             }
         }
@@ -267,7 +267,7 @@ pub fn build_index_with_cache(
 
     let _lock_guard = acquire_lock(index_path)?;
 
-    // diff update を試みる (pre_walk_dataがあればPhase1 walkを省略)
+    // Attempt a diff update (skip Phase 1 walk if pre_walk_data is available).
     if index_path.exists() {
         if let Some(v) = try_build_index_diff(
             root,
@@ -277,7 +277,7 @@ pub fn build_index_with_cache(
             &lock_path,
             pre_walk_data,
         )? {
-            return Ok(v); // フォールバック不要: diff 更新成功
+            return Ok(v); // No fallback needed: diff update succeeded.
         }
     }
 
@@ -958,12 +958,12 @@ fn try_build_index_diff(
 
     let old_file_count = reader.file_count() as usize;
 
-    // 既知バイナリファイルのキャッシュをロード (phase2 で不要な peek を回避)
+    // Load cache of known binary files (avoids unnecessary peek in phase 2).
     let bc_path = binary_cache_path(index_path);
     let mut binary_cache = load_binary_cache(&bc_path);
     let binary_cache_original_len = binary_cache.len();
 
-    // path → file_id / mtime のマップを構築 (regular file table = fixed-size, fast)
+    // Build path → file_id / mtime maps (regular file table = fixed-size, fast).
     let mut path_to_file_id: HashMap<String, u32> = HashMap::new();
     let mut path_to_mtime: HashMap<String, u64> = HashMap::new();
     for fid in 0..old_file_count as u32 {
@@ -974,15 +974,15 @@ fn try_build_index_diff(
         }
     }
 
-    // Phase 1: mtime のみ確認 (ファイル内容は読まない)
-    // pre_walk_data がある場合 (pre-lock fp walk の結果を再利用) → Phase1 walk を省略
+    // Phase 1: check mtime only (do not read file contents).
+    // If pre_walk_data is available (reusing pre-lock fp walk result), skip Phase 1 walk.
     let mut changed_candidates: Vec<(String, PathBuf, u64)> = Vec::new(); // (rel, abs, mtime)
     let mut new_candidates: Vec<(String, PathBuf, u64, u64)> = Vec::new(); // (rel, abs, mtime, size)
     let mut seen_paths: HashSet<String> = HashSet::new();
     let mut fp_entries: Vec<(String, u64, u64)>;
 
     if let Some(walk_data) = pre_walk_data {
-        // pre-lock walkデータを流用: Phase1 walkを省略 (~1s節約)
+        // Reuse pre-lock walk data: skip Phase 1 walk (~1s saving).
         fp_entries = walk_data;
         for (relative, mtime, size) in &fp_entries {
             seen_paths.insert(relative.clone());
@@ -993,7 +993,7 @@ fn try_build_index_diff(
                     changed_candidates.push((relative.clone(), abs_path, *mtime));
                 }
             } else {
-                // 既知バイナリかつ mtime+size 一致 → phase2 peek をスキップ
+                // Known binary with matching mtime+size → skip phase 2 peek.
                 if binary_cache
                     .get(relative)
                     .is_some_and(|&(m, s)| m == *mtime && s == *size)
@@ -1051,7 +1051,7 @@ fn try_build_index_diff(
                     changed_candidates.push((relative, path.to_path_buf(), mtime));
                 }
             } else {
-                // 既知バイナリかつ mtime+size 一致 → phase2 peek をスキップ
+                // Known binary with matching mtime+size → skip phase 2 peek.
                 if binary_cache
                     .get(&relative)
                     .is_some_and(|&(m, s)| m == mtime && s == size)
@@ -1070,14 +1070,14 @@ fn try_build_index_diff(
         .cloned()
         .collect();
 
-    // フォールバック判定: コンテンツ読み込み前に閾値チェック
-    // (大量変更の場合ファイル内容を一切読まずに即座に返却)
+    // Fallback check: threshold check before reading content
+    // (return immediately without reading any file contents when changes are too large).
     let total_candidates = changed_candidates.len() + new_candidates.len() + deleted_paths.len();
     if total_candidates * 2 > old_file_count.max(1) {
         return Ok(None);
     }
 
-    // Phase 2: 変更ファイルのコンテンツ読み込みとトライグラム抽出
+    // Phase 2: read content of changed files and extract trigrams.
     let mut changed_files: Vec<(String, Vec<[u8; 3]>)> = Vec::new();
     let mut new_files: Vec<NewFileInfo> = Vec::new();
 
@@ -1087,7 +1087,7 @@ fn try_build_index_diff(
             Err(_) => continue,
         };
         if memchr::memchr(0, &content).is_some() {
-            // テキスト→バイナリ: 旧 trigrams を削除するため空リストで登録
+            // Text→binary: register with empty list so old trigrams are removed.
             changed_files.push((relative, vec![]));
             continue;
         }
@@ -1095,7 +1095,7 @@ fn try_build_index_diff(
     }
 
     for (relative, abs_path, mtime, size) in new_candidates {
-        // 8KB peek でバイナリ早期検出: バイナリファイル(数MB)の全件読み込みを排除
+        // 8 KB peek for early binary detection: avoids reading entire binary files (several MB).
         use std::io::Read;
         let mut file = match fs::File::open(&abs_path) {
             Ok(f) => f,
@@ -1108,7 +1108,7 @@ fn try_build_index_diff(
         };
         if memchr::memchr(0, &peek[..n]).is_some() {
             binary_cache.insert(relative, (mtime, size));
-            continue; // バイナリ: cache に記録して捨てる
+            continue; // Binary: record in cache and skip.
         }
         let mut content = peek[..n].to_vec();
         if file.read_to_end(&mut content).is_err() {
@@ -1124,13 +1124,13 @@ fn try_build_index_diff(
         ));
     }
 
-    // phase2 で新たにバイナリと判定されたファイルを保存 (次回以降の phase2 をスキップ)
+    // Save files newly identified as binary in phase 2 (skip their phase 2 in subsequent runs).
     if binary_cache.len() != binary_cache_original_len {
         save_binary_cache(&bc_path, &binary_cache);
     }
 
-    // インデックス関連の変更がなければフィンガープリントのみ更新して終了
-    // (バイナリファイルの変更などでフィンガープリントは変わるがインデックスは変わらない場合)
+    // If there are no index-relevant changes, update only the fingerprint and return.
+    // (Fingerprint may change due to binary file changes, but the index itself is unaffected.)
     if changed_files.is_empty() && new_files.is_empty() && deleted_paths.is_empty() {
         fp_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut h = Xxh64::new(0);
@@ -1144,17 +1144,17 @@ fn try_build_index_diff(
         return Ok(Some(false));
     }
 
-    // 50% を超えたらフルリビルドにフォールバック。
-    // これは性能上の最適点ではなく安全側の保守値: diff 更新の追加コスト
-    // (旧 posting list の decode) と全件再構築コストの交差点は CPU のみなら
-    // ~91% (実測で検証予定)。50% はその手前 41pt のマージン。書込コストは
-    // 両パスとも v3 index フル書き直し (~650MB) で同じ。
+    // Fall back to full rebuild if changes exceed 50%.
+    // This is a conservative safety margin, not the performance optimum: the crossover
+    // between diff update cost (decoding old posting lists) and full rebuild cost is ~91%
+    // CPU-only (to be verified by measurement). 50% provides a 41-point margin.
+    // Write cost is the same for both paths: full v3 index rewrite (~650 MB).
     let total_changes = changed_files.len() + new_files.len() + deleted_paths.len();
     if total_changes * 2 > old_file_count.max(1) {
         return Ok(None);
     }
 
-    // ID 削除・remap の構築
+    // Build ID deletion and remap tables.
     let deleted_ids: HashSet<u32> = deleted_paths
         .iter()
         .filter_map(|p| path_to_file_id.get(p).copied())
@@ -1169,11 +1169,11 @@ fn try_build_index_diff(
     }
     let base_new_id = new_id;
 
-    // affected_set: 変更が必要な trigrams のみ
-    // unaffected (affected_set 外) の posting list は old mmap から raw byte コピーする
+    // affected_set: only trigrams that need to be updated.
+    // Posting lists for unaffected trigrams (outside affected_set) are raw-copied from the old mmap.
     let mut affected_set: HashSet<[u8; 3]> = HashSet::new();
 
-    // 変更ファイルの旧 + 新 trigrams
+    // Old + new trigrams of changed files.
     for (path, new_trigs) in &changed_files {
         if let Some(&fid) = path_to_file_id.get(path) {
             for &t_u32 in &read_pf_trigrams(pf_raw, pf_offsets[fid as usize]) {
@@ -1184,7 +1184,7 @@ fn try_build_index_diff(
             affected_set.insert(t);
         }
     }
-    // 削除ファイルの trigrams
+    // Trigrams of deleted files.
     for path in &deleted_paths {
         if let Some(&fid) = path_to_file_id.get(path) {
             for &t_u32 in &read_pf_trigrams(pf_raw, pf_offsets[fid as usize]) {
@@ -1192,14 +1192,14 @@ fn try_build_index_diff(
             }
         }
     }
-    // 新規ファイルの trigrams
+    // Trigrams of new files.
     for (_, _, _, _, trigs) in &new_files {
         for &t in trigs {
             affected_set.insert(t);
         }
     }
-    // 削除がある場合: min_deleted_id より大きい file_id を持つファイルの trigrams も
-    // ID remap が必要なため affected_set に追加
+    // When there are deletions: also add trigrams of files whose file_id is greater than
+    // min_deleted_id to affected_set, since they require ID remap.
     if !deleted_ids.is_empty() {
         let min_deleted = deleted_ids.iter().min().copied().unwrap_or(u32::MAX);
         for fid in (min_deleted + 1)..old_file_count as u32 {
@@ -1209,7 +1209,7 @@ fn try_build_index_diff(
         }
     }
 
-    // affected_set の posting list のみデコード（最重要最適化）
+    // Decode only posting lists in affected_set (the most important optimization).
     let mut affected_postings: HashMap<[u8; 3], Vec<u32>> =
         HashMap::with_capacity(affected_set.len());
     for &t in &affected_set {
@@ -1217,8 +1217,8 @@ fn try_build_index_diff(
         affected_postings.insert(t, ids);
     }
 
-    // 削除 + remap: 削除がない場合は skip (デコード済みリストはソート済みのまま)
-    // 削除がある場合のみ retain + remap + sort が必要
+    // Deletion + remap: skip if there are no deletions (decoded lists remain sorted).
+    // retain + remap + sort is only needed when there are deletions.
     if !deleted_ids.is_empty() {
         for ids in affected_postings.values_mut() {
             ids.retain(|id| !deleted_ids.contains(id));
@@ -1232,8 +1232,8 @@ fn try_build_index_diff(
         }
     }
 
-    // 変更ファイルの旧 trigrams 除去:
-    // retain の代わりに binary_search + remove でソート済み状態を維持
+    // Remove old trigrams of changed files:
+    // use binary_search + remove instead of retain to maintain sorted order.
     let mut changed_file_new_trigrams: HashMap<String, Vec<[u8; 3]>> = HashMap::new();
     for (path, new_trigrams) in &changed_files {
         if let Some(&old_fid) = path_to_file_id.get(path) {
@@ -1251,8 +1251,8 @@ fn try_build_index_diff(
         }
     }
 
-    // 変更ファイルの新 trigrams 追加:
-    // push の代わりに partition_point + insert でソート済み状態を維持
+    // Add new trigrams of changed files:
+    // use partition_point + insert instead of push to maintain sorted order.
     for (path, new_trigrams) in &changed_file_new_trigrams {
         if let Some(&old_fid) = path_to_file_id.get(path) {
             if let Some(&new_fid) = old_to_new.get(&old_fid) {
@@ -1267,7 +1267,7 @@ fn try_build_index_diff(
         }
     }
 
-    // 新規ファイルの trigrams 追加 (sorted insert)
+    // Add trigrams of new files (sorted insert).
     let mut new_file_infos: Vec<NewFileInfo> = Vec::new();
     for (i, (path, mtime, size, content_hash, trigs)) in new_files.into_iter().enumerate() {
         let assigned_id = base_new_id + i as u32;
@@ -1281,16 +1281,16 @@ fn try_build_index_diff(
         new_file_infos.push((path, mtime, size, content_hash, trigs));
     }
 
-    // sorted insert を維持しているため sort_unstable は不要。空リストのみ除去
+    // Sorted order is maintained, so sort_unstable is not needed. Remove empty lists only.
     affected_postings.retain(|_, ids| !ids.is_empty());
 
-    // 新 file リストと per-file section data を構築
+    // Build new file list and per-file section data.
     let mut remapped: Vec<(u32, u32)> = old_to_new.iter().map(|(&o, &n)| (n, o)).collect();
     remapped.sort_by_key(|&(n, _)| n);
 
     let mut new_files_list: Vec<FileInfo> = Vec::new();
-    // PerFileSection::Raw は pf_raw への参照 (no allocation, no sort)
-    // PerFileSection::New は変更/新規ファイルのみ Vec<u32> を持つ
+    // PerFileSection::Raw holds a reference into pf_raw (no allocation, no sort).
+    // PerFileSection::New holds a Vec<u32> only for changed/new files.
     let mut pf_section: Vec<PerFileSection<'_>> = Vec::new();
 
     for (_, old_id) in &remapped {
@@ -1320,8 +1320,8 @@ fn try_build_index_diff(
             });
             pf_section.push(PerFileSection::New(trigrams_to_sorted_u32(new_trigs)));
         } else {
-            // 不変ファイル: raw bytes を per_file section からそのままコピー
-            // Vec<u32> アロケーションも sort も不要
+            // Unchanged file: copy raw bytes directly from the per-file section.
+            // No Vec<u32> allocation or sort required.
             let raw_start = pf_offsets[*old_id as usize];
             let raw_end = pf_offsets[*old_id as usize + 1];
             new_files_list.push(FileInfo {
@@ -1334,7 +1334,7 @@ fn try_build_index_diff(
         }
     }
 
-    // 新規ファイルを末尾に追加
+    // Append new files at the end.
     for (path, mtime, size, content_hash, trigs) in new_file_infos {
         new_files_list.push(FileInfo {
             relative_path: path,
@@ -1345,8 +1345,8 @@ fn try_build_index_diff(
         pf_section.push(PerFileSection::New(trigrams_to_sorted_u32(&trigs)));
     }
 
-    // smart diff write: affected は再エンコード、unaffected は raw bytes コピー
-    // reader はここで まだ alive (pf_section の Raw エントリが reader.mmap を参照)
+    // Smart diff write: re-encode affected, raw-copy unaffected.
+    // reader is still alive here (Raw entries in pf_section reference reader.mmap).
     write_smart_diff_index_v3(
         index_path,
         &reader,
@@ -1357,14 +1357,14 @@ fn try_build_index_diff(
     )?;
 
     drop(reader);
-    // diff mode ではキャッシュを更新しない:
-    // - diff path はキャッシュを読まないため更新不要
-    // - フルビルド fallback 時はフルビルド側でキャッシュを再構築する
-    // - stale になった変更ファイルのエントリは次回フルビルドで自動再計算される
+    // In diff mode, do not update the cache:
+    // - The diff path does not read the cache, so no update is needed.
+    // - On full-rebuild fallback, the full-build path will regenerate the cache.
+    // - Stale entries for changed files are automatically recalculated on the next full build.
     let _ = cache_path; // suppress unused warning
 
-    // Phase1 walkで収集済みの (path, mtime, size) から fingerprint を計算
-    // compute_corpus_fingerprint (3回目のwalk ~1.2s) を排除
+    // Compute fingerprint from (path, mtime, size) collected in Phase 1 walk,
+    // eliminating compute_corpus_fingerprint (a 3rd walk, ~1.2 s).
     fp_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut h = Xxh64::new(0);
     for (path, mtime, size) in &fp_entries {
@@ -1380,13 +1380,13 @@ fn try_build_index_diff(
 
 /// Smart differential index write.
 ///
-/// 最適化の3層:
-/// 1. affected_postings のみ再エンコード (decode/encode ~25K vs 100K)
-/// 2. unaffected posting list は old mmap から raw bytes コピー
-/// 3. per-file section は unchanged ファイルを raw bytes コピー
-///    (137K × Vec<u32> alloc を排除 = 274K mmap syscall 削減)
+/// Three layers of optimization:
+/// 1. Only re-encode affected_postings (decode/encode ~25K vs 100K).
+/// 2. Raw-copy unaffected posting lists from the old mmap.
+/// 3. Raw-copy unchanged files' per-file section entries
+///    (eliminates 137K × Vec<u32> allocations = 274K fewer mmap syscalls).
 ///
-/// 前提: ID remap が必要な trigrams はすべて affected_set に含まれていること。
+/// Precondition: all trigrams requiring ID remap must be included in affected_set.
 fn write_smart_diff_index_v3<'a>(
     index_path: &Path,
     old_reader: &'a crate::index::reader::IndexReader,
@@ -1395,12 +1395,12 @@ fn write_smart_diff_index_v3<'a>(
     affected_postings: &HashMap<[u8; 3], Vec<u32>>,
     affected_set: &HashSet<[u8; 3]>,
 ) -> Result<()> {
-    // old mmap の全 trigram entry (sorted) を raw bytes 付きで取得
+    // Retrieve all trigram entries (sorted) from the old mmap with their raw bytes.
     let old_raw_entries = old_reader.all_trigram_entries_raw();
     let old_raw_map: HashMap<[u8; 3], &[u8]> =
         old_raw_entries.iter().map(|&(t, b)| (t, b)).collect();
 
-    // 最終的な trigram リスト: (old - affected) ∪ non-empty affected
+    // Final trigram list: (old - affected) ∪ non-empty affected.
     let final_trigrams: Vec<[u8; 3]> = {
         let mut v: Vec<[u8; 3]> = old_raw_map
             .keys()
@@ -1438,7 +1438,7 @@ fn write_smart_diff_index_v3<'a>(
 
     for &t in &final_trigrams {
         let raw: &[u8] = if let Some(ids) = affected_postings.get(&t) {
-            // 再エンコード
+            // Re-encode.
             posting_buf.clear();
             encode_varint(&mut posting_buf, ids.len() as u32);
             let mut prev = 0u32;
@@ -1448,7 +1448,7 @@ fn write_smart_diff_index_v3<'a>(
             }
             &posting_buf
         } else if let Some(&r) = old_raw_map.get(&t) {
-            // raw bytes コピー (decode/encode なし)
+            // Raw-copy bytes (no decode/encode).
             r
         } else {
             continue;
@@ -1563,16 +1563,16 @@ mod tests {
     fn assert_diff_eq_full(dir: &Path, index_path: &Path) {
         use crate::index::reader::IndexReader;
 
-        // 差分更新結果を読む
+        // Read the diff-update result.
         let diff_reader = IndexReader::open(index_path).unwrap();
         let mut diff_map = collect_trigram_to_paths(&diff_reader);
-        // paths をソートして比較可能にする
+        // Sort paths to make them comparable.
         for v in diff_map.values_mut() {
             v.sort();
         }
         drop(diff_reader);
 
-        // フルリビルドを行う
+        // Perform a full rebuild.
         let full_index_path = dir.join("full_rebuild.xgrep");
         build_index(dir, &full_index_path).unwrap();
 
@@ -1582,7 +1582,10 @@ mod tests {
             v.sort();
         }
 
-        assert_eq!(diff_map, full_map, "差分更新結果がフルリビルドと一致しない");
+        assert_eq!(
+            diff_map, full_map,
+            "diff update result does not match full rebuild"
+        );
     }
 
     #[test]
@@ -2157,11 +2160,11 @@ mod tests {
         fs::write(root.join("a.txt"), "changed a content xyz").unwrap();
         fs::write(root.join("b.txt"), "changed b content qrs").unwrap();
 
-        // フォールバック（フルビルド）が走ってもOk(true)を返す
+        // Returns Ok(true) even when fallback (full build) is triggered.
         let result = build_index_with_cache(root, &index_path, None).unwrap();
         assert!(result);
 
-        // 正しくインデックスが更新されている
+        // Verify the index is correctly updated.
         use crate::index::reader::IndexReader;
         let reader = IndexReader::open(&index_path).unwrap();
         assert!(!reader.lookup_trigram(*b"xyz").is_empty());
@@ -2171,14 +2174,14 @@ mod tests {
     fn test_diff_update_noop_trigrams_eq_full_rebuild() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        // trigramが増減しないファイル変更（末尾に改行追加、内容は短い）
+        // File change that does not alter the trigram set (e.g. short content, same bytes rewritten).
         fs::write(root.join("a.txt"), "abcdef").unwrap();
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        // 全く同じtrigramになるように同じ内容を書く（mtime変更のみ）
-        // → diff updateはmtimeが変わったと判断するが、trigramは同じ
+        // Write the same content so the trigrams are identical (only mtime changes).
+        // The diff update detects a mtime change but the trigrams are the same.
         fs::write(root.join("a.txt"), "abcdef").unwrap();
         build_index_with_cache(root, &index_path, None).unwrap();
 
@@ -2189,7 +2192,7 @@ mod tests {
     fn test_diff_update_last_file_for_trigram_deleted() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        // "zzz" というtrigramを含むのはb.txtだけ
+        // Only b.txt contains the "zzz" trigram.
         fs::write(root.join("a.txt"), "hello world foo").unwrap();
         fs::write(root.join("b.txt"), "zzz unique trigram").unwrap();
         let index_path = root.join("index.xgrep");
@@ -2205,22 +2208,22 @@ mod tests {
         build_index_with_cache(root, &index_path, None).unwrap();
 
         let reader = IndexReader::open(&index_path).unwrap();
-        // パニックしないこと + 空リストを返すこと
+        // Must not panic and must return an empty list.
         let result = reader.lookup_trigram(*b"zzz");
         assert!(result.is_empty());
     }
 
     // --- bincache correctness tests ---
     //
-    // bincache の不変条件: diff 更新後のインデックスはフルリビルドと同一でなければならない。
-    // bincache が関与する経路（new_candidates のバイナリ判定）も同じ原則に従う。
+    // bincache invariant: the index after a diff update must be identical to a full rebuild.
+    // The bincache code path (binary classification of new_candidates) follows the same rule.
     //
-    // 既知の制限: mtime と size が同一のままバイナリ→テキストに変化したファイルは
-    // bincache によって誤ってスキップされる（OS の mtime 精度と同じ前提）。
-    // これは git が `--assume-unchanged` で採用するのと同じトレードオフ。
+    // Known limitation: a file that changes from binary to text while keeping the same mtime
+    // and size will be incorrectly skipped by bincache (same assumption as OS mtime precision).
+    // This is the same trade-off git uses with `--assume-unchanged`.
 
-    // bincache が存在しない / 破損している場合でも diff 更新がクラッシュせず
-    // 結果がフルリビルドと一致することを確認する。
+    // Verify that diff update does not crash and produces a result matching full rebuild
+    // even when bincache is absent or corrupted.
     #[test]
     fn test_bincache_missing_does_not_crash() {
         let dir = tempdir().unwrap();
@@ -2232,7 +2235,7 @@ mod tests {
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
 
-        // bincache が存在しないまま diff 更新
+        // Diff update without bincache.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(root.join("text.txt"), "hello world updated").unwrap();
         build_index_with_cache(root, &index_path, None).unwrap();
@@ -2240,8 +2243,8 @@ mod tests {
         assert_diff_eq_full(root, &index_path);
     }
 
-    // bincache に記録されたバイナリファイルの mtime が変化した場合、
-    // bincache ミスとなり再 peek される。バイナリのまま → インデックス対象外のまま。
+    // When the mtime of a binary file recorded in bincache changes,
+    // it becomes a cache miss and is re-peeked. Still binary → still excluded from index.
     #[test]
     fn test_bincache_binary_mtime_changed_still_excluded() {
         let dir = tempdir().unwrap();
@@ -2252,23 +2255,23 @@ mod tests {
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
 
-        // 1回目 diff: binary.bin が new_candidate → bincache に記録される
+        // 1st diff: binary.bin is a new_candidate → recorded in bincache.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(root.join("text.txt"), "hello world unique_abc v2").unwrap();
         build_index_with_cache(root, &index_path, None).unwrap();
 
-        // binary.bin の mtime を変更 (bincache ミスを誘発)
+        // Change binary.bin's mtime (triggers a bincache miss).
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        // 内容はバイナリのまま、mtime だけ更新
+        // Content remains binary; only mtime is updated.
         fs::write(root.join("binary.bin"), b"data\x00null").unwrap();
         build_index_with_cache(root, &index_path, None).unwrap();
 
-        // バイナリは依然インデックス対象外 → フルリビルドと一致
+        // Binary is still excluded from index → matches full rebuild.
         assert_diff_eq_full(root, &index_path);
     }
 
-    // バイナリ→テキストに変化し mtime が更新された場合、
-    // bincache ミス → 再 peek → テキストと判定 → 正しくインデックスに含まれる。
+    // When a file changes from binary to text and mtime is updated,
+    // bincache miss → re-peek → classified as text → correctly included in index.
     #[test]
     fn test_bincache_binary_to_text_reindexed() {
         let dir = tempdir().unwrap();
@@ -2279,37 +2282,37 @@ mod tests {
         let index_path = root.join("index.xgrep");
         build_index(root, &index_path).unwrap();
 
-        // 1回目 diff: became_text.bin が new_candidate → bincache に記録
+        // 1st diff: became_text.bin is a new_candidate → recorded in bincache.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(root.join("text.txt"), "hello world v2").unwrap();
         build_index_with_cache(root, &index_path, None).unwrap();
 
-        // became_text.bin をテキストに変更 (mtime も更新)
+        // Change became_text.bin to text content (mtime also updated).
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(root.join("became_text.bin"), "now text content qzx").unwrap();
         build_index_with_cache(root, &index_path, None).unwrap();
 
-        // テキストになったので "qzx" が検索可能になる → フルリビルドと一致
+        // Now text, so "qzx" should be searchable → matches full rebuild.
         use crate::index::reader::IndexReader;
         let reader = IndexReader::open(&index_path).unwrap();
         let qzx = reader.lookup_trigram(*b"qzx");
         assert!(
             !qzx.is_empty(),
-            "binary→text 変換後のコンテンツが検索可能でなければならない"
+            "content after binary→text conversion must be searchable"
         );
         drop(reader);
 
         assert_diff_eq_full(root, &index_path);
     }
 
-    // テキスト→バイナリに変化し mtime が更新された場合、
-    // 旧 trigrams が posting list から除去され、その trigram を持つ最後のファイルが
-    // 除外されると posting list が空になることを確認する。
+    // When a file changes from text to binary and mtime is updated,
+    // old trigrams are removed from posting lists; when the last file for a trigram
+    // is excluded, the posting list becomes empty.
     #[test]
     fn test_bincache_text_to_binary_posting_list_emptied() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        // "qqq" trigram は became_binary.txt のみが持つ
+        // Only became_binary.txt contains the "qqq" trigram.
         fs::write(root.join("became_binary.txt"), "qqq unique trigram").unwrap();
         fs::write(root.join("other.txt"), "hello world").unwrap();
 
@@ -2321,11 +2324,11 @@ mod tests {
             let reader = IndexReader::open(&index_path).unwrap();
             assert!(
                 !reader.lookup_trigram(*b"qqq").is_empty(),
-                "初期 build で qqq が存在"
+                "qqq must exist after initial build"
             );
         }
 
-        // became_binary.txt をバイナリに変更
+        // Change became_binary.txt to binary content.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(root.join("became_binary.txt"), b"binary\x00content").unwrap();
         build_index_with_cache(root, &index_path, None).unwrap();
@@ -2334,7 +2337,7 @@ mod tests {
         let result = reader.lookup_trigram(*b"qqq");
         assert!(
             result.is_empty(),
-            "テキスト→バイナリ後、qqq の posting list が空でなければならない"
+            "after text→binary, the qqq posting list must be empty"
         );
         drop(reader);
 

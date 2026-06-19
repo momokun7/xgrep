@@ -150,7 +150,7 @@ impl FileEntry {
     }
 }
 
-/// trigram [u8;3] を u32 に変換
+/// Convert trigram [u8;3] to u32
 pub fn trigram_to_u32(t: [u8; 3]) -> u32 {
     (t[0] as u32) << 16 | (t[1] as u32) << 8 | t[2] as u32
 }
@@ -159,7 +159,7 @@ pub fn u32_to_trigram(v: u32) -> [u8; 3] {
     [(v >> 16) as u8, (v >> 8) as u8, v as u8]
 }
 
-/// Vec<[u8;3]> を sorted unique u32 リストに変換
+/// Convert Vec<[u8;3]> to a sorted unique u32 list
 pub fn trigrams_to_sorted_u32(trigrams: &[[u8; 3]]) -> Vec<u32> {
     let mut v: Vec<u32> = trigrams.iter().map(|&t| trigram_to_u32(t)).collect();
     v.sort_unstable();
