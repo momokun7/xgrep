@@ -357,6 +357,23 @@ impl Xgrep {
         if let Some(parent) = self.index_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        // v2 → v3 migration: emit a one-time message so users understand
+        // why the first run after upgrade is slower than usual.
+        if !self.config.quiet && self.index_path.exists() {
+            use crate::index::format::{VERSION, VERSION_V2};
+            use std::io::Read;
+            if let Ok(mut f) = std::fs::File::open(&self.index_path) {
+                let mut buf = [0u8; 8];
+                if f.read_exact(&mut buf).is_ok() {
+                    let ver = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    if ver == VERSION_V2 && &buf[0..4] == b"XGRP" {
+                        eprintln!("migrating index to v{VERSION} format (one-time rebuild)...");
+                    }
+                }
+            }
+        }
+
         let cache = index::cache::cache_path_for(&self.index_path);
         let rebuilt =
             index::builder::build_index_with_cache(&self.root, &self.index_path, Some(&cache))?;

@@ -1087,6 +1087,8 @@ fn try_build_index_diff(
             Err(_) => continue,
         };
         if memchr::memchr(0, &content).is_some() {
+            // テキスト→バイナリ: 旧 trigrams を削除するため空リストで登録
+            changed_files.push((relative, vec![]));
             continue;
         }
         changed_files.push((relative, trigram::extract_trigrams(&content)));
@@ -2206,5 +2208,136 @@ mod tests {
         // パニックしないこと + 空リストを返すこと
         let result = reader.lookup_trigram(*b"zzz");
         assert!(result.is_empty());
+    }
+
+    // --- bincache correctness tests ---
+    //
+    // bincache の不変条件: diff 更新後のインデックスはフルリビルドと同一でなければならない。
+    // bincache が関与する経路（new_candidates のバイナリ判定）も同じ原則に従う。
+    //
+    // 既知の制限: mtime と size が同一のままバイナリ→テキストに変化したファイルは
+    // bincache によって誤ってスキップされる（OS の mtime 精度と同じ前提）。
+    // これは git が `--assume-unchanged` で採用するのと同じトレードオフ。
+
+    // bincache が存在しない / 破損している場合でも diff 更新がクラッシュせず
+    // 結果がフルリビルドと一致することを確認する。
+    #[test]
+    fn test_bincache_missing_does_not_crash() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // text + binary
+        fs::write(root.join("text.txt"), "hello world").unwrap();
+        fs::write(root.join("binary.bin"), b"data\x00null").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        // bincache が存在しないまま diff 更新
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("text.txt"), "hello world updated").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        assert_diff_eq_full(root, &index_path);
+    }
+
+    // bincache に記録されたバイナリファイルの mtime が変化した場合、
+    // bincache ミスとなり再 peek される。バイナリのまま → インデックス対象外のまま。
+    #[test]
+    fn test_bincache_binary_mtime_changed_still_excluded() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("text.txt"), "hello world unique_abc").unwrap();
+        fs::write(root.join("binary.bin"), b"data\x00null").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        // 1回目 diff: binary.bin が new_candidate → bincache に記録される
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("text.txt"), "hello world unique_abc v2").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        // binary.bin の mtime を変更 (bincache ミスを誘発)
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // 内容はバイナリのまま、mtime だけ更新
+        fs::write(root.join("binary.bin"), b"data\x00null").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        // バイナリは依然インデックス対象外 → フルリビルドと一致
+        assert_diff_eq_full(root, &index_path);
+    }
+
+    // バイナリ→テキストに変化し mtime が更新された場合、
+    // bincache ミス → 再 peek → テキストと判定 → 正しくインデックスに含まれる。
+    #[test]
+    fn test_bincache_binary_to_text_reindexed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("text.txt"), "hello world").unwrap();
+        fs::write(root.join("became_text.bin"), b"was\x00binary").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        // 1回目 diff: became_text.bin が new_candidate → bincache に記録
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("text.txt"), "hello world v2").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        // became_text.bin をテキストに変更 (mtime も更新)
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("became_text.bin"), "now text content qzx").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        // テキストになったので "qzx" が検索可能になる → フルリビルドと一致
+        use crate::index::reader::IndexReader;
+        let reader = IndexReader::open(&index_path).unwrap();
+        let qzx = reader.lookup_trigram(*b"qzx");
+        assert!(
+            !qzx.is_empty(),
+            "binary→text 変換後のコンテンツが検索可能でなければならない"
+        );
+        drop(reader);
+
+        assert_diff_eq_full(root, &index_path);
+    }
+
+    // テキスト→バイナリに変化し mtime が更新された場合、
+    // 旧 trigrams が posting list から除去され、その trigram を持つ最後のファイルが
+    // 除外されると posting list が空になることを確認する。
+    #[test]
+    fn test_bincache_text_to_binary_posting_list_emptied() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // "qqq" trigram は became_binary.txt のみが持つ
+        fs::write(root.join("became_binary.txt"), "qqq unique trigram").unwrap();
+        fs::write(root.join("other.txt"), "hello world").unwrap();
+
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+
+        use crate::index::reader::IndexReader;
+        {
+            let reader = IndexReader::open(&index_path).unwrap();
+            assert!(
+                !reader.lookup_trigram(*b"qqq").is_empty(),
+                "初期 build で qqq が存在"
+            );
+        }
+
+        // became_binary.txt をバイナリに変更
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(root.join("became_binary.txt"), b"binary\x00content").unwrap();
+        build_index_with_cache(root, &index_path, None).unwrap();
+
+        let reader = IndexReader::open(&index_path).unwrap();
+        let result = reader.lookup_trigram(*b"qqq");
+        assert!(
+            result.is_empty(),
+            "テキスト→バイナリ後、qqq の posting list が空でなければならない"
+        );
+        drop(reader);
+
+        assert_diff_eq_full(root, &index_path);
     }
 }
