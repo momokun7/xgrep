@@ -353,7 +353,7 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Build wheel
         working-directory: python
-        run: maturin build --release --target ${{ matrix.target }} --features extension-module
+        run: maturin build --release --target ${{ matrix.target }} --features extension-module -i python3.11
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       - name: Upload artifact
