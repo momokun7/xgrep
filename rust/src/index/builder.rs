@@ -38,6 +38,51 @@ fn write_fingerprint(fp_path: &Path, fingerprint: u64) -> Result<()> {
     Ok(())
 }
 
+fn binary_cache_path(index_path: &Path) -> PathBuf {
+    let mut s = index_path.as_os_str().to_os_string();
+    s.push(".bincache");
+    PathBuf::from(s)
+}
+
+/// 既知バイナリファイルのキャッシュをロード。
+/// 形式: 各行 `{path}\t{mtime}\t{size}\n`
+fn load_binary_cache(cache_path: &Path) -> HashMap<String, (u64, u64)> {
+    let Ok(data) = fs::read_to_string(cache_path) else {
+        return HashMap::new();
+    };
+    let mut map = HashMap::new();
+    for line in data.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let (Some(path), Some(mtime_s), Some(size_s)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let (Ok(mtime), Ok(size)) = (mtime_s.parse::<u64>(), size_s.parse::<u64>()) else {
+            continue;
+        };
+        map.insert(path.to_owned(), (mtime, size));
+    }
+    map
+}
+
+fn save_binary_cache(cache_path: &Path, cache: &HashMap<String, (u64, u64)>) {
+    let mut data = String::with_capacity(cache.len() * 80);
+    let mut entries: Vec<(&str, u64, u64)> = cache
+        .iter()
+        .map(|(p, &(m, s))| (p.as_str(), m, s))
+        .collect();
+    entries.sort_unstable_by_key(|e| e.0);
+    for (path, mtime, size) in entries {
+        data.push_str(path);
+        data.push('\t');
+        data.push_str(&mtime.to_string());
+        data.push('\t');
+        data.push_str(&size.to_string());
+        data.push('\n');
+    }
+    let _ = fs::write(cache_path, data.as_bytes());
+}
+
 /// Walk `root` and compute a fingerprint of all file paths + mtimes + sizes.
 ///
 /// The fingerprint captures the state of the entire file tree, including
@@ -60,7 +105,11 @@ fn is_xgrep_internal(name: &str) -> bool {
         || name.starts_with(".xgrep_tmp_") // atomic write tmp files
 }
 
-fn compute_corpus_fingerprint(root: &Path, lock_path: &Path) -> Option<u64> {
+/// Walk corpus and collect (relative_path, mtime, size) for every non-binary-filtered file.
+/// Returns (fingerprint, walk_data). The caller can reuse walk_data in Phase 1 to skip the
+/// duplicate walk.
+#[allow(clippy::type_complexity)]
+fn collect_corpus_walk(root: &Path, lock_path: &Path) -> Option<(u64, Vec<(String, u64, u64)>)> {
     let mut entries: Vec<(String, u64, u64)> = Vec::new();
     for entry in WalkBuilder::new(root)
         .hidden(true)
@@ -97,7 +146,11 @@ fn compute_corpus_fingerprint(root: &Path, lock_path: &Path) -> Option<u64> {
         h.update(&mtime.to_le_bytes());
         h.update(&size.to_le_bytes());
     }
-    Some(h.digest())
+    Some((h.digest(), entries))
+}
+
+fn compute_corpus_fingerprint(root: &Path, lock_path: &Path) -> Option<u64> {
+    collect_corpus_walk(root, lock_path).map(|(fp, _)| fp)
 }
 
 // ============================================================
@@ -198,22 +251,32 @@ pub fn build_index_with_cache(
     // 高速パス: フィンガープリントが一致すれば即返却 (ロック前 = 競合なし)
     // compute_corpus_fingerprint はウォーク 1 回 (~1s) で済み、
     // diff ウォーク (~6s: mmap 初期化 + per-file section スキャン) より速い。
+    // pre-lock fp walk: walkデータを収集して diff path に流用 (Phase1 walkを省略)
+    let mut pre_walk_data: Option<Vec<(String, u64, u64)>> = None;
     if index_path.exists() && fp_path.exists() {
-        if let (Some(stored), Some(current)) = (
-            read_fingerprint(&fp_path),
-            compute_corpus_fingerprint(root, &lock_path),
-        ) {
-            if current == stored {
-                return Ok(false);
+        if let Some(stored) = read_fingerprint(&fp_path) {
+            if let Some((current_fp, walk_data)) = collect_corpus_walk(root, &lock_path) {
+                if current_fp == stored {
+                    return Ok(false);
+                }
+                // fp不一致: walkデータをdiff pathに渡してPhase1 walkを省略
+                pre_walk_data = Some(walk_data);
             }
         }
     }
 
     let _lock_guard = acquire_lock(index_path)?;
 
-    // diff update を試みる (ウォーク内でフィンガープリントを同時計算して末尾ウォークを排除)
+    // diff update を試みる (pre_walk_dataがあればPhase1 walkを省略)
     if index_path.exists() {
-        if let Some(v) = try_build_index_diff(root, index_path, cache_path, &fp_path, &lock_path)? {
+        if let Some(v) = try_build_index_diff(
+            root,
+            index_path,
+            cache_path,
+            &fp_path,
+            &lock_path,
+            pre_walk_data,
+        )? {
             return Ok(v); // フォールバック不要: diff 更新成功
         }
     }
@@ -873,6 +936,7 @@ fn try_build_index_diff(
     cache_path: Option<&Path>,
     fp_path: &Path,
     lock_path: &Path,
+    pre_walk_data: Option<Vec<(String, u64, u64)>>, // (rel_path, mtime, size) from pre-lock walk
 ) -> Result<Option<bool>> {
     use crate::index::format::u32_to_trigram;
     use crate::index::reader::IndexReader;
@@ -894,6 +958,11 @@ fn try_build_index_diff(
 
     let old_file_count = reader.file_count() as usize;
 
+    // 既知バイナリファイルのキャッシュをロード (phase2 で不要な peek を回避)
+    let bc_path = binary_cache_path(index_path);
+    let mut binary_cache = load_binary_cache(&bc_path);
+    let binary_cache_original_len = binary_cache.len();
+
     // path → file_id / mtime のマップを構築 (regular file table = fixed-size, fast)
     let mut path_to_file_id: HashMap<String, u32> = HashMap::new();
     let mut path_to_mtime: HashMap<String, u64> = HashMap::new();
@@ -906,55 +975,92 @@ fn try_build_index_diff(
     }
 
     // Phase 1: mtime のみ確認 (ファイル内容は読まない)
-    // フォールバック判定をコンテンツ読み込み前に行うことで大量変更時の無駄な I/O を排除。
-    // (大量変更: 68K+ ファイルを読まずにフォールバック判定できる)
+    // pre_walk_data がある場合 (pre-lock fp walk の結果を再利用) → Phase1 walk を省略
     let mut changed_candidates: Vec<(String, PathBuf, u64)> = Vec::new(); // (rel, abs, mtime)
-    let mut new_candidates: Vec<(String, PathBuf, u64)> = Vec::new(); // (rel, abs, mtime)
+    let mut new_candidates: Vec<(String, PathBuf, u64, u64)> = Vec::new(); // (rel, abs, mtime, size)
     let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut fp_entries: Vec<(String, u64, u64)>;
 
-    for entry in WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .filter_entry(|e| !is_xgrep_internal(&e.file_name().to_string_lossy()))
-        .build()
-    {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if entry.file_type().map_or(true, |ft| !ft.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        if path == lock_path {
-            continue;
-        }
-        let relative = match path.strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().to_string(),
-            Err(_) => continue,
-        };
-        seen_paths.insert(relative.clone());
-
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        if path_to_file_id.contains_key(&relative) {
-            let old_mtime = path_to_mtime.get(&relative).copied().unwrap_or(0);
-            if mtime != old_mtime {
-                changed_candidates.push((relative, path.to_path_buf(), mtime));
+    if let Some(walk_data) = pre_walk_data {
+        // pre-lock walkデータを流用: Phase1 walkを省略 (~1s節約)
+        fp_entries = walk_data;
+        for (relative, mtime, size) in &fp_entries {
+            seen_paths.insert(relative.clone());
+            if path_to_file_id.contains_key(relative) {
+                let old_mtime = path_to_mtime.get(relative).copied().unwrap_or(0);
+                if *mtime != old_mtime {
+                    let abs_path = root.join(relative);
+                    changed_candidates.push((relative.clone(), abs_path, *mtime));
+                }
+            } else {
+                // 既知バイナリかつ mtime+size 一致 → phase2 peek をスキップ
+                if binary_cache
+                    .get(relative)
+                    .is_some_and(|&(m, s)| m == *mtime && s == *size)
+                {
+                    // skip
+                } else {
+                    let abs_path = root.join(relative);
+                    new_candidates.push((relative.clone(), abs_path, *mtime, *size));
+                }
             }
-        } else {
-            new_candidates.push((relative, path.to_path_buf(), mtime));
+        }
+    } else {
+        fp_entries = Vec::with_capacity(old_file_count + 256);
+        for entry in WalkBuilder::new(root)
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .filter_entry(|e| !is_xgrep_internal(&e.file_name().to_string_lossy()))
+            .build()
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.file_type().map_or(true, |ft| !ft.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            if path == lock_path {
+                continue;
+            }
+            let relative = match path.strip_prefix(root) {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+            seen_paths.insert(relative.clone());
+
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let size = meta.len();
+            fp_entries.push((relative.clone(), mtime, size));
+
+            if path_to_file_id.contains_key(&relative) {
+                let old_mtime = path_to_mtime.get(&relative).copied().unwrap_or(0);
+                if mtime != old_mtime {
+                    changed_candidates.push((relative, path.to_path_buf(), mtime));
+                }
+            } else {
+                // 既知バイナリかつ mtime+size 一致 → phase2 peek をスキップ
+                if binary_cache
+                    .get(&relative)
+                    .is_some_and(|&(m, s)| m == mtime && s == size)
+                {
+                    // skip
+                } else {
+                    new_candidates.push((relative, path.to_path_buf(), mtime, size));
+                }
+            }
         }
     }
 
@@ -986,15 +1092,26 @@ fn try_build_index_diff(
         changed_files.push((relative, trigram::extract_trigrams(&content)));
     }
 
-    for (relative, abs_path, mtime) in new_candidates {
-        let content = match fs::read(&abs_path) {
-            Ok(c) => c,
+    for (relative, abs_path, mtime, size) in new_candidates {
+        // 8KB peek でバイナリ早期検出: バイナリファイル(数MB)の全件読み込みを排除
+        use std::io::Read;
+        let mut file = match fs::File::open(&abs_path) {
+            Ok(f) => f,
             Err(_) => continue,
         };
-        if memchr::memchr(0, &content).is_some() {
+        let mut peek = [0u8; 8192];
+        let n = match file.read(&mut peek) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if memchr::memchr(0, &peek[..n]).is_some() {
+            binary_cache.insert(relative, (mtime, size));
+            continue; // バイナリ: cache に記録して捨てる
+        }
+        let mut content = peek[..n].to_vec();
+        if file.read_to_end(&mut content).is_err() {
             continue;
         }
-        let size = fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
         let hash = xxhash_rust::xxh64::xxh64(&content, 0);
         new_files.push((
             relative,
@@ -1005,12 +1122,23 @@ fn try_build_index_diff(
         ));
     }
 
+    // phase2 で新たにバイナリと判定されたファイルを保存 (次回以降の phase2 をスキップ)
+    if binary_cache.len() != binary_cache_original_len {
+        save_binary_cache(&bc_path, &binary_cache);
+    }
+
     // インデックス関連の変更がなければフィンガープリントのみ更新して終了
     // (バイナリファイルの変更などでフィンガープリントは変わるがインデックスは変わらない場合)
     if changed_files.is_empty() && new_files.is_empty() && deleted_paths.is_empty() {
-        if let Some(fp) = compute_corpus_fingerprint(root, lock_path) {
-            let _ = write_fingerprint(fp_path, fp);
+        fp_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut h = Xxh64::new(0);
+        for (path, mtime, size) in &fp_entries {
+            h.update(path.as_bytes());
+            h.update(&[0u8]);
+            h.update(&mtime.to_le_bytes());
+            h.update(&size.to_le_bytes());
         }
+        let _ = write_fingerprint(fp_path, h.digest());
         return Ok(Some(false));
     }
 
@@ -1087,19 +1215,23 @@ fn try_build_index_diff(
         affected_postings.insert(t, ids);
     }
 
-    // 削除 + remap を affected_postings に適用
-    for ids in affected_postings.values_mut() {
-        ids.retain(|id| !deleted_ids.contains(id));
-        for id in ids.iter_mut() {
-            if let Some(&mapped) = old_to_new.get(id) {
-                *id = mapped;
+    // 削除 + remap: 削除がない場合は skip (デコード済みリストはソート済みのまま)
+    // 削除がある場合のみ retain + remap + sort が必要
+    if !deleted_ids.is_empty() {
+        for ids in affected_postings.values_mut() {
+            ids.retain(|id| !deleted_ids.contains(id));
+            for id in ids.iter_mut() {
+                if let Some(&mapped) = old_to_new.get(id) {
+                    *id = mapped;
+                }
             }
+            ids.sort_unstable();
+            ids.dedup();
         }
-        ids.sort_unstable();
-        ids.dedup();
     }
 
-    // 変更ファイルの旧 trigrams 除去（remap 後の new_fid で）
+    // 変更ファイルの旧 trigrams 除去:
+    // retain の代わりに binary_search + remove でソート済み状態を維持
     let mut changed_file_new_trigrams: HashMap<String, Vec<[u8; 3]>> = HashMap::new();
     for (path, new_trigrams) in &changed_files {
         if let Some(&old_fid) = path_to_file_id.get(path) {
@@ -1107,7 +1239,9 @@ fn try_build_index_diff(
                 for &t_u32 in &read_pf_trigrams(pf_raw, pf_offsets[old_fid as usize]) {
                     let t = u32_to_trigram(t_u32);
                     if let Some(ids) = affected_postings.get_mut(&t) {
-                        ids.retain(|&id| id != new_fid);
+                        if let Ok(pos) = ids.binary_search(&new_fid) {
+                            ids.remove(pos);
+                        }
                     }
                 }
                 changed_file_new_trigrams.insert(path.clone(), new_trigrams.clone());
@@ -1115,32 +1249,37 @@ fn try_build_index_diff(
         }
     }
 
-    // 変更ファイルの新 trigrams 追加
+    // 変更ファイルの新 trigrams 追加:
+    // push の代わりに partition_point + insert でソート済み状態を維持
     for (path, new_trigrams) in &changed_file_new_trigrams {
         if let Some(&old_fid) = path_to_file_id.get(path) {
             if let Some(&new_fid) = old_to_new.get(&old_fid) {
                 for &t in new_trigrams {
-                    affected_postings.entry(t).or_default().push(new_fid);
+                    let ids = affected_postings.entry(t).or_default();
+                    let pos = ids.partition_point(|&x| x < new_fid);
+                    if pos >= ids.len() || ids[pos] != new_fid {
+                        ids.insert(pos, new_fid);
+                    }
                 }
             }
         }
     }
 
-    // 新規ファイルの trigrams 追加
+    // 新規ファイルの trigrams 追加 (sorted insert)
     let mut new_file_infos: Vec<NewFileInfo> = Vec::new();
     for (i, (path, mtime, size, content_hash, trigs)) in new_files.into_iter().enumerate() {
         let assigned_id = base_new_id + i as u32;
         for &t in &trigs {
-            affected_postings.entry(t).or_default().push(assigned_id);
+            let ids = affected_postings.entry(t).or_default();
+            let pos = ids.partition_point(|&x| x < assigned_id);
+            if pos >= ids.len() || ids[pos] != assigned_id {
+                ids.insert(pos, assigned_id);
+            }
         }
         new_file_infos.push((path, mtime, size, content_hash, trigs));
     }
 
-    // ソート + dedup + 空リスト除去
-    for ids in affected_postings.values_mut() {
-        ids.sort_unstable();
-        ids.dedup();
-    }
+    // sorted insert を維持しているため sort_unstable は不要。空リストのみ除去
     affected_postings.retain(|_, ids| !ids.is_empty());
 
     // 新 file リストと per-file section data を構築
@@ -1151,8 +1290,6 @@ fn try_build_index_diff(
     // PerFileSection::Raw は pf_raw への参照 (no allocation, no sort)
     // PerFileSection::New は変更/新規ファイルのみ Vec<u32> を持つ
     let mut pf_section: Vec<PerFileSection<'_>> = Vec::new();
-    // cache 更新用に trigrams が必要 (lazy: 変更/新規のみ追跡)
-    let mut pf_section_trigrams: Vec<Vec<u32>> = Vec::new(); // per file, for cache
 
     for (_, old_id) in &remapped {
         let path = reader.file_path(*old_id).to_string();
@@ -1179,9 +1316,7 @@ fn try_build_index_diff(
                 size,
                 content_hash: new_hash,
             });
-            let trigs_u32 = trigrams_to_sorted_u32(new_trigs);
-            pf_section_trigrams.push(trigs_u32.clone());
-            pf_section.push(PerFileSection::New(trigs_u32));
+            pf_section.push(PerFileSection::New(trigrams_to_sorted_u32(new_trigs)));
         } else {
             // 不変ファイル: raw bytes を per_file section からそのままコピー
             // Vec<u32> アロケーションも sort も不要
@@ -1193,7 +1328,6 @@ fn try_build_index_diff(
                 size,
                 content_hash,
             });
-            pf_section_trigrams.push(vec![]); // placeholder; read lazily for cache
             pf_section.push(PerFileSection::Raw(&pf_raw[raw_start..raw_end]));
         }
     }
@@ -1206,9 +1340,7 @@ fn try_build_index_diff(
             size,
             content_hash,
         });
-        let trigs_u32 = trigrams_to_sorted_u32(&trigs);
-        pf_section_trigrams.push(trigs_u32.clone());
-        pf_section.push(PerFileSection::New(trigs_u32));
+        pf_section.push(PerFileSection::New(trigrams_to_sorted_u32(&trigs)));
     }
 
     // smart diff write: affected は再エンコード、unaffected は raw bytes コピー
@@ -1223,46 +1355,23 @@ fn try_build_index_diff(
     )?;
 
     drop(reader);
+    // diff mode ではキャッシュを更新しない:
+    // - diff path はキャッシュを読まないため更新不要
+    // - フルビルド fallback 時はフルビルド側でキャッシュを再構築する
+    // - stale になった変更ファイルのエントリは次回フルビルドで自動再計算される
+    let _ = cache_path; // suppress unused warning
 
-    // キャッシュを更新
-    if let Some(cp) = cache_path {
-        let mut new_entries = HashMap::with_capacity(new_files_list.len());
-        for (i, fi) in new_files_list.iter().enumerate() {
-            // changed/new ファイルは pf_section_trigrams に入っている
-            // unchanged ファイルは placeholder; cache 用に raw bytes から読む
-            let trigrams_u32 = if pf_section_trigrams[i].is_empty() {
-                // unchanged: we need to find old_id by path lookup
-                // Just skip cache update for unchanged (cache already has correct entry)
-                // (cache.entries for unchanged files are still valid)
-                continue;
-            } else {
-                &pf_section_trigrams[i]
-            };
-            let trigrams: Vec<[u8; 3]> = trigrams_u32.iter().map(|&t| u32_to_trigram(t)).collect();
-            new_entries.insert(
-                fi.relative_path.clone(),
-                CachedFile {
-                    mtime: fi.mtime,
-                    content_hash: fi.content_hash,
-                    trigrams,
-                },
-            );
-        }
-        // Merge: keep old cache entries for unchanged files, update changed/new
-        let mut merged_cache = TrigramCache::load(cp);
-        for (k, v) in new_entries {
-            merged_cache.entries.insert(k, v);
-        }
-        // Remove deleted files from cache
-        for path in &deleted_paths {
-            merged_cache.entries.remove(path);
-        }
-        merged_cache.save(cp)?;
+    // Phase1 walkで収集済みの (path, mtime, size) から fingerprint を計算
+    // compute_corpus_fingerprint (3回目のwalk ~1.2s) を排除
+    fp_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Xxh64::new(0);
+    for (path, mtime, size) in &fp_entries {
+        h.update(path.as_bytes());
+        h.update(&[0u8]);
+        h.update(&mtime.to_le_bytes());
+        h.update(&size.to_le_bytes());
     }
-
-    if let Some(fp) = compute_corpus_fingerprint(root, lock_path) {
-        let _ = write_fingerprint(fp_path, fp);
-    }
+    let _ = write_fingerprint(fp_path, h.digest());
 
     Ok(Some(true))
 }
