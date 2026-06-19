@@ -157,10 +157,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: "1.74.0"
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-        with:
-          workspaces: rust
-      - name: Remove lock file (v4 format unsupported by 1.74)
+      - name: Remove lock file (Cargo.lock v4 is not supported by Cargo 1.74)
         working-directory: rust
         run: rm -f Cargo.lock
       - name: Check MSRV
