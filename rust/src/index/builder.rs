@@ -120,7 +120,7 @@ fn collect_corpus_walk(root: &Path, lock_path: &Path) -> Option<(u64, Vec<(Strin
         .build()
     {
         let entry = entry.ok()?;
-        if entry.file_type().map_or(true, |ft| !ft.is_file()) {
+        if entry.file_type().is_none_or(|ft| !ft.is_file()) {
             continue;
         }
         let path = entry.path();
@@ -301,7 +301,7 @@ pub fn build_index_with_cache(
         .build()
     {
         let entry = entry.map_err(|e| XgrepError::IndexError(e.to_string()))?;
-        if entry.file_type().map_or(true, |ft| !ft.is_file()) {
+        if entry.file_type().is_none_or(|ft| !ft.is_file()) {
             continue;
         }
         let path = entry.path().to_path_buf();
@@ -1019,7 +1019,7 @@ fn try_build_index_diff(
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if entry.file_type().map_or(true, |ft| !ft.is_file()) {
+            if entry.file_type().is_none_or(|ft| !ft.is_file()) {
                 continue;
             }
             let path = entry.path();
