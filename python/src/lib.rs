@@ -75,6 +75,7 @@ impl Xgrep {
     pub fn build_index(&self) -> PyResult<()> {
         self.inner
             .build_index()
+            .map(|_| ())
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
