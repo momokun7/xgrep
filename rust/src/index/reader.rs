@@ -9,12 +9,18 @@ use memmap2::Mmap;
 use crate::index::format::*;
 
 pub fn read_header(data: &[u8]) -> Header {
+    let per_file_section_offset = if data.len() >= 32 {
+        u64::from_le_bytes(data[24..32].try_into().unwrap())
+    } else {
+        0
+    };
     Header {
         magic: [data[0], data[1], data[2], data[3]],
         version: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
         trigram_count: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
         file_count: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
         posting_total_bytes: u64::from_le_bytes(data[16..24].try_into().unwrap()),
+        per_file_section_offset,
     }
 }
 
@@ -34,6 +40,13 @@ fn read_file_entry(data: &[u8]) -> FileEntry {
         size: u64::from_le_bytes(data[12..20].try_into().unwrap()),
         content_hash: u64::from_le_bytes(data[20..28].try_into().unwrap()),
     }
+}
+
+#[allow(dead_code)]
+pub struct PerFileEntry {
+    pub mtime: u64,
+    pub content_hash: u64,
+    pub trigrams: Vec<u32>, // sorted unique
 }
 
 pub struct IndexReader {
@@ -56,7 +69,7 @@ impl IndexReader {
         {
             // SAFETY: `mmap.as_ptr()` and `mmap.len()` are valid (mmap created above).
             // MADV_WILLNEED is an advisory hint that does not modify memory contents.
-            let ret = unsafe {
+            let _ret = unsafe {
                 libc::madvise(
                     mmap.as_ptr() as *mut libc::c_void,
                     mmap.len(),
@@ -64,7 +77,7 @@ impl IndexReader {
                 )
             };
             #[cfg(debug_assertions)]
-            if ret != 0 {
+            if _ret != 0 {
                 eprintln!(
                     "xgrep: madvise warning: {}",
                     std::io::Error::last_os_error()
@@ -80,7 +93,7 @@ impl IndexReader {
         if &header.magic != b"XGRP" {
             return Err(XgrepError::IndexError("invalid index magic".to_string()));
         }
-        if header.version != VERSION {
+        if header.version != VERSION && header.version != VERSION_V2 {
             return Err(XgrepError::IndexError(format!(
                 "unsupported index version: {}",
                 header.version
@@ -191,7 +204,7 @@ impl IndexReader {
         if count > data.len() {
             return vec![];
         }
-        let mut result = Vec::with_capacity(count.min(1024));
+        let mut result = Vec::with_capacity(count);
         let mut prev: u32 = 0;
         for _ in 0..count {
             if pos >= data.len() {
@@ -258,7 +271,7 @@ impl IndexReader {
             return vec![];
         }
 
-        let mut seen = std::collections::BTreeSet::new();
+        let mut result: Vec<u32> = Vec::new();
         for i in lo_idx..hi_idx {
             let offset = trigram_table_start + i * TrigramEntry::SIZE;
             let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
@@ -273,11 +286,11 @@ impl IndexReader {
                 continue; // skip corrupted entry
             }
             let data = &self.mmap[pl_start..pl_end];
-            for fid in Self::decode_posting_list(data) {
-                seen.insert(fid);
-            }
+            result.extend(Self::decode_posting_list(data));
         }
-        seen.into_iter().collect()
+        result.sort_unstable();
+        result.dedup();
+        result
     }
 
     /// Return the union of posting lists for all trigrams `t` where
@@ -296,7 +309,7 @@ impl IndexReader {
         }
 
         let trigram_table_start = Header::SIZE;
-        let mut seen = std::collections::BTreeSet::new();
+        let mut result: Vec<u32> = Vec::new();
         for i in 0..count {
             let offset = trigram_table_start + i * TrigramEntry::SIZE;
             if offset + TrigramEntry::SIZE > self.mmap.len() {
@@ -312,11 +325,11 @@ impl IndexReader {
                 continue; // skip corrupted entry
             }
             let data = &self.mmap[pl_start..pl_end];
-            for fid in Self::decode_posting_list(data) {
-                seen.insert(fid);
-            }
+            result.extend(Self::decode_posting_list(data));
         }
-        seen.into_iter().collect()
+        result.sort_unstable();
+        result.dedup();
+        result
     }
 
     pub fn file_path(&self, file_id: u32) -> &str {
@@ -335,6 +348,110 @@ impl IndexReader {
         let remaining = &self.mmap[str_start..];
         let len = memchr::memchr(0, remaining).unwrap_or(remaining.len());
         std::str::from_utf8(&remaining[..len]).unwrap_or("<invalid>")
+    }
+
+    #[allow(dead_code)]
+    pub fn read_per_file_section(&self) -> Option<Vec<PerFileEntry>> {
+        let offset = self.cached_header.per_file_section_offset as usize;
+        if offset == 0 {
+            return None;
+        }
+        let data = &self.mmap[offset..];
+        let mut pos = 0;
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let file_count = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        let mut entries = Vec::with_capacity(file_count);
+        for _ in 0..file_count {
+            if pos + 20 > data.len() {
+                return None;
+            }
+            let mtime = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+            pos += 8;
+            let content_hash = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+            pos += 8;
+            let trigram_count = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+            pos += 4;
+            if pos + trigram_count * 4 > data.len() {
+                return None;
+            }
+            let mut trigrams = Vec::with_capacity(trigram_count);
+            for _ in 0..trigram_count {
+                let t = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+                pos += 4;
+                trigrams.push(t);
+            }
+            entries.push(PerFileEntry {
+                mtime,
+                content_hash,
+                trigrams,
+            });
+        }
+        Some(entries)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn all_trigrams(&self) -> Vec<[u8; 3]> {
+        let count = self.cached_header.trigram_count as usize;
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = Header::SIZE + i * TrigramEntry::SIZE;
+            if offset + TrigramEntry::SIZE > self.mmap.len() {
+                break;
+            }
+            let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
+            result.push(entry.trigram);
+        }
+        result
+    }
+
+    /// Returns the raw bytes of the per-file section (mmap slice, no allocation).
+    /// Used for bulk-copy optimization: unchanged files' per-file entries can
+    /// be written directly without decode/re-encode.
+    pub(crate) fn per_file_section_raw(&self) -> &[u8] {
+        let offset = self.cached_header.per_file_section_offset as usize;
+        if offset == 0 || offset >= self.mmap.len() {
+            &[]
+        } else {
+            &self.mmap[offset..]
+        }
+    }
+
+    /// Returns all trigrams with their raw posting bytes in sorted order.
+    /// Used for byte-copy optimization: unaffected posting lists can be
+    /// copied directly without decode/re-encode.
+    pub(crate) fn all_trigram_entries_raw(&self) -> Vec<([u8; 3], &[u8])> {
+        let count = self.cached_header.trigram_count as usize;
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            let tbl_offset = Header::SIZE + i * TrigramEntry::SIZE;
+            if tbl_offset + TrigramEntry::SIZE > self.mmap.len() {
+                break;
+            }
+            let entry = read_trigram_entry(&self.mmap[tbl_offset..tbl_offset + TrigramEntry::SIZE]);
+            let pl_start = self.posting_lists_start + entry.posting_offset as usize;
+            let pl_end = pl_start + entry.posting_len as usize;
+            if pl_end > self.mmap.len() {
+                break;
+            }
+            result.push((entry.trigram, &self.mmap[pl_start..pl_end]));
+        }
+        result
+    }
+
+    pub(crate) fn file_entry(&self, file_id: u32) -> Option<FileEntry> {
+        if file_id >= self.cached_header.file_count {
+            return None;
+        }
+        let offset = self.file_table_start + file_id as usize * FileEntry::SIZE;
+        if offset + FileEntry::SIZE > self.mmap.len() {
+            return None;
+        }
+        Some(read_file_entry(
+            &self.mmap[offset..offset + FileEntry::SIZE],
+        ))
     }
 }
 
@@ -399,7 +516,7 @@ mod tests {
     fn test_open_invalid_magic() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.xgrep");
-        fs::write(&path, b"BADMxxxxxxxxxxxxxxxx").unwrap();
+        fs::write(&path, b"BADMxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").unwrap();
         assert!(IndexReader::open(&path).is_err());
     }
 
@@ -407,7 +524,7 @@ mod tests {
     fn test_open_file_too_small() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("tiny.xgrep");
-        fs::write(&path, b"XGR").unwrap(); // only 3 bytes, need 20
+        fs::write(&path, b"XGR").unwrap(); // only 3 bytes, need 32
         assert!(IndexReader::open(&path).is_err());
     }
 
@@ -415,7 +532,7 @@ mod tests {
     fn test_open_invalid_version() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("badver.xgrep");
-        let mut data = vec![0u8; 24];
+        let mut data = vec![0u8; 32];
         data[0..4].copy_from_slice(b"XGRP");
         // version = 99 (invalid)
         data[4..8].copy_from_slice(&99u32.to_le_bytes());
@@ -439,12 +556,13 @@ mod tests {
         // Header is valid but trigram_count is huge with insufficient actual data
         let dir = tempdir().unwrap();
         let path = dir.path().join("truncated.xgrep");
-        let mut data = vec![0u8; 28]; // Header(24) + only 4 bytes
+        let mut data = vec![0u8; 36]; // Header(32) + only 4 bytes
         data[0..4].copy_from_slice(b"XGRP");
         data[4..8].copy_from_slice(&VERSION.to_le_bytes());
         data[8..12].copy_from_slice(&9999u32.to_le_bytes()); // trigram_count = 9999 (huge)
         data[12..16].copy_from_slice(&0u32.to_le_bytes()); // file_count = 0
         data[16..24].copy_from_slice(&0u64.to_le_bytes()); // posting_total_bytes = 0
+        data[24..32].copy_from_slice(&0u64.to_le_bytes()); // per_file_section_offset = 0
         fs::write(&path, &data).unwrap();
         let result = IndexReader::open(&path);
         assert!(result.is_err());
@@ -489,5 +607,21 @@ mod tests {
         let result = IndexReader::decode_posting_list(&data);
         // Should not infinite-loop; returns empty or partial result
         assert!(result.len() < 100);
+    }
+
+    #[test]
+    fn test_read_per_file_section() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("hello.txt"), "hello world").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let per_file = reader.read_per_file_section();
+        assert!(per_file.is_some());
+        let entries = per_file.unwrap();
+        assert_eq!(entries.len(), 1);
+        // "hello world" has trigrams: "hel", "ell", "llo", "lo ", "o w", " wo", "wor", "orl", "rld"
+        assert!(!entries[0].trigrams.is_empty());
     }
 }

@@ -201,14 +201,21 @@ fn run() -> Result<()> {
                 Xgrep::open(&dir)?
             };
             let start = std::time::Instant::now();
-            xg.build_index()?;
-            let meta = std::fs::metadata(xg.index_path())?;
-            eprintln!(
-                "Index built: {} ({} bytes) in {:.2}s",
-                xg.index_path().display(),
-                meta.len(),
-                start.elapsed().as_secs_f64()
-            );
+            let rebuilt = xg.build_index()?;
+            if rebuilt {
+                let meta = std::fs::metadata(xg.index_path())?;
+                eprintln!(
+                    "Index built: {} ({} bytes) in {:.2}s",
+                    xg.index_path().display(),
+                    meta.len(),
+                    start.elapsed().as_secs_f64()
+                );
+            } else {
+                eprintln!(
+                    "Index is up to date. ({:.2}s)",
+                    start.elapsed().as_secs_f64()
+                );
+            }
         }
         Some(Commands::Serve { root }) => {
             let root_path = root

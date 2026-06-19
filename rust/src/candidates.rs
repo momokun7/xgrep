@@ -21,35 +21,29 @@ pub(crate) fn resolve_literal_candidates(
         if trigrams.is_empty() {
             (0..reader.file_count()).collect()
         } else {
-            let total_lookups: usize = trigrams.iter().map(|t| case_variants(*t).len()).sum();
-            if total_lookups > 64 {
-                (0..reader.file_count()).collect()
+            let mut trigram_candidates: Vec<Vec<u32>> = Vec::new();
+            let mut any_empty = false;
+
+            for t in trigrams {
+                let variants = case_variants(*t);
+                let mut union: Vec<u32> = variants
+                    .iter()
+                    .flat_map(|v| reader.lookup_trigram(*v))
+                    .collect();
+                union.sort_unstable();
+                union.dedup();
+                if union.is_empty() {
+                    any_empty = true;
+                    break;
+                }
+                trigram_candidates.push(union);
+            }
+
+            if any_empty {
+                vec![]
             } else {
-                let mut trigram_candidates: Vec<Vec<u32>> = Vec::new();
-                let mut any_empty = false;
-
-                for t in trigrams {
-                    let variants = case_variants(*t);
-                    let mut union_set = std::collections::BTreeSet::new();
-                    for v in &variants {
-                        for fid in reader.lookup_trigram(*v) {
-                            union_set.insert(fid);
-                        }
-                    }
-                    if union_set.is_empty() {
-                        any_empty = true;
-                        break;
-                    }
-                    trigram_candidates.push(union_set.into_iter().collect());
-                }
-
-                if any_empty {
-                    vec![]
-                } else {
-                    let refs: Vec<&[u32]> =
-                        trigram_candidates.iter().map(|v| v.as_slice()).collect();
-                    intersect_postings(&refs)
-                }
+                let refs: Vec<&[u32]> = trigram_candidates.iter().map(|v| v.as_slice()).collect();
+                intersect_postings(&refs)
             }
         }
     } else if trigrams.is_empty() {
@@ -189,21 +183,20 @@ pub fn intersect_postings(lists: &[&[u32]]) -> Vec<u32> {
 
     let mut result: Vec<u32> = sorted_lists[0].to_vec();
     for list in &sorted_lists[1..] {
-        let mut new_result = Vec::new();
-        let mut i = 0;
         let mut j = 0;
-        while i < result.len() && j < list.len() {
-            match result[i].cmp(&list[j]) {
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
-                std::cmp::Ordering::Equal => {
-                    new_result.push(result[i]);
-                    i += 1;
-                    j += 1;
-                }
+        result.retain(|&x| {
+            while j < list.len() && list[j] < x {
+                j += 1;
             }
+            let found = j < list.len() && list[j] == x;
+            if found {
+                j += 1;
+            }
+            found
+        });
+        if result.is_empty() {
+            break;
         }
-        result = new_result;
     }
     result
 }

@@ -1,4 +1,4 @@
-//! # xgrep Index Binary Format (Version 2)
+//! # xgrep Index Binary Format (Version 3)
 //!
 //! ## Design Note: Existence-Only Trigrams
 //!
@@ -13,17 +13,18 @@
 //! reduces false positives (estimated 90-99% reduction for medium-length queries)
 //! but increases index size to ~20-35% of source.
 //!
-//! Positional trigrams are planned for index format v3. See
+//! Positional trigrams are planned for a future version. See
 //! `docs/positional-trigrams-design.md` for the full design document.
 //!
 //! ```text
 //! ┌──────────────────────────────────────────┐
-//! │ Header (24 bytes)                        │
+//! │ Header (32 bytes)                        │
 //! │   magic: [u8; 4]        = "XGRP"        │
-//! │   version: u32           = 2             │
+//! │   version: u32           = 3             │
 //! │   trigram_count: u32                     │
 //! │   file_count: u32                        │
 //! │   posting_total_bytes: u64               │
+//! │   per_file_section_offset: u64           │
 //! ├──────────────────────────────────────────┤
 //! │ Trigram Table (16 bytes × trigram_count) │
 //! │   trigram: [u8; 3]                       │
@@ -44,6 +45,14 @@
 //! ├──────────────────────────────────────────┤
 //! │ String Pool (variable length)            │
 //! │   Null-terminated file paths             │
+//! ├──────────────────────────────────────────┤
+//! │ Per-File Section (variable length)       │
+//! │   file_count: u32                        │
+//! │   Per file:                              │
+//! │     mtime: u64                           │
+//! │     content_hash: u64                    │
+//! │     trigram_count: u32                   │
+//! │     trigrams: [u32; trigram_count]       │
 //! └──────────────────────────────────────────┘
 //! ```
 //!
@@ -52,17 +61,19 @@
 //! compression (file IDs stored as differences from previous).
 
 pub const MAGIC: [u8; 4] = *b"XGRP";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+pub const VERSION_V2: u32 = 2;
 
-/// Header: 24 bytes
+/// Header: 32 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
-    pub magic: [u8; 4],           // 4
-    pub version: u32,             // 4
-    pub trigram_count: u32,       // 4
-    pub file_count: u32,          // 4
-    pub posting_total_bytes: u64, // 8
+    pub magic: [u8; 4],               // 4
+    pub version: u32,                 // 4
+    pub trigram_count: u32,           // 4
+    pub file_count: u32,              // 4
+    pub posting_total_bytes: u64,     // 8
+    pub per_file_section_offset: u64, // 8
 }
 
 /// Trigram Table entry: 16 bytes
@@ -99,13 +110,14 @@ impl Header {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
     #[allow(clippy::wrong_self_convention)]
-    pub fn to_bytes(&self) -> [u8; 24] {
-        let mut bytes = [0u8; 24];
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
         bytes[0..4].copy_from_slice(&self.magic);
         bytes[4..8].copy_from_slice(&self.version.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.trigram_count.to_le_bytes());
         bytes[12..16].copy_from_slice(&self.file_count.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.posting_total_bytes.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.per_file_section_offset.to_le_bytes());
         bytes
     }
 }
@@ -136,6 +148,23 @@ impl FileEntry {
         bytes[20..28].copy_from_slice(&self.content_hash.to_le_bytes());
         bytes
     }
+}
+
+/// Convert trigram [u8;3] to u32
+pub fn trigram_to_u32(t: [u8; 3]) -> u32 {
+    (t[0] as u32) << 16 | (t[1] as u32) << 8 | t[2] as u32
+}
+
+pub fn u32_to_trigram(v: u32) -> [u8; 3] {
+    [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
+
+/// Convert Vec<[u8;3]> to a sorted unique u32 list
+pub fn trigrams_to_sorted_u32(trigrams: &[[u8; 3]]) -> Vec<u32> {
+    let mut v: Vec<u32> = trigrams.iter().map(|&t| trigram_to_u32(t)).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// Encode u32 as LEB128 varint
@@ -181,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_header_size() {
-        assert_eq!(Header::SIZE, 24);
+        assert_eq!(Header::SIZE, 32);
     }
 
     #[test]
@@ -299,6 +328,21 @@ mod tests {
         let data = [0x80, 0x80, 0x80, 0x80, 0x80];
         let (_, bytes_read) = decode_varint(&data);
         assert!(bytes_read > 0);
+    }
+
+    #[test]
+    fn test_trigram_to_u32_roundtrip() {
+        let t = [b'h', b'e', b'l'];
+        let v = trigram_to_u32(t);
+        assert_eq!(u32_to_trigram(v), t);
+    }
+
+    #[test]
+    fn test_trigrams_to_sorted_u32_dedup() {
+        let trigrams = vec![*b"abc", *b"xyz", *b"abc"];
+        let sorted = trigrams_to_sorted_u32(&trigrams);
+        assert_eq!(sorted.len(), 2);
+        assert!(sorted[0] < sorted[1]);
     }
 }
 

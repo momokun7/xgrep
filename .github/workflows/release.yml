@@ -310,6 +310,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: macos-latest
@@ -344,9 +346,16 @@ jobs:
           open(path, 'w').write(content)
       - name: Install maturin
         run: pip install --require-hashes -r python/requirements-build.txt
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Build wheel
         working-directory: python
         run: maturin build --release --target ${{ matrix.target }} --features extension-module
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -400,7 +409,8 @@ jobs:
 
   publish-release:
     name: Publish Release
-    needs: [create-release, build-release, publish-crate, publish-npm, publish-pypi]
+    needs:
+      [create-release, build-release, publish-crate, publish-npm, publish-pypi]
     if: |
       always() &&
       needs.create-release.result == 'success' &&

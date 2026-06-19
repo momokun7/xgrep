@@ -336,7 +336,8 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
 #[allow(dead_code)]
 fn build_with_cache(root: &Path, index_path: &Path) -> Result<()> {
     let cache_path = crate::index::cache::cache_path_for(index_path);
-    crate::index::builder::build_index_with_cache(root, index_path, Some(&cache_path))
+    let _ = crate::index::builder::build_index_with_cache(root, index_path, Some(&cache_path))?;
+    Ok(())
 }
 
 /// Check if the index is up-to-date and rebuild if necessary.

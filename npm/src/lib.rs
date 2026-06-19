@@ -83,6 +83,7 @@ impl Xgrep {
     pub fn build_index(&self) -> Result<()> {
         self.inner
             .build_index()
+            .map(|_| ())
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 

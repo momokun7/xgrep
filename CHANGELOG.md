@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Differential index update (v3 format)**: `xg init` now performs a fast diff
+  update instead of always rebuilding from scratch. Only changed/added/deleted
+  files are re-processed; unchanged files' posting lists and per-file sections are
+  bulk-copied from the existing mmap without decode/re-encode.
+- **Binary file cache** (`.xgrep/index.bincache`): binary files that are not
+  covered by `.gitignore` (e.g. compiled executables in Homebrew's Cellar) are
+  recorded after the first diff run so subsequent diffs can skip the 8 KB peek.
+  Relevant for non-git corpora with large numbers of binary files.
+- **v2 → v3 migration message**: when upgrading from a v2 index, `xg init` now
+  prints `migrating index to v3 format (one-time rebuild)...` before the full
+  rebuild so users understand why the first post-upgrade run is slower. Suppressed
+  in quiet / MCP mode.
+
+### Changed
+- Index format bumped from v2 to v3: the header gains an 8-byte
+  `per_file_section_offset` field that stores per-file trigram lists for the diff
+  path. v2 indices are read transparently and trigger a one-time full rebuild.
+  **Downgrade note**: a v3 index cannot be read by v2 binaries; run `xg init` to
+  regenerate if you revert to an older binary.
+
+### Fixed
+- **Ghost trigram hits after text→binary conversion**: when a previously-indexed
+  text file was replaced with a binary file, the old trigrams remained in posting
+  lists (diff update skipped binary files without removing their entries). Fixed by
+  treating text→binary as a change to zero trigrams, which removes the old entries.
+- **Fingerprint early-exit**: a changed corpus fingerprint no longer triggers a
+  full rebuild when the diff path succeeds. A no-op corpus (fingerprint match)
+  returns immediately without acquiring the index lock.
+
+### Performance
+
+Benchmarks on Homebrew Cellar (137 K files, 919 MB index):
+
+| Case | Before | After |
+|---|---|---|
+| Full rebuild (Case 1) | ~25 s | ~22 s |
+| No-change early exit (Case 2) | ~1.0 s | ~0.9 s |
+| 10-file diff — warm (bincache populated) | 15.4 s | **1.6–2.0 s** |
+| 10-file diff — cold (first run, no bincache) | 15.4 s | ~7–8 s *(estimated)* |
+| 100-file diff (Case 4) | full rebuild | 3.8 s (diff mode) |
+
+*Cold estimate is derived from the sorted-insert baseline (~9 s before binary
+cache). Exact cold measurement requires the full Homebrew Cellar corpus with a
+cold page cache — run `rm ~/.cache/xgrep/*/index.bincache && xg init /opt/homebrew/Cellar`
+twice: first run = cold, second run = warm.*
+
+Key optimizations applied:
+- **sorted insert**: decoded posting lists maintain sorted order via
+  `binary_search + remove` / `partition_point + insert`, eliminating
+  `sort_unstable` on every diff update (~1.5 s saving)
+- **affected-set decode**: only trigrams touched by the diff are decoded and
+  re-encoded; unaffected posting lists are raw-copied from the mmap
+- **PerFileSection::Raw**: unchanged files' per-file section entries are
+  bulk-copied without decode/re-encode (eliminates 137 K allocations per update)
+- **pre-walk reuse**: the corpus walk done before lock acquisition is reused in
+  Phase 1, eliminating a redundant walk
+
 ## [0.4.1] - 2026-06-15
 
 ### Added
