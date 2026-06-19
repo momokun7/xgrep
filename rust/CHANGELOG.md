@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.8.0](https://github.com/momokun7/xgrep/compare/v0.7.0...v0.8.0) (2026-06-19)
+
+
+### Features
+
+* add --version flag and optional path argument ([d9c1aee](https://github.com/momokun7/xgrep/commit/d9c1aee9864e7e696cd45e0cb717eca8b27c96b4)), closes [#17](https://github.com/momokun7/xgrep/issues/17) [#16](https://github.com/momokun7/xgrep/issues/16)
+* add case-insensitive file type matching ([b6ae906](https://github.com/momokun7/xgrep/commit/b6ae906dc818108267dee126e035e5b300519d82))
+* add criterion.rs benchmark infrastructure ([0d079a5](https://github.com/momokun7/xgrep/commit/0d079a518193ef10cf26f3f6e8bb26b94812a40c)), closes [#26](https://github.com/momokun7/xgrep/issues/26)
+* add strict input validation to MCP tool handlers ([c406d20](https://github.com/momokun7/xgrep/commit/c406d20a1824ebd0814ee66f55a03373c46989bb))
+* add version header to trigram cache format ([bcf0a9d](https://github.com/momokun7/xgrep/commit/bcf0a9d3dd922593d907671d8f2dc66da0fb1d2d))
+* distributed パターンのボトルネック計測基盤を追加 ([10181a6](https://github.com/momokun7/xgrep/commit/10181a640cad8843fec725286eacf0c1261f9059))
+* MCPパラメータをserde構造体化、find_definitionsにmax_results追加 ([#55](https://github.com/momokun7/xgrep/issues/55)) ([d2e97ab](https://github.com/momokun7/xgrep/commit/d2e97ab86a5b2a7c780492df9aad3aa9f6390be5))
+* PyPI への xgrep-search パッケージ追加（PyO3 バインディング + xg バイナリ） ([#58](https://github.com/momokun7/xgrep/issues/58)) ([7785704](https://github.com/momokun7/xgrep/commit/7785704dcb2027db7dafad8d9be185bab1b5a93c))
+* v0.2.0 release ([#24](https://github.com/momokun7/xgrep/issues/24)) ([1306afa](https://github.com/momokun7/xgrep/commit/1306afade6aa975b8343ed12d90129a0ef2b168f))
+* v0.4.0 — ripgrep-compatible search UX and AI-friendly API ([#35](https://github.com/momokun7/xgrep/issues/35)) ([1768b78](https://github.com/momokun7/xgrep/commit/1768b78f98244b2b4f9c425ed132e589fb46afac))
+* v3インデックス差分更新を実装（2段階ウォーク・PerFileSection・フィンガープリントキャッシュ） ([e1cccc2](https://github.com/momokun7/xgrep/commit/e1cccc209634b822262c6b6aba48659606a371ef))
+* 検索後にバックグラウンドでインデックスを自動リビルド（30秒間隔制限付き） ([a130aec](https://github.com/momokun7/xgrep/commit/a130aecb47bc8e936b95bba8c8fa88c7441ccfce))
+
+
+### Bug Fixes
+
+* address code review findings across [#25](https://github.com/momokun7/xgrep/issues/25)-[#29](https://github.com/momokun7/xgrep/issues/29) ([bab8a5e](https://github.com/momokun7/xgrep/commit/bab8a5ee0f5c6011a774688108c2cf29e1b4694b))
+* bincache 4テスト追加・text→binary bug 修正・v2→v3 移行メッセージ追加 ([b907864](https://github.com/momokun7/xgrep/commit/b9078642227c7e1681815c5133cff9c6b47124fa))
+* cargo publish --allow-dirty追加、v0.1.4 ([4e6f2a0](https://github.com/momokun7/xgrep/commit/4e6f2a00be279b9bf63d6c2315a210d1976c919c))
+* crates.io の readme パスをパッケージ内に変更 ([cc538fd](https://github.com/momokun7/xgrep/commit/cc538fd6b99bc10564f60bb60cb98d06c4ff1fe9))
+* exclude index-related files from newest_file_mtime detection ([c5d0347](https://github.com/momokun7/xgrep/commit/c5d034793c7a01fff5ba138009706ceb6168d8b9))
+* GitHub Actions Node24対応、ハウスキーピング、Arc&lt;str&gt;移行 ([#49](https://github.com/momokun7/xgrep/issues/49)) ([8aae6f6](https://github.com/momokun7/xgrep/commit/8aae6f68e58d8a64016c827207081b1184622152))
+* MSRV を 1.85 → 1.74 へ引き下げ (is_none_or を map_or に置換) ([3e3029a](https://github.com/momokun7/xgrep/commit/3e3029ae396d8d55c59c816b13de06d1054fb535))
+* release.yml修正（macos-13→macos-latest、publish-crateをビルド非依存に） ([3c88b8a](https://github.com/momokun7/xgrep/commit/3c88b8af26e02c63fd1aa9f11331e3df5066fc3e))
+* resolve path doubling in --fresh and --changed for git subdirectories ([9b92a7f](https://github.com/momokun7/xgrep/commit/9b92a7fac0502479c648278fdeb79532143abc1d)), closes [#15](https://github.com/momokun7/xgrep/issues/15)
+* RUSTSEC-2026-0097 修正（rand 更新）+ pip install ハッシュ固定 ([#63](https://github.com/momokun7/xgrep/issues/63)) ([4551e4f](https://github.com/momokun7/xgrep/commit/4551e4fbc32c9d47de9e5537fa2ac4b78a98f1b8))
+* sed -i を macOS 互換に修正 (-i.bak) ([f24ef35](https://github.com/momokun7/xgrep/commit/f24ef3523b70aa8114fe56b30e873ee32a60a62f))
+* suppress stderr output in MCP server mode ([1bd8da5](https://github.com/momokun7/xgrep/commit/1bd8da542784b5c16ae34f0167d1991e6a341d96))
+* use tempdir instead of NamedTempFile in cache tests for CI stability ([44bdd1a](https://github.com/momokun7/xgrep/commit/44bdd1a1d88710788e2ad85049ce4f4c155c7d0e))
+* Windows mtime精度対応（sleep 1s→2s） ([f95cb00](https://github.com/momokun7/xgrep/commit/f95cb000e954b9870f04934426228250d4f5529e))
+* Windows対応（stale lock回復のmtimeフォールバック、テストをcfg(unix)化） ([21287fe](https://github.com/momokun7/xgrep/commit/21287fe6403f313af565f56e1434fd3686ba7796))
+* パッケージレジストリのメタデータを修正 (PyPI 0.5.0 固着・crates.io README なし) ([fe1b355](https://github.com/momokun7/xgrep/commit/fe1b3558536eb85e8397fec3c0412e9abd382b71))
+
+
+### Performance Improvements
+
+* benchmark BTreeSet vs HashSet for trigram extraction ([fbfd79b](https://github.com/momokun7/xgrep/commit/fbfd79be58da27c47b2705e9378a6cb7eda6fff6))
+* check_index_statusの高速パス追加（commit hash同一時にgit ls-files --othersをスキップ、170ms削減） ([8b166e0](https://github.com/momokun7/xgrep/commit/8b166e00189f6d688e426a3012f5f04f38532718))
+* optimize RegexMatcher and CaseInsensitiveMatcher hot paths ([6379546](https://github.com/momokun7/xgrep/commit/6379546b412467378ff00a059935d4428ebba205)), closes [#27](https://github.com/momokun7/xgrep/issues/27)
+* search性能回復（中間Vec排除、line_offsets遅延化、チャンキング廃止） ([40c796c](https://github.com/momokun7/xgrep/commit/40c796c157029dfbd1c2c9186b2e9f4e167417dc))
+* search性能回復（中間Vec排除、line_offsets遅延化）、ベンチマーク実測値更新、doc comment英語化 ([1c04251](https://github.com/momokun7/xgrep/commit/1c04251fba8cbacf525cac19df8de2f584cf6f87))
+* v3差分更新・bincache・sorted insertでCase3を15s→1.6s(warm)に最適化 ([93e7b72](https://github.com/momokun7/xgrep/commit/93e7b722fb9fc2952e1db29b04e9c70036781fd8))
+* コーパスフィンガープリントで変更なし早期リターンを実装 (Step1) ([99e7ce6](https://github.com/momokun7/xgrep/commit/99e7ce6504399b4a69e5d1beb96cf485308e130d))
+* デフォルトで鮮度チェック無効化（--freshでオプトイン）、37ms達成（ripgrep比55x） ([fada96d](https://github.com/momokun7/xgrep/commit/fada96df54eaa5f2f0e205be6fad64d53bbd59ac))
+* 全ボトルネック (BN-1〜BN-10) を一括修正 ([0e2cf4f](https://github.com/momokun7/xgrep/commit/0e2cf4f6dc00f76162da3d723147857dbda94407))
+* 差分更新を sorted insert + binary cache で最適化 (Case3: 9.05s→1.6s) ([8b0d3f6](https://github.com/momokun7/xgrep/commit/8b0d3f67e85f1c04e188cd35a32c01b0adf21d72))
+
 ## [0.7.0](https://github.com/momokun7/xgrep/compare/v0.6.0...v0.7.0) (2026-06-19)
 
 
