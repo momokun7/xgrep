@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/momokun7/xgrep/actions/workflows/ci.yml/badge.svg)](https://github.com/momokun7/xgrep/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/xgrep-search.svg)](https://crates.io/crates/xgrep-search)
+[![npm](https://img.shields.io/npm/v/xgrep.svg)](https://www.npmjs.com/package/xgrep)
+[![PyPI](https://img.shields.io/pypi/v/xgrep-search.svg)](https://pypi.org/project/xgrep-search/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Ultra-fast indexed code search engine with MCP server for AI coding tools.
@@ -15,14 +17,14 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 - **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io/) server for AI coding tools (Claude Code, Cursor, etc.)
 - **LLM-optimized output** — `--format llm` produces Markdown with language tags, context lines, and token-aware truncation
 - **Git-aware** — search only changed files (`--changed`), recent commits (`--since 1h`), respects `.gitignore`
-- **Zero config** — `cargo install xgrep-search`, then `xg "pattern"`. Index builds automatically on first search
+- **Zero config** — install via cargo/npm/pip, then `xg "pattern"`. Index builds automatically on first search
 - **Hybrid search** — serves results from index instantly while rebuilding in the background
 
 ## Why xgrep?
 
 | | ripgrep | zoekt | xgrep |
 |---|---------|-------|-------|
-| Setup | None | Server required | None (`cargo install`) |
+| Setup | None | Server required | None (`cargo`/`npm`/`pip`) |
 | First search | Instant | After server start | Auto-builds index |
 | Repeated search (Linux kernel) | 1,687ms | 170ms (server) | 37ms |
 | File discovery (next.js, 26K files) | N/A | N/A | 9ms (fd: 191ms) |
@@ -32,14 +34,28 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 
 xgrep is not a ripgrep replacement. Use ripgrep for one-off searches. Use xgrep when you search the same codebase repeatedly — the index pays for itself after ~2 searches.
 
+## Installation
+
+Choose your package manager:
+
+```bash
+# Rust (recommended — native binary, no runtime)
+cargo install xgrep-search    # Requires Rust 1.85+
+
+# npm (Node.js 18+)
+npm install -g xgrep
+
+# pip (Python 3.8+)
+pip install xgrep-search
+```
+
+Prebuilt binaries are also available on the [Releases](https://github.com/momokun7/xgrep/releases) page.
+
 ## Quick Start
 
 ```bash
-cargo install xgrep-search    # Installs the `xg` command
 xg "pattern"                  # Search (auto-builds index on first run)
 ```
-
-Requires Rust 1.85+. Works on macOS, Linux, and Windows.
 
 <details>
 <summary>Build from source</summary>

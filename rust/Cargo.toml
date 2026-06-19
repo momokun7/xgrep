@@ -1,11 +1,11 @@
 [package]
 name = "xgrep-search"
-version = "0.5.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.74"
 description = "Ultra-fast indexed code search engine with MCP server for AI coding tools."
 license = "MIT"
-readme = "../README.md"
+readme = "README.md"
 repository = "https://github.com/momokun7/xgrep"
 keywords = ["search", "grep", "trigram", "index", "code-search"]
 categories = ["command-line-utilities", "development-tools"]
