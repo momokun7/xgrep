@@ -20,6 +20,9 @@ cargo test
 
 `./scripts/check.sh` runs all of these, with and without default features, the same way CI does. Run it before opening a pull request (`--quick` skips the no-default-features pass).
 
+If you use [mise](https://mise.jdx.dev), the same steps are available as tasks from the repository root
+(`mise run build`, `mise run test`, `mise run lint`, `mise run install`; `mise tasks` lists them all).
+
 ## Pull Requests
 
 1. Fork the repository

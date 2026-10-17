@@ -17,6 +17,9 @@ git clone --depth 1 https://github.com/torvalds/linux.git bench/linux-src
 ./bench/run.sh all
 ```
 
+With [mise](https://mise.jdx.dev): `mise run bench small` (also `mise run bench:fair`, `mise run bench:find`).
+The benchmarks are POSIX-only (Linux or macOS); on Windows the tasks stop with a message.
+
 ## Requirements
 
 - [hyperfine](https://github.com/sharkdp/hyperfine) - `cargo install hyperfine`

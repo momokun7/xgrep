@@ -1,0 +1,35 @@
+# Optional task runner for contributors who use mise (https://mise.jdx.dev).
+# `mise tasks` lists them; cargo works the same without mise. Extra args are passed through.
+[tools]
+uv = "0.13"
+
+[tasks.build]
+description = "Build xg in release mode"
+dir = "rust"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run the test suite"
+dir = "rust"
+run = "cargo test"
+
+[tasks.lint]
+description = "Check formatting and clippy (same as CI)"
+dir = "rust"
+run = ["cargo fmt -- --check", "cargo clippy --all-targets -- -D warnings"]
+
+[tasks.install]
+description = "Install xg from this checkout into ~/.cargo/bin (replaces an installed xg of the same version)"
+run = "cargo install --locked --force --path rust --bin xg"
+
+[tasks.bench]
+description = "Search benchmarks: mise run bench [small|medium|large|all] (Linux/macOS only)"
+run = "uv run bench/posix.py bench/run.sh"
+
+[tasks."bench:fair"]
+description = "xg vs ripgrep vs zoekt fair benchmark (Linux/macOS only)"
+run = "uv run bench/posix.py bench/fair-bench.sh"
+
+[tasks."bench:find"]
+description = "xg --find vs fd vs find (Linux/macOS only)"
+run = "uv run bench/posix.py benchmarks/bench_find.sh"
