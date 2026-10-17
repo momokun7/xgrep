@@ -585,6 +585,8 @@ fn test_mcp_pagination_exact_total_and_next_offset() {
     let (t, _) = &out[2];
     let shown: Vec<usize> = t
         .lines()
+        // Lines look like `4> marker 2` (line-number gutter + match marker).
+        .filter_map(|l| l.split_once("> ").map(|(_, rest)| rest))
         .filter_map(|l| l.strip_prefix("marker "))
         .map(|n| n.parse().unwrap())
         .collect();

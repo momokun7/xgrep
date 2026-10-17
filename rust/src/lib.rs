@@ -299,6 +299,106 @@ impl std::fmt::Display for IndexStatusInfo {
     }
 }
 
+/// Index freshness observed by a search, returned by
+/// [`Xgrep::last_search_freshness`].
+///
+/// Default searches check which files changed since the index was built
+/// (via `git status`, or by comparing mtimes outside git) and read those
+/// files directly, so results include new code even before the index is
+/// rebuilt. The [`Display`](std::fmt::Display) impl renders a short note
+/// such as `index stale: 3 files rescanned`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Freshness {
+    /// Files that differ from the index (modified, deleted, or new).
+    pub changed_files: usize,
+    /// Files read directly from disk and merged into the results.
+    pub rescanned_files: usize,
+    /// True when too many files changed to rescan them all; the results
+    /// then come from the stale index alone and may be incomplete.
+    pub truncated: bool,
+}
+
+impl Freshness {
+    /// True if any file differs from the index.
+    pub fn is_stale(&self) -> bool {
+        self.changed_files > 0 || self.truncated
+    }
+}
+
+impl std::fmt::Display for Freshness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.is_stale() {
+            write!(f, "index fresh")
+        } else if self.truncated {
+            write!(
+                f,
+                "index stale: {} files changed, not rescanned (rebuild pending)",
+                self.changed_files
+            )
+        } else {
+            write!(f, "index stale: {} files rescanned", self.rescanned_files)
+        }
+    }
+}
+
+/// Maximum number of changed files read directly by a default search.
+/// Beyond this, the search uses the index alone, warns, and relies on the
+/// background rebuild (`--fresh` rebuilds synchronously instead).
+const OVERLAY_MAX_FILES: usize = 500;
+
+/// Default time budget for the freshness probe of a default search.
+/// Override with `XGREP_OVERLAY_TIMEOUT_MS`.
+const OVERLAY_PROBE_BUDGET_MS: u64 = 200;
+
+/// After a probe exceeds its budget, skip probing for this long.
+const OVERLAY_PROBE_BACKOFF_SECS: u64 = 600;
+
+fn overlay_probe_budget() -> std::time::Duration {
+    let ms = std::env::var("XGREP_OVERLAY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(OVERLAY_PROBE_BUDGET_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Skip background rebuilds if one was attempted within this many seconds.
+const REBUILD_COOLDOWN_SECS: u64 = 30;
+
+/// When true, background rebuilds spawn `<current_exe> init` as a detached
+/// process. Only the `xg` CLI sets this: in library contexts (Python, Node)
+/// `current_exe()` is the host interpreter, which must never be launched.
+static SPAWN_REBUILD_PROCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Choose how background index rebuilds run (process-wide).
+///
+/// `true` spawns a detached `xg init` child (the current executable must be
+/// the `xg` binary); used by short-lived CLI invocations so the search can
+/// exit immediately. `false` (default) rebuilds on a background thread
+/// inside the current process, which is what libraries and the MCP server
+/// want: no foreign processes and no zombies.
+#[doc(hidden)]
+pub fn set_background_rebuild_process(enabled: bool) {
+    SPAWN_REBUILD_PROCESS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True if the freshness overlay is disabled via `XGREP_NO_OVERLAY=1`.
+fn overlay_disabled() -> bool {
+    std::env::var_os("XGREP_NO_OVERLAY").is_some_and(|v| v == "1" || v == "true")
+}
+
+/// Build/update the index at `index_path` and record its metadata.
+///
+/// Metadata is saved even when the corpus fingerprint matched (no rebuild),
+/// so the "verified" timestamp advances and freshness checks stay cheap.
+fn rebuild_index_files(root: &Path, index_path: &Path) -> Result<bool> {
+    let started = std::time::SystemTime::now();
+    let cache = index::cache::cache_path_for(index_path);
+    let rebuilt = index::builder::build_index_with_cache(root, index_path, Some(&cache))?;
+    index::updater::save_meta(root, index_path, Some(started))?;
+    Ok(rebuilt)
+}
+
 /// Main entry point for the search engine.
 ///
 /// Use `open()` to specify a directory, then `search()` to execute queries.
@@ -307,6 +407,10 @@ pub struct Xgrep {
     root: PathBuf,
     index_path: PathBuf,
     config: Config,
+    /// Freshness observed by the most recent index search.
+    last_freshness: std::sync::Mutex<Option<Freshness>>,
+    /// Set while an in-process background rebuild thread is running.
+    rebuild_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Xgrep {
@@ -314,22 +418,24 @@ impl Xgrep {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = resolve_index_path(&root)?;
-        Ok(Self {
-            root,
-            index_path,
-            config: Config::default(),
-        })
+        Ok(Self::with_paths(root, index_path))
     }
 
     /// Open with a local index (.xgrep/) explicitly.
     pub fn open_local(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = root.join(".xgrep").join("index");
-        Ok(Self {
+        Ok(Self::with_paths(root, index_path))
+    }
+
+    fn with_paths(root: PathBuf, index_path: PathBuf) -> Self {
+        Self {
             root,
             index_path,
             config: Config::default(),
-        })
+            last_freshness: std::sync::Mutex::new(None),
+            rebuild_running: Default::default(),
+        }
     }
 
     /// Set the configuration using builder pattern.
@@ -378,13 +484,7 @@ impl Xgrep {
             }
         }
 
-        let cache = index::cache::cache_path_for(&self.index_path);
-        let rebuilt =
-            index::builder::build_index_with_cache(&self.root, &self.index_path, Some(&cache))?;
-        if rebuilt {
-            index::updater::save_meta(&self.root, &self.index_path)?;
-        }
-        Ok(rebuilt)
+        rebuild_index_files(&self.root, &self.index_path)
     }
 
     /// Apply word-boundary wrapping. Returns the effective pattern and
@@ -401,7 +501,18 @@ impl Xgrep {
             } else {
                 regex::escape(pattern)
             };
-            (format!(r"\b(?:{})\b", inner).into(), true)
+            // ripgrep semantics: the match must be preceded by start-of-line
+            // or a non-word character, and followed by end-of-line or a
+            // non-word character. Plain `\b...\b` fails for patterns whose
+            // edges are non-word characters (`-w 'foo('` would never match
+            // `call foo( x)`). The regex crate has no lookaround, so the
+            // neighbouring character is consumed instead; results are
+            // line-based, so this does not change which lines match.
+            // `\n` is excluded so a match never starts on the previous line.
+            (
+                format!(r"(?:(?m:^)|[^\w\n])(?:{})(?:(?m:$)|[^\w\n])", inner).into(),
+                true,
+            )
         } else {
             (pattern.into(), opts.regex)
         }
@@ -432,18 +543,15 @@ impl Xgrep {
             extensions,
             path_substring: opts.path_pattern.clone(),
             globs,
-            // The fresh path drops index results for changed files after
-            // scanning, so a pushed-down limit could lose results there.
-            max_count: if opts.fresh { None } else { opts.max_count },
+            exclude_paths: None,
+            max_count: opts.max_count,
         };
 
-        let mut results = search::with_scan_filter(filter, || {
-            if opts.changed_only || opts.since.is_some() {
-                self.search_changed(pattern, regex, opts)
-            } else {
-                self.search_indexed(pattern, regex, opts)
-            }
-        })?;
+        let mut results = if opts.changed_only || opts.since.is_some() {
+            self.search_changed(pattern, regex, opts, &filter)?
+        } else {
+            self.search_indexed(pattern, regex, opts, &filter)?
+        };
 
         if let Some(max) = opts.max_count {
             results.truncate(max);
@@ -452,182 +560,345 @@ impl Xgrep {
         Ok(results)
     }
 
-    /// Index-based search. When `opts.fresh` is true, checks index freshness
-    /// and uses hybrid search for changed files. When false (default), uses
-    /// existing index as-is for maximum speed.
+    /// Index-based search with a freshness overlay.
+    ///
+    /// Before using the index, a cheap probe finds files that changed since
+    /// the index was built (`git status` in a git work tree, mtime/size
+    /// comparison otherwise). Index results for those files are dropped and
+    /// the files are scanned directly, so new and edited code is found even
+    /// before the index is rebuilt. The rebuild itself happens in the
+    /// background.
+    ///
+    /// If more than [`OVERLAY_MAX_FILES`] files changed, the default search
+    /// falls back to the index alone (with a warning), while `opts.fresh`
+    /// rebuilds the index synchronously first.
     fn search_indexed(
         &self,
         pattern: &str,
         regex: bool,
         opts: &SearchOptions,
+        filter: &search::ScanFilter,
     ) -> Result<Vec<SearchResult>> {
-        if !opts.fresh {
-            // Fast path: use index as-is without freshness check
-            if self.index_path.exists() {
-                let reader = index::reader::IndexReader::open(&self.index_path)?;
-                let results = if regex {
-                    search::search_regex(
-                        &reader,
-                        &self.root,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )
-                } else {
-                    search::search(
-                        &reader,
-                        &self.root,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )
-                };
-                // Background rebuild: spawn a detached process to update the index
-                // The current search uses the existing index; next search will use the updated one
-                self.spawn_background_rebuild();
-                return results;
+        self.set_last_freshness(None);
+
+        if !self.index_path.exists() {
+            if !self.config.quiet {
+                eprintln!("[indexing...]");
             }
-            // Index doesn't exist, fall through to auto-build
+            self.build_index()?;
+            if !self.config.quiet {
+                eprintln!("[done]");
+            }
+            let reader = index::reader::IndexReader::open(&self.index_path)?;
+            self.set_last_freshness(Some(Freshness::default()));
+            return self.search_reader(&reader, pattern, regex, opts, filter);
         }
 
-        let status = index::updater::check_index_status(&self.root, &self.index_path)?;
+        let reader = index::reader::IndexReader::open(&self.index_path)?;
+        let perf = std::env::var_os("XGREP_PERF_TIMING").is_some();
+        let t0 = perf.then(std::time::Instant::now);
+        let overlay = if opts.fresh {
+            index::updater::compute_overlay(&self.root, &self.index_path, &reader, None)
+        } else if overlay_disabled() || self.probe_backoff_active() {
+            None
+        } else {
+            let deadline = std::time::Instant::now() + overlay_probe_budget();
+            let ov = index::updater::compute_overlay(
+                &self.root,
+                &self.index_path,
+                &reader,
+                Some(deadline),
+            );
+            self.record_probe_outcome(ov.is_some());
+            ov
+        };
+        if let (Some(t), Some(ov)) = (t0, overlay.as_ref()) {
+            eprintln!(
+                "[perf] overlay_probe: {:.1}ms  changed={}{}",
+                t.elapsed().as_secs_f64() * 1000.0,
+                ov.changed.len(),
+                if ov.truncated { "+" } else { "" }
+            );
+        }
+        let Some(overlay) = overlay else {
+            // Probe disabled, backed off, or timed out: use the index as-is
+            // (freshness unknown).
+            let results = self.search_reader(&reader, pattern, regex, opts, filter);
+            self.spawn_background_rebuild();
+            return results;
+        };
 
-        match status {
-            index::updater::IndexStatus::Fresh => {
-                let reader = index::reader::IndexReader::open(&self.index_path)?;
-                if regex {
-                    search::search_regex(
-                        &reader,
-                        &self.root,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )
-                } else {
-                    search::search(
-                        &reader,
-                        &self.root,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )
-                }
+        let changed = overlay.changed.len();
+        if changed == 0 && !overlay.truncated {
+            self.set_last_freshness(Some(Freshness::default()));
+            if overlay.meta_outdated {
+                self.spawn_background_rebuild();
             }
-            index::updater::IndexStatus::Stale { changed_files } => {
-                let reader = index::reader::IndexReader::open(&self.index_path)?;
+            return self.search_reader(&reader, pattern, regex, opts, filter);
+        }
 
-                // Search from index (results for changed files may be stale)
-                let mut index_results = if regex {
-                    search::search_regex(
-                        &reader,
-                        &self.root,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )?
-                } else {
-                    search::search(
-                        &reader,
-                        &self.root,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )?
-                };
-
-                // Exclude results from changed files (may be stale data)
-                let changed_set: std::collections::HashSet<String> = changed_files
-                    .iter()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect();
-                index_results.retain(|r| !changed_set.contains(r.file.as_ref()));
-
-                // Directly scan changed files
-                let direct_results = if regex {
-                    search::search_files_regex(
-                        &self.root,
-                        &changed_files,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )?
-                } else {
-                    search::search_files(
-                        &self.root,
-                        &changed_files,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )?
-                };
-
-                // Merge, sort, and deduplicate
-                index_results.extend(direct_results);
-                index_results
-                    .sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
-                index_results.dedup_by(|a, b| a.file == b.file && a.line_number == b.line_number);
-                Ok(index_results)
-            }
-            index::updater::IndexStatus::NeedsFullBuild => {
-                // No index, full build required
+        if overlay.truncated || changed > OVERLAY_MAX_FILES {
+            if opts.fresh {
+                // Too many changes to rescan: incremental rebuild, then search.
+                drop(reader);
                 if !self.config.quiet {
-                    eprintln!("[indexing...]");
+                    eprintln!("[updating index ({} files changed)...]", changed);
                 }
                 self.build_index()?;
                 if !self.config.quiet {
                     eprintln!("[done]");
                 }
-
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
-                if regex {
-                    search::search_regex(
-                        &reader,
-                        &self.root,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )
-                } else {
-                    search::search(
-                        &reader,
-                        &self.root,
-                        pattern,
-                        opts.case_insensitive,
-                        self.config.quiet,
-                    )
-                }
+                self.set_last_freshness(Some(Freshness::default()));
+                return self.search_reader(&reader, pattern, regex, opts, filter);
+            }
+            let info = Freshness {
+                changed_files: changed,
+                rescanned_files: 0,
+                truncated: true,
+            };
+            if !self.config.quiet {
+                eprintln!(
+                    "xgrep: warning: {}; results may be incomplete. Run `xg init` or use --fresh.",
+                    info
+                );
+            }
+            self.set_last_freshness(Some(info));
+            let results = self.search_reader(&reader, pattern, regex, opts, filter);
+            self.spawn_background_rebuild();
+            return results;
+        }
+
+        // Overlay: skip changed files in the index scan and scan them
+        // directly. Excluding them up front (rather than dropping their hits
+        // afterwards) keeps the pushed-down max_count correct.
+        let changed_keys: std::collections::HashSet<String> = overlay
+            .changed
+            .iter()
+            .map(|p| index::updater::index_key(p))
+            .collect();
+        let index_filter = search::ScanFilter {
+            exclude_paths: Some(changed_keys),
+            ..filter.clone()
+        };
+        let mut results = self.search_reader(&reader, pattern, regex, opts, &index_filter)?;
+        drop(reader);
+
+        let scan: Vec<PathBuf> = overlay
+            .changed
+            .into_iter()
+            .filter(|p| self.root.join(p).is_file())
+            .collect();
+        let direct = search::search_files_with_filter(
+            &self.root,
+            &scan,
+            pattern,
+            regex,
+            opts.case_insensitive,
+            self.config.quiet,
+            filter,
+        )?;
+        results.extend(direct);
+        results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
+        results.dedup_by(|a, b| a.file == b.file && a.line_number == b.line_number);
+
+        self.set_last_freshness(Some(Freshness {
+            changed_files: changed,
+            rescanned_files: scan.len(),
+            truncated: false,
+        }));
+        self.spawn_background_rebuild();
+        Ok(results)
+    }
+
+    /// Run a literal or regex search against an open index reader.
+    fn search_reader(
+        &self,
+        reader: &index::reader::IndexReader,
+        pattern: &str,
+        regex: bool,
+        opts: &SearchOptions,
+        filter: &search::ScanFilter,
+    ) -> Result<Vec<SearchResult>> {
+        search::search_with_filter(
+            reader,
+            &self.root,
+            pattern,
+            regex,
+            opts.case_insensitive,
+            self.config.quiet,
+            filter,
+        )
+    }
+
+    /// Marker written when a freshness probe exceeds its budget (e.g. git on
+    /// a slow network or WSL `/mnt/c` filesystem).
+    fn probe_slow_marker(&self) -> PathBuf {
+        self.index_path.with_extension("probe-slow")
+    }
+
+    /// True while a recent probe timeout says probing is not worth it.
+    fn probe_backoff_active(&self) -> bool {
+        std::fs::metadata(self.probe_slow_marker())
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() < OVERLAY_PROBE_BACKOFF_SECS)
+    }
+
+    fn record_probe_outcome(&self, completed: bool) {
+        let marker = self.probe_slow_marker();
+        if completed {
+            if marker.exists() {
+                let _ = std::fs::remove_file(marker);
+            }
+        } else {
+            let _ = std::fs::write(marker, b"freshness probe timed out\n");
+            if !self.config.quiet {
+                eprintln!(
+                    "xgrep: note: index freshness check took over {}ms; skipping it for {} minutes \
+                     (results may miss recent edits; use --fresh to force)",
+                    overlay_probe_budget().as_millis(),
+                    OVERLAY_PROBE_BACKOFF_SECS / 60
+                );
             }
         }
     }
 
-    /// Spawn a detached background process to rebuild the index.
-    /// Skips if: lock file exists, or index was built within the last 30 seconds.
+    fn set_last_freshness(&self, value: Option<Freshness>) {
+        if let Ok(mut guard) = self.last_freshness.lock() {
+            *guard = value;
+        }
+    }
+
+    /// Freshness observed by the most recent [`search`](Self::search).
+    ///
+    /// `None` if no index search has run yet, or the last search did not use
+    /// the index (`changed_only`, `since`). When the index was stale, the
+    /// returned value tells how many changed files were rescanned directly
+    /// (its `Display` renders e.g. `index stale: 3 files rescanned`).
+    pub fn last_search_freshness(&self) -> Option<Freshness> {
+        self.last_freshness.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Files whose contents may differ from the index (modified, deleted,
+    /// or new — including untracked files in a git work tree), relative to
+    /// the root. Empty when the index is fresh or has not been built.
+    pub fn stale_files(&self) -> Result<Vec<PathBuf>> {
+        match index::updater::check_index_status(&self.root, &self.index_path)? {
+            index::updater::IndexStatus::Stale { changed_files } => Ok(changed_files),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Start a background index rebuild without blocking the caller.
+    ///
+    /// Skips if a build lock exists, a rebuild is already running in this
+    /// process, or a rebuild was attempted within the last
+    /// [`REBUILD_COOLDOWN_SECS`]. Attempts are recorded in a `.rebuild`
+    /// stamp file next to the index, touched even when the build turns out
+    /// to be a no-op, so repeated searches do not re-walk the tree.
+    ///
+    /// In the `xg` CLI (see [`set_background_rebuild_process`]) a detached
+    /// `xg init` child is spawned so the search process can exit at once.
+    /// Everywhere else (MCP server, Python/Node bindings) the rebuild runs on
+    /// a background thread: `current_exe()` is not `xg` there, and a thread
+    /// leaves no zombie processes behind.
     fn spawn_background_rebuild(&self) {
-        // Skip if lock file exists (another rebuild in progress)
-        if self.index_path.with_extension("lock").exists() {
+        use std::sync::atomic::Ordering;
+
+        if self.index_path.with_extension("lock").exists()
+            || self.rebuild_running.load(Ordering::Acquire)
+        {
             return;
         }
-        // Skip if index is fresh enough (built within last 30 seconds)
-        if let Ok(meta) = std::fs::metadata(&self.index_path) {
-            if let Ok(modified) = meta.modified() {
-                if modified.elapsed().unwrap_or_default().as_secs() < 30 {
-                    return;
-                }
-            }
-        }
-        // Get the current executable path
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(_) => return,
+        let recent = |p: &Path| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_secs() < REBUILD_COOLDOWN_SECS)
         };
-        // Spawn detached: `xg init` in the background
-        let _ = std::process::Command::new(exe)
-            .arg("init")
-            .current_dir(&self.root)
+        let stamp = self.index_path.with_extension("rebuild");
+        if recent(&stamp) || recent(&self.index_path) {
+            return;
+        }
+        // Record the attempt first so concurrent searches don't pile up.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if std::fs::write(&stamp, now.to_string()).is_err() {
+            return;
+        }
+
+        if SPAWN_REBUILD_PROCESS.load(Ordering::Relaxed) && current_exe_is_xg() {
+            self.spawn_rebuild_process();
+        } else {
+            self.spawn_rebuild_thread();
+        }
+    }
+
+    /// Spawn a detached `xg init` for this root (CLI only).
+    ///
+    /// The child is not waited for: the CLI exits right after printing
+    /// results, and the orphaned child is reaped by init. It is placed in
+    /// its own process group so Ctrl-C on the search does not kill it.
+    fn spawn_rebuild_process(&self) {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let root = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("init");
+        if self.index_path == self.root.join(".xgrep").join("index") {
+            cmd.arg("--local");
+        }
+        cmd.arg(&root)
+            .current_dir(&root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let _ = cmd.spawn();
+    }
+
+    /// Rebuild on a background thread inside this process.
+    fn spawn_rebuild_thread(&self) {
+        use std::sync::atomic::Ordering;
+
+        if self.rebuild_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let root = self.root.clone();
+        let index_path = self.index_path.clone();
+        let running = std::sync::Arc::clone(&self.rebuild_running);
+        let spawned = std::thread::Builder::new()
+            .name("xgrep-rebuild".into())
+            .spawn(move || {
+                let _ = rebuild_index_files(&root, &index_path);
+                running.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.rebuild_running.store(false, Ordering::Release);
+        }
+    }
+
+    /// Wait (bounded) until an in-process background rebuild finishes.
+    #[cfg(test)]
+    fn wait_background_rebuild(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self
+            .rebuild_running
+            .load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Search specific files directly without using the index.
@@ -641,35 +912,24 @@ impl Xgrep {
     ) -> Result<Vec<SearchResult>> {
         let (pattern, regex) = Self::effective_pattern(pattern, opts);
         let pattern = pattern.as_ref();
-        let mut results = if regex {
-            search::search_files_regex(
-                &self.root,
-                files,
-                pattern,
-                opts.case_insensitive,
-                self.config.quiet,
-            )?
-        } else {
-            search::search_files(
-                &self.root,
-                files,
-                pattern,
-                opts.case_insensitive,
-                self.config.quiet,
-            )?
+        let filter = search::ScanFilter {
+            globs: if opts.globs.is_empty() {
+                None
+            } else {
+                Some(globfilter::GlobFilter::new(&opts.globs)?)
+            },
+            max_count: opts.max_count,
+            ..Default::default()
         };
-
-        // glob filter (-g)
-        if !opts.globs.is_empty() {
-            let filter = globfilter::GlobFilter::new(&opts.globs)?;
-            results.retain(|r| filter.matches(&r.file));
-        }
-
-        if let Some(max) = opts.max_count {
-            results.truncate(max);
-        }
-
-        Ok(results)
+        search::search_files_with_filter(
+            &self.root,
+            files,
+            pattern,
+            regex,
+            opts.case_insensitive,
+            self.config.quiet,
+            &filter,
+        )
     }
 
     /// Search only git-changed files. Returns error if not a git repository.
@@ -678,7 +938,9 @@ impl Xgrep {
         pattern: &str,
         regex: bool,
         opts: &SearchOptions,
+        filter: &search::ScanFilter,
     ) -> Result<Vec<SearchResult>> {
+        self.set_last_freshness(None);
         if !git::is_git_repo(&self.root) {
             return Err(XgrepError::NotGitRepo);
         }
@@ -693,23 +955,15 @@ impl Xgrep {
         files.sort();
         files.dedup();
 
-        if regex {
-            search::search_files_regex(
-                &self.root,
-                &files,
-                pattern,
-                opts.case_insensitive,
-                self.config.quiet,
-            )
-        } else {
-            search::search_files(
-                &self.root,
-                &files,
-                pattern,
-                opts.case_insensitive,
-                self.config.quiet,
-            )
-        }
+        search::search_files_with_filter(
+            &self.root,
+            &files,
+            pattern,
+            regex,
+            opts.case_insensitive,
+            self.config.quiet,
+            filter,
+        )
     }
 
     /// Find files matching a glob or substring pattern.
@@ -797,7 +1051,21 @@ pub fn start_mcp_server(xg: Xgrep) {
     mcp::start(xg);
 }
 
+/// True if the running executable is the `xg` CLI binary (not a host
+/// interpreter such as python or node that loaded xgrep as a library).
+fn current_exe_is_xg() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .is_some_and(|stem| stem == "xg" || stem == "xgrep")
+}
+
+/// Resolve where the index for `root` lives.
+///
+/// The root is canonicalized first so that relative paths, `..`
+/// components, and symlinked paths to the same directory share one index.
 fn resolve_index_path(root: &Path) -> Result<PathBuf> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let local = root.join(".xgrep").join("index");
     if local.exists() {
         return Ok(local);
@@ -1323,5 +1591,373 @@ mod tests {
             .search_files(&[std::path::PathBuf::from("a.py")], "needle", &opts)
             .unwrap();
         assert!(results.is_empty(), "-g '*.rs' must filter out a .py file");
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = crate::git::git_cmd()
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
+    }
+
+    fn init_repo_with(root: &Path, files: &[(&str, &str)]) {
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@t"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::write(root.join(".gitignore"), ".xgrep/\n").unwrap();
+        for (name, content) in files {
+            let p = root.join(name);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, content).unwrap();
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "init"]);
+    }
+
+    fn lines_of(results: &[SearchResult]) -> Vec<(String, usize)> {
+        results
+            .iter()
+            .map(|r| (r.file.to_string(), r.line_number))
+            .collect()
+    }
+
+    /// Regression (P2): `-w 'foo('` must match `call foo( x)` like ripgrep.
+    #[test]
+    fn test_word_boundary_non_word_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("a.txt"),
+            "call foo( x)\nfoo(\nxfoo( y\nfoo(x\n(bar) end\nx(bar)y\n",
+        )
+        .unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let opts = SearchOptions::new().with_word(true);
+
+        let r = xg.search("foo(", &opts).unwrap();
+        assert_eq!(
+            lines_of(&r),
+            vec![("a.txt".into(), 1), ("a.txt".into(), 2)],
+            "{r:?}"
+        );
+
+        let r = xg.search("(bar)", &opts).unwrap();
+        assert_eq!(lines_of(&r), vec![("a.txt".into(), 5)], "{r:?}");
+    }
+
+    /// The consumed boundary character must never attribute a match to the
+    /// previous line, and regex patterns must work too.
+    #[test]
+    fn test_word_boundary_line_attribution_and_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "abc\nfoo bar\nfoobar\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+
+        let r = xg
+            .search("foo", &SearchOptions::new().with_word(true))
+            .unwrap();
+        assert_eq!(lines_of(&r), vec![("a.txt".into(), 2)], "{r:?}");
+        assert_eq!(r[0].line, "foo bar");
+
+        let r = xg
+            .search(
+                "fo+|bar",
+                &SearchOptions::new().with_word(true).with_regex(true),
+            )
+            .unwrap();
+        assert_eq!(lines_of(&r), vec![("a.txt".into(), 2)], "{r:?}");
+    }
+
+    /// Regression (1-7): the default (non-fresh) search must not silently
+    /// miss edited or untracked files, and must drop stale index hits.
+    #[test]
+    fn test_default_search_overlays_git_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo_with(
+            root,
+            &[
+                ("a.rs", "fn old_name() {}\n"),
+                ("gone.rs", "fn old_name_gone() {}\n"),
+            ],
+        );
+        let xg = Xgrep::open_local(root)
+            .unwrap()
+            .with_config(Config { quiet: true });
+        xg.build_index().unwrap();
+
+        let opts = SearchOptions::new();
+        let r = xg.search("old_name", &opts).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(xg.last_search_freshness(), Some(Freshness::default()));
+
+        std::fs::write(root.join("a.rs"), "fn brand_new_sym() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::write(root.join("src/deep/b.rs"), "fn another_new_sym() {}\n").unwrap();
+        std::fs::write(root.join(".hidden.rs"), "fn brand_new_sym_hidden() {}\n").unwrap();
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+
+        let r = xg.search("brand_new_sym", &opts).unwrap();
+        assert_eq!(lines_of(&r), vec![("a.rs".into(), 1)], "{r:?}");
+        let r = xg.search("another_new_sym", &opts).unwrap();
+        assert_eq!(lines_of(&r), vec![("src/deep/b.rs".into(), 1)], "{r:?}");
+        // Stale hits for the edited and the deleted file are dropped.
+        let r = xg.search("old_name", &opts).unwrap();
+        assert!(r.is_empty(), "{r:?}");
+
+        let f = xg.last_search_freshness().unwrap();
+        assert!(f.is_stale());
+        assert!(!f.truncated);
+        // a.rs (modified), gone.rs (deleted), src/deep/b.rs (untracked)
+        assert_eq!(f.changed_files, 3, "{f:?}");
+        assert_eq!(f.rescanned_files, 2, "{f:?}");
+        assert_eq!(f.to_string(), "index stale: 2 files rescanned");
+
+        let stale = xg.stale_files().unwrap();
+        assert_eq!(
+            stale,
+            vec![
+                PathBuf::from("a.rs"),
+                PathBuf::from("gone.rs"),
+                PathBuf::from("src/deep/b.rs")
+            ]
+        );
+        xg.wait_background_rebuild();
+    }
+
+    /// After a commit, files changed between the indexed commit and HEAD
+    /// are rescanned even though `git status` is clean.
+    #[test]
+    fn test_default_search_overlays_new_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo_with(root, &[("a.rs", "fn first() {}\n")]);
+        let xg = Xgrep::open_local(root)
+            .unwrap()
+            .with_config(Config { quiet: true });
+        xg.build_index().unwrap();
+
+        std::fs::write(root.join("a.rs"), "fn committed_change() {}\n").unwrap();
+        git(root, &["commit", "-q", "-am", "second"]);
+
+        let r = xg
+            .search("committed_change", &SearchOptions::new())
+            .unwrap();
+        assert_eq!(lines_of(&r), vec![("a.rs".into(), 1)], "{r:?}");
+        xg.wait_background_rebuild();
+    }
+
+    /// Same-size edit right after a build (same mtime second) is still seen.
+    #[test]
+    fn test_default_search_racy_same_size_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo_with(root, &[("a.rs", "x\n")]);
+        std::fs::write(root.join("u.rs"), "fn aaaa() {}\n").unwrap();
+        let xg = Xgrep::open_local(root)
+            .unwrap()
+            .with_config(Config { quiet: true });
+        xg.build_index().unwrap();
+        // Untracked file rewritten with identical size immediately.
+        std::fs::write(root.join("u.rs"), "fn bbbb() {}\n").unwrap();
+        let r = xg.search("bbbb", &SearchOptions::new()).unwrap();
+        assert_eq!(lines_of(&r), vec![("u.rs".into(), 1)], "{r:?}");
+        xg.wait_background_rebuild();
+    }
+
+    /// Non-git trees: modified, deleted, and new files (including files in
+    /// new directories) are detected via mtimes.
+    #[test]
+    fn test_default_search_overlays_non_git_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(!crate::git::is_git_repo(root), "tempdir must not be in git");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), "needle_old\n").unwrap();
+        std::fs::write(root.join("sub/c.txt"), "needle_old too\n").unwrap();
+        let xg = Xgrep::open_local(root)
+            .unwrap()
+            .with_config(Config { quiet: true });
+        xg.build_index().unwrap();
+        assert!(xg.stale_files().unwrap().is_empty());
+
+        std::fs::write(root.join("a.txt"), "needle_new here\n").unwrap();
+        std::fs::remove_file(root.join("sub/c.txt")).unwrap();
+        std::fs::create_dir_all(root.join("newdir/inner")).unwrap();
+        std::fs::write(root.join("newdir/inner/n.txt"), "needle_new deep\n").unwrap();
+        std::fs::write(root.join("sub/d.txt"), "needle_new sub\n").unwrap();
+        std::fs::write(root.join(".hidden"), "needle_new hidden\n").unwrap();
+
+        let opts = SearchOptions::new();
+        let r = xg.search("needle_new", &opts).unwrap();
+        assert_eq!(
+            lines_of(&r),
+            vec![
+                ("a.txt".into(), 1),
+                ("newdir/inner/n.txt".into(), 1),
+                ("sub/d.txt".into(), 1)
+            ],
+            "{r:?}"
+        );
+        let r = xg.search("needle_old", &opts).unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        let f = xg.last_search_freshness().unwrap();
+        assert_eq!(f.changed_files, 4, "{f:?}");
+        assert_eq!(f.rescanned_files, 3, "{f:?}");
+        xg.wait_background_rebuild();
+    }
+
+    /// max_count with changed files: the limited index scan must not be
+    /// filled by stale hits of changed files that are dropped afterwards.
+    #[test]
+    fn test_overlay_respects_max_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "needle\nneedle\n").unwrap();
+        std::fs::write(root.join("b.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("c.txt"), "needle\n").unwrap();
+        let xg = Xgrep::open_local(root)
+            .unwrap()
+            .with_config(Config { quiet: true });
+        xg.build_index().unwrap();
+
+        // a.txt no longer matches; its stale index hits must not use up the limit.
+        std::fs::write(root.join("a.txt"), "gone\n").unwrap();
+        let r = xg
+            .search("needle", &SearchOptions::new().with_max_count(2))
+            .unwrap();
+        assert_eq!(
+            lines_of(&r),
+            vec![("b.txt".into(), 1), ("c.txt".into(), 1)],
+            "{r:?}"
+        );
+        xg.wait_background_rebuild();
+    }
+
+    /// Too many changed files: the default search falls back to the index
+    /// and reports it; `fresh` rebuilds synchronously instead.
+    #[test]
+    fn test_overlay_cap_and_fresh_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("seed.txt"), "seed content\n").unwrap();
+        let xg = Xgrep::open_local(root)
+            .unwrap()
+            .with_config(Config { quiet: true });
+        xg.build_index().unwrap();
+        // Keep the background rebuild from racing the assertions.
+        std::fs::write(xg.index_path().with_extension("rebuild"), "0").unwrap();
+
+        for i in 0..(OVERLAY_MAX_FILES + 1) {
+            std::fs::write(root.join(format!("f{i}.txt")), "capneedle\n").unwrap();
+        }
+        let r = xg.search("capneedle", &SearchOptions::new()).unwrap();
+        assert!(r.is_empty());
+        let f = xg.last_search_freshness().unwrap();
+        assert!(f.truncated, "{f:?}");
+        assert_eq!(f.changed_files, OVERLAY_MAX_FILES + 1);
+
+        let r = xg
+            .search("capneedle", &SearchOptions::new().with_fresh(true))
+            .unwrap();
+        assert_eq!(r.len(), OVERLAY_MAX_FILES + 1);
+        assert_eq!(xg.last_search_freshness(), Some(Freshness::default()));
+    }
+
+    /// Regression (1-8/2-12): library contexts rebuild on a thread (never by
+    /// spawning `current_exe()`), and the cooldown stamp is honoured even
+    /// when the rebuild finds nothing to change.
+    #[test]
+    fn test_background_rebuild_thread_and_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "alpha_one\n").unwrap();
+        let xg = Xgrep::open_local(root)
+            .unwrap()
+            .with_config(Config { quiet: true });
+        xg.build_index().unwrap();
+        let stamp = xg.index_path().with_extension("rebuild");
+        let age = |p: &Path| {
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        age(xg.index_path());
+
+        std::fs::write(root.join("a.txt"), "alpha_two\n").unwrap();
+        let r = xg.search("alpha_two", &SearchOptions::new()).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(stamp.exists(), "rebuild attempt must be stamped");
+        xg.wait_background_rebuild();
+        assert!(
+            xg.stale_files().unwrap().is_empty(),
+            "background thread should have refreshed the index"
+        );
+
+        // Within the cooldown, no further rebuild starts.
+        age(xg.index_path());
+        std::fs::write(root.join("a.txt"), "alpha_three\n").unwrap();
+        let r = xg.search("alpha_three", &SearchOptions::new()).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(!xg
+            .rebuild_running
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(xg.stale_files().unwrap(), vec![PathBuf::from("a.txt")]);
+    }
+
+    /// Regression (P2): non-ASCII paths work with --fresh (git -z parsing).
+    #[test]
+    fn test_fresh_search_non_ascii_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo_with(root, &[("日本.txt", "old text\n")]);
+        let xg = Xgrep::open_local(root)
+            .unwrap()
+            .with_config(Config { quiet: true });
+        xg.build_index().unwrap();
+        std::fs::write(root.join("日本.txt"), "brand new text\n").unwrap();
+
+        for fresh in [true, false] {
+            let r = xg
+                .search("brand new", &SearchOptions::new().with_fresh(fresh))
+                .unwrap();
+            assert_eq!(lines_of(&r), vec![("日本.txt".into(), 1)], "{r:?}");
+        }
+        match xg.index_status().unwrap().state {
+            IndexState::Stale { changed_files } => assert_eq!(changed_files, 1),
+            other => panic!("expected stale, got {other:?}"),
+        }
+        xg.wait_background_rebuild();
+    }
+
+    /// Regression (P2): relative, `..`, and symlinked spellings of the same
+    /// root share one index.
+    #[test]
+    fn test_resolve_index_path_canonicalizes_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let canonical = resolve_index_path(&root).unwrap();
+        assert_eq!(
+            resolve_index_path(&root.join("sub").join("..")).unwrap(),
+            canonical
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            assert_eq!(resolve_index_path(&link).unwrap(), canonical);
+        }
     }
 }

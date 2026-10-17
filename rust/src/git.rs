@@ -63,20 +63,63 @@ fn to_root_relative(root: &Path, git_root: &Path, git_rel_path: &str) -> Option<
     rel.strip_prefix(prefix).ok().map(|p| p.to_path_buf())
 }
 
-/// Collect git-changed file paths, converting to root-relative paths.
-fn collect_git_paths(root: &Path, git_root: &Option<PathBuf>, lines: &str) -> HashSet<PathBuf> {
-    let mut files = HashSet::new();
-    for line in lines.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+/// Split NUL-separated git output (`-z`) into path tokens.
+///
+/// Empty tokens are skipped. A leading newline (emitted by `git log -z`
+/// between commits) is stripped. Paths are neither quoted nor escaped in
+/// `-z` mode, so non-ASCII names such as `日本.txt` survive intact.
+pub(crate) fn split_nul(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes.split(|&b| b == 0).filter_map(|tok| {
+        let tok = tok.strip_prefix(b"\n").unwrap_or(tok);
+        if tok.is_empty() {
+            None
+        } else {
+            Some(tok)
         }
+    })
+}
+
+/// Convert raw path bytes from git into a `PathBuf` without lossy decoding
+/// on Unix (git paths are byte strings).
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Locate the git working-tree root by walking up from `root` looking for a
+/// `.git` entry (directory, or file for worktrees/submodules).
+///
+/// This avoids spawning `git rev-parse --show-toplevel` on hot paths. The
+/// result is canonicalized. Callers must still handle git commands failing
+/// (e.g. a stray `.git` that is not a repository).
+pub(crate) fn find_toplevel_fs(root: &Path) -> Option<PathBuf> {
+    let canon = std::fs::canonicalize(root).ok()?;
+    let mut dir: &Path = &canon;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Collect git-changed file paths from `-z` output, converting to root-relative paths.
+fn collect_git_paths(root: &Path, git_root: &Option<PathBuf>, out: &[u8]) -> HashSet<PathBuf> {
+    let mut files = HashSet::new();
+    for tok in split_nul(out) {
         let rel = match git_root {
-            Some(gr) => match to_root_relative(root, gr, line) {
+            Some(gr) => match to_root_relative(root, gr, &String::from_utf8_lossy(tok)) {
                 Some(p) => p,
                 None => continue, // path outside root's scope
             },
-            None => PathBuf::from(line),
+            None => bytes_to_path(tok),
         };
         let full = root.join(&rel);
         if full.exists() {
@@ -97,25 +140,17 @@ pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
 
     // unstaged changes
     let output = git_cmd()
-        .args(["diff", "--name-only"])
+        .args(["diff", "--name-only", "-z"])
         .current_dir(root)
         .output()?;
-    files.extend(collect_git_paths(
-        root,
-        &gr,
-        &String::from_utf8_lossy(&output.stdout),
-    ));
+    files.extend(collect_git_paths(root, &gr, &output.stdout));
 
     // staged changes
     let output = git_cmd()
-        .args(["diff", "--cached", "--name-only"])
+        .args(["diff", "--cached", "--name-only", "-z"])
         .current_dir(root)
         .output()?;
-    files.extend(collect_git_paths(
-        root,
-        &gr,
-        &String::from_utf8_lossy(&output.stdout),
-    ));
+    files.extend(collect_git_paths(root, &gr, &output.stdout));
 
     let mut result: Vec<PathBuf> = files.into_iter().collect();
     result.sort();
@@ -134,6 +169,7 @@ pub fn since_files(root: &Path, duration: &str) -> Result<Vec<PathBuf>> {
                 "log",
                 &format!("--since={since_str}"),
                 "--name-only",
+                "-z",
                 "--pretty=format:",
             ])
             .current_dir(root)
@@ -142,13 +178,19 @@ pub fn since_files(root: &Path, duration: &str) -> Result<Vec<PathBuf>> {
         // commits mode: "3.commits" -> git log -3
         let n: &str = duration.split('.').next().unwrap();
         git_cmd()
-            .args(["log", &format!("-{n}"), "--name-only", "--pretty=format:"])
+            .args([
+                "log",
+                "-z",
+                &format!("-{n}"),
+                "--name-only",
+                "--pretty=format:",
+            ])
             .current_dir(root)
             .output()?
     };
 
     let gr = git_toplevel(root);
-    let files = collect_git_paths(root, &gr, &String::from_utf8_lossy(&output.stdout));
+    let files = collect_git_paths(root, &gr, &output.stdout);
 
     let mut result: Vec<PathBuf> = files.into_iter().collect();
     result.sort();
@@ -278,5 +320,43 @@ mod tests {
     fn test_is_git_repo_non_git_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!is_git_repo(dir.path()));
+    }
+
+    /// Regression: non-ASCII names come back raw with `-z` (not quoted as
+    /// `"\346\227\245..."`), so they resolve to existing files.
+    #[test]
+    fn test_changed_and_since_files_non_ascii() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("日本.txt"), "one").unwrap();
+        std::fs::write(root.join("a b.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let since = since_files(root, "1.commits").unwrap();
+        assert!(since.contains(&PathBuf::from("日本.txt")), "{since:?}");
+        assert!(since.contains(&PathBuf::from("a b.txt")), "{since:?}");
+
+        std::fs::write(root.join("日本.txt"), "two").unwrap();
+        let changed = changed_files(root).unwrap();
+        assert_eq!(changed, vec![PathBuf::from("日本.txt")]);
+    }
+
+    #[test]
+    fn test_split_nul_skips_empty_and_log_newlines() {
+        let toks: Vec<&[u8]> = split_nul(b"a.txt\0\0\nb.txt\0").collect();
+        assert_eq!(toks, vec![&b"a.txt"[..], &b"b.txt"[..]]);
     }
 }

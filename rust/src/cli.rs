@@ -15,9 +15,10 @@ struct Cli {
     /// Search pattern
     pattern: Option<String>,
 
-    /// File or directory to search (default: current directory)
+    /// Files or directories to search (default: current directory).
+    /// Each directory uses its own index; results are concatenated.
     #[arg(value_name = "PATH")]
-    path: Option<PathBuf>,
+    paths: Vec<PathBuf>,
 
     /// Output format (default, llm)
     #[arg(long, default_value = "default")]
@@ -201,6 +202,45 @@ fn resolve_dir(path: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+/// Combine per-PATH search results into one list.
+///
+/// With a single PATH, results stay relative to that search root (the
+/// historical behaviour). With several, they are re-rooted at the deepest
+/// common ancestor directory so file names stay unambiguous; duplicates
+/// from overlapping PATHs are dropped.
+fn merge_path_groups(
+    mut groups: Vec<(PathBuf, Vec<crate::SearchResult>)>,
+) -> (PathBuf, Vec<crate::SearchResult>) {
+    if groups.len() == 1 {
+        return groups.pop().expect("one group");
+    }
+    let mut base = groups[0].0.clone();
+    for (dir, _) in &groups[1..] {
+        while !dir.starts_with(&base) {
+            if !base.pop() {
+                break;
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for (dir, results) in groups {
+        let prefix = dir
+            .strip_prefix(&base)
+            .unwrap_or(Path::new(""))
+            .to_path_buf();
+        for mut r in results {
+            if !prefix.as_os_str().is_empty() {
+                r.file = prefix.join(&*r.file).to_string_lossy().into();
+            }
+            if seen.insert((r.file.clone(), r.line_number)) {
+                merged.push(r);
+            }
+        }
+    }
+    (base, merged)
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -301,7 +341,10 @@ fn run() -> Result<()> {
             }
 
             if cli.find {
-                let dir = resolve_dir(cli.path.as_deref())?;
+                if cli.paths.len() > 1 {
+                    anyhow::bail!("--find accepts a single PATH");
+                }
+                let dir = resolve_dir(cli.paths.first().map(PathBuf::as_path))?;
                 let xg = Xgrep::open(&dir)?;
 
                 let mut files = if cli.changed {
@@ -394,46 +437,65 @@ fn run() -> Result<()> {
                 !crate::pattern_has_uppercase(&pattern, cli.regex)
             };
 
-            let resolved = resolve_path(cli.path.as_deref())?;
-            let (dir, results) = match resolved {
-                ResolvedPath::Dir(dir) => {
-                    let xg = Xgrep::open(&dir)?;
-                    let opts = SearchOptions {
-                        case_insensitive,
-                        regex: cli.regex,
-                        file_type: cli.file_type,
-                        max_count: cli.max_count,
-                        changed_only: cli.changed,
-                        since: cli.since,
-                        path_pattern: None,
-                        fresh: cli.fresh,
-                        word: cli.word_regexp,
-                        globs: cli.globs.clone(),
-                    };
-                    let results = xg.search(&pattern, &opts)?;
-                    (dir, results)
-                }
-                ResolvedPath::File { dir, file } => {
-                    let rel_path = file.strip_prefix(&dir).unwrap_or(&file).to_path_buf();
-                    let xg = Xgrep::open(&dir)?;
-                    let opts = SearchOptions {
-                        case_insensitive,
-                        regex: cli.regex,
-                        max_count: cli.max_count,
-                        word: cli.word_regexp,
-                        globs: cli.globs.clone(),
-                        ..Default::default()
-                    };
-                    let results = xg.search_files(&[rel_path], &pattern, &opts)?;
-                    (dir, results)
-                }
+            // One-shot CLI: background index rebuilds may spawn a detached
+            // `xg init` (this executable) instead of a thread that would die
+            // with the process.
+            crate::set_background_rebuild_process(true);
+
+            // --exclude is applied here, after the library search, so the
+            // --max-count limit must be applied after it (not inside search).
+            let lib_max_count = if cli.exclude.is_empty() {
+                cli.max_count
+            } else {
+                None
             };
 
-            // The search stopped at --max-count, so there may be more matches.
-            let hit_max_count = cli.max_count.is_some_and(|m| results.len() >= m);
+            let targets: Vec<Option<&Path>> = if cli.paths.is_empty() {
+                vec![None]
+            } else {
+                cli.paths.iter().map(|p| Some(p.as_path())).collect()
+            };
+            let mut groups: Vec<(PathBuf, Vec<crate::SearchResult>)> = Vec::new();
+            for target in targets {
+                let group = match resolve_path(target)? {
+                    ResolvedPath::Dir(dir) => {
+                        let xg = Xgrep::open(&dir)?;
+                        let opts = SearchOptions {
+                            case_insensitive,
+                            regex: cli.regex,
+                            file_type: cli.file_type.clone(),
+                            max_count: lib_max_count,
+                            changed_only: cli.changed,
+                            since: cli.since.clone(),
+                            path_pattern: None,
+                            fresh: cli.fresh,
+                            word: cli.word_regexp,
+                            globs: cli.globs.clone(),
+                        };
+                        let results = xg.search(&pattern, &opts)?;
+                        (dir, results)
+                    }
+                    ResolvedPath::File { dir, file } => {
+                        let rel_path = file.strip_prefix(&dir).unwrap_or(&file).to_path_buf();
+                        let xg = Xgrep::open(&dir)?;
+                        let opts = SearchOptions {
+                            case_insensitive,
+                            regex: cli.regex,
+                            max_count: lib_max_count,
+                            word: cli.word_regexp,
+                            globs: cli.globs.clone(),
+                            ..Default::default()
+                        };
+                        let results = xg.search_files(&[rel_path], &pattern, &opts)?;
+                        (dir, results)
+                    }
+                };
+                groups.push(group);
+            }
+            let (dir, results) = merge_path_groups(groups);
 
-            // Apply --exclude filter
-            let results = if cli.exclude.is_empty() {
+            // Apply --exclude filter, then --max-count
+            let mut results: Vec<crate::SearchResult> = if cli.exclude.is_empty() {
                 results
             } else {
                 results
@@ -445,6 +507,11 @@ fn run() -> Result<()> {
                     })
                     .collect()
             };
+            // The search stopped at --max-count, so there may be more matches.
+            let hit_max_count = cli.max_count.is_some_and(|m| results.len() >= m);
+            if let Some(max) = cli.max_count {
+                results.truncate(max);
+            }
 
             if results.is_empty() {
                 std::process::exit(1);

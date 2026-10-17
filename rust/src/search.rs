@@ -196,7 +196,7 @@ impl Matcher for RegexMatcher {
 
 /// Path-based filters and a result limit, applied to candidate files before
 /// they are read.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ScanFilter {
     /// Keep only files with one of these extensions (`-t`).
     pub(crate) extensions: Option<Vec<&'static str>>,
@@ -204,6 +204,8 @@ pub(crate) struct ScanFilter {
     pub(crate) path_substring: Option<String>,
     /// Include/exclude globs (`-g`).
     pub(crate) globs: Option<GlobFilter>,
+    /// Skip these exact paths (e.g. files rescanned outside the index).
+    pub(crate) exclude_paths: Option<std::collections::HashSet<String>>,
     /// Stop once this many results are collected. Results are the first
     /// `max_count` in (file, line) order.
     pub(crate) max_count: Option<usize>,
@@ -227,49 +229,19 @@ impl ScanFilter {
                 return false;
             }
         }
+        if let Some(excluded) = &self.exclude_paths {
+            if excluded.contains(path) {
+                return false;
+            }
+        }
         true
     }
 
     fn has_path_filter(&self) -> bool {
-        self.extensions.is_some() || self.path_substring.is_some() || self.globs.is_some()
-    }
-}
-
-thread_local! {
-    static SCOPED_FILTER: RefCell<Option<ScanFilter>> = const { RefCell::new(None) };
-}
-
-/// Run `f` with `filter` applied to every `search*` call it makes on this
-/// thread. Lets callers that cannot pass a filter explicitly still get
-/// filter pushdown.
-pub(crate) fn with_scan_filter<R>(filter: ScanFilter, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<ScanFilter>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let prev = self.0.take();
-            SCOPED_FILTER.with(|c| *c.borrow_mut() = prev);
-        }
-    }
-    let prev = SCOPED_FILTER.with(|c| c.borrow_mut().replace(filter));
-    let _restore = Restore(prev);
-    f()
-}
-
-/// Run `f` with the scoped filter (or the default). The filter is taken out
-/// while `f` runs so that work stolen onto this thread does not see it.
-fn with_active_filter<R>(f: impl FnOnce(&ScanFilter) -> R) -> R {
-    struct PutBack(Option<ScanFilter>);
-    impl Drop for PutBack {
-        fn drop(&mut self) {
-            if let Some(filter) = self.0.take() {
-                SCOPED_FILTER.with(|c| *c.borrow_mut() = Some(filter));
-            }
-        }
-    }
-    let guard = PutBack(SCOPED_FILTER.with(|c| c.borrow_mut().take()));
-    match &guard.0 {
-        Some(filter) => f(filter),
-        None => f(&ScanFilter::default()),
+        self.extensions.is_some()
+            || self.path_substring.is_some()
+            || self.globs.is_some()
+            || self.exclude_paths.is_some()
     }
 }
 
@@ -456,19 +428,6 @@ pub(crate) fn search_files_with_filter(
     Ok(scan_direct(root, files, &*matcher, filter, quiet))
 }
 
-/// Literal search. Honors a filter installed with [`with_scan_filter`].
-pub(crate) fn search(
-    reader: &IndexReader,
-    root: &Path,
-    pattern: &str,
-    case_insensitive: bool,
-    quiet: bool,
-) -> Result<Vec<SearchResult>> {
-    with_active_filter(|f| {
-        search_with_filter(reader, root, pattern, false, case_insensitive, quiet, f)
-    })
-}
-
 fn search_literal_filtered(
     reader: &IndexReader,
     root: &Path,
@@ -536,20 +495,6 @@ fn search_literal_filtered(
     Ok(results)
 }
 
-/// Search specified files directly without using the index.
-/// Honors a filter installed with [`with_scan_filter`].
-pub(crate) fn search_files(
-    root: &Path,
-    files: &[PathBuf],
-    pattern: &str,
-    case_insensitive: bool,
-    quiet: bool,
-) -> Result<Vec<SearchResult>> {
-    with_active_filter(|f| {
-        search_files_with_filter(root, files, pattern, false, case_insensitive, quiet, f)
-    })
-}
-
 /// Compile a search regex. `^`/`$` match at line boundaries (LF or CRLF),
 /// and matching runs on raw bytes so non-UTF-8 files keep exact offsets.
 fn build_regex(pattern: &str, case_insensitive: bool) -> Result<regex::bytes::Regex> {
@@ -559,21 +504,6 @@ fn build_regex(pattern: &str, case_insensitive: bool) -> Result<regex::bytes::Re
         .crlf(true)
         .build()
         .map_err(|e| XgrepError::InvalidPattern(e.to_string()))
-}
-
-/// Regex search: extract literal trigrams from pattern for index lookup,
-/// then verify with full regex on candidate files.
-/// Honors a filter installed with [`with_scan_filter`].
-pub(crate) fn search_regex(
-    reader: &IndexReader,
-    root: &Path,
-    pattern: &str,
-    case_insensitive: bool,
-    quiet: bool,
-) -> Result<Vec<SearchResult>> {
-    with_active_filter(|f| {
-        search_with_filter(reader, root, pattern, true, case_insensitive, quiet, f)
-    })
 }
 
 fn search_regex_filtered(
@@ -595,20 +525,6 @@ fn search_regex_filtered(
         filter,
         quiet,
     ))
-}
-
-/// Also add search_files_regex for --changed/--since with regex.
-/// Honors a filter installed with [`with_scan_filter`].
-pub(crate) fn search_files_regex(
-    root: &Path,
-    files: &[PathBuf],
-    pattern: &str,
-    case_insensitive: bool,
-    quiet: bool,
-) -> Result<Vec<SearchResult>> {
-    with_active_filter(|f| {
-        search_files_with_filter(root, files, pattern, true, case_insensitive, quiet, f)
-    })
 }
 
 /// Extract literal substrings from a regex pattern (simple heuristic)
@@ -1348,30 +1264,62 @@ mod tests {
     }
 
     #[test]
-    fn test_scoped_filter_applies_to_legacy_entry_points() {
+    fn test_exclude_paths_skips_files_before_limit() {
         let (dir, reader) = many_files(10);
         let root = dir.path();
+        let all = search(&reader, root, "needle", false, true).unwrap();
+        let first = all[0].file.to_string();
         let filter = ScanFilter {
-            extensions: Some(vec!["rs"]),
+            exclude_paths: Some(std::iter::once(first.clone()).collect()),
             max_count: Some(3),
             ..Default::default()
         };
-        let results = with_scan_filter(filter, || {
-            let a = search(&reader, root, "needle", false, true).unwrap();
-            let b = search_regex(&reader, root, "needle", false, true).unwrap();
-            let files = vec![PathBuf::from("docs/d000.md"), PathBuf::from("src/f000.rs")];
-            let c = search_files(root, &files, "needle", false, true).unwrap();
-            (a, b, c)
-        });
-        assert_eq!(results.0.len(), 3);
-        assert_eq!(results.1.len(), 3);
-        assert_eq!(results.2.len(), 2);
-        assert!(results.0.iter().all(|r| r.file.ends_with(".rs")));
-        assert!(results.2.iter().all(|r| r.file.ends_with(".rs")));
-        // Scope ended: no filter applies.
-        assert_eq!(
-            search(&reader, root, "needle", false, true).unwrap().len(),
-            40
-        );
+        let got = search_with_filter(&reader, root, "needle", false, false, true, &filter).unwrap();
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|r| *r.file != *first));
+    }
+
+    fn search(
+        reader: &IndexReader,
+        root: &Path,
+        pattern: &str,
+        case_insensitive: bool,
+        quiet: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let f = ScanFilter::default();
+        search_with_filter(reader, root, pattern, false, case_insensitive, quiet, &f)
+    }
+
+    fn search_regex(
+        reader: &IndexReader,
+        root: &Path,
+        pattern: &str,
+        case_insensitive: bool,
+        quiet: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let f = ScanFilter::default();
+        search_with_filter(reader, root, pattern, true, case_insensitive, quiet, &f)
+    }
+
+    fn search_files(
+        root: &Path,
+        files: &[PathBuf],
+        pattern: &str,
+        case_insensitive: bool,
+        quiet: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let f = ScanFilter::default();
+        search_files_with_filter(root, files, pattern, false, case_insensitive, quiet, &f)
+    }
+
+    fn search_files_regex(
+        root: &Path,
+        files: &[PathBuf],
+        pattern: &str,
+        case_insensitive: bool,
+        quiet: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let f = ScanFilter::default();
+        search_files_with_filter(root, files, pattern, true, case_insensitive, quiet, &f)
     }
 }
