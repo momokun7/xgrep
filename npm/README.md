@@ -116,4 +116,5 @@ xg "pattern" --type rs
 
 ## License
 
-MIT
+MIT OR Apache-2.0, at your option. See the
+[repository](https://github.com/momokun7/xgrep#license) for details.
