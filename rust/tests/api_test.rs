@@ -142,6 +142,7 @@ fn test_search_result_debug_clone() {
         file: std::sync::Arc::from("a.rs"),
         line_number: 1,
         line: "hello".to_string(),
+        column: 0,
     };
     let _ = format!("{:?}", r);
     let _cloned = r.clone();

@@ -1,7 +1,10 @@
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
+use std::sync::Mutex;
+
 use crate::mcp_tools;
+use crate::session::Session;
 use crate::Xgrep;
 
 /// JSON-RPC request/notification.
@@ -59,17 +62,84 @@ pub fn tool_result(text: &str, is_error: bool) -> Value {
     })
 }
 
+/// Add `note` to a tool's text: as a `"note"` field when the text is a JSON
+/// object (`index_status`), otherwise as a first line.
+fn with_note(text: String, note: &str) -> String {
+    if text.starts_with('{') {
+        if let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(&text) {
+            m.insert("note".into(), note.into());
+            return Value::Object(m).to_string();
+        }
+    }
+    format!("{}\n{}", note, text)
+}
+
+/// Instructions sent to the client on `initialize`.
+pub const INSTRUCTIONS: &str = "xgrep is an indexed code search engine. Pick the tool by intent: \
+repo_map = ranked overview of the important symbols (start here in an unfamiliar repo); \
+outline = a file's symbols and line ranges without bodies; \
+find_definitions = where a symbol is declared; find_references = call sites with their callers; \
+search = where text occurs (usages, strings; \
+word:true for identifiers; expand:'block' for whole enclosing functions; \
+output_mode:'locations' or 'files' to survey cheaply; queries:[...] \
+for several searches in one call); find_files = files by name/glob; read_file = a line window \
+of one file. Results are ranked (definitions and source first) and paginated: the header gives \
+the exact total and next_offset. Ranges already returned in this session are collapsed to \
+'already shown: path:L10-40' (include_seen:true or session_reset to repeat). Use fresh:true \
+right after editing files; index_status/build_index manage the index.";
+
+/// MCP server state: the search engine plus per-session memory.
+pub struct Server {
+    xg: Xgrep,
+    session: Mutex<Session>,
+}
+
+impl Server {
+    pub fn new(xg: Xgrep) -> Self {
+        Self {
+            xg,
+            session: Mutex::new(Session::new()),
+        }
+    }
+
+    /// Dispatch a message and return the response.
+    pub fn handle(&self, msg: &Message) -> Option<Value> {
+        handle_message_with(&self.xg, &self.session, msg)
+    }
+}
+
+/// True unless file watching is disabled with `XGREP_NO_WATCH=1`.
+fn watch_enabled() -> bool {
+    !std::env::var_os("XGREP_NO_WATCH").is_some_and(|v| v == "1" || v == "true")
+}
+
 /// Start the MCP server (stdio transport).
+///
+/// The server is long-lived, so it watches the root for file changes:
+/// searches then use the tracked change set instead of probing the
+/// filesystem on every call, and the index is rebuilt in the background
+/// after edits settle. If the watcher cannot start, searches probe as
+/// before. The watcher (and its threads) stop when stdin closes.
 pub fn start(xg: Xgrep) {
-    run_server(|msg| handle_message(&xg, msg));
+    if watch_enabled() {
+        // Failure only means falling back to per-search probing.
+        let _ = xg.start_watching();
+    }
+    let server = Server::new(xg);
+    run_server(|msg| server.handle(msg));
+    // Dropping the server stops the watcher and joins its worker thread.
+    drop(server);
+}
+
+/// Dispatch a message with a fresh, throwaway session (used by tests).
+#[cfg(test)]
+pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
+    handle_message_with(xg, &Mutex::new(Session::new()), msg)
 }
 
 /// Dispatch a message and return the response.
-pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
-    let id = match &msg.id {
-        Some(id) => id.clone(),
-        None => return None, // notification
-    };
+pub fn handle_message_with(xg: &Xgrep, session: &Mutex<Session>, msg: &Message) -> Option<Value> {
+    let id = msg.id.clone()?; // no id: notification, no response
 
     match msg.method.as_str() {
         "initialize" => {
@@ -82,7 +152,7 @@ pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
                     "name": "xgrep",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "xgrep is an ultra-fast indexed code search engine. Use 'search' to find patterns, 'find_definitions' to locate symbol definitions, 'read_file' to view full file contents, 'index_status' to check index health, and 'build_index' to rebuild the index."
+                "instructions": INSTRUCTIONS
             });
             Some(success_response(id, result))
         }
@@ -102,20 +172,36 @@ pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
+            // Unknown argument names are ignored (with a note), not errors.
+            let (arguments, note) = mcp_tools::strip_unknown_args(tool_name, &arguments);
+            let mut session = session.lock().unwrap_or_else(|e| e.into_inner());
+            let session = &mut *session;
 
             let (text, is_error) = match tool_name {
-                "search" => mcp_tools::handle_search(xg, &arguments),
-                "find_definitions" => mcp_tools::handle_find_definitions(xg, &arguments),
+                "search" => mcp_tools::handle_search(xg, session, &arguments),
+                "find_definitions" => mcp_tools::handle_find_definitions(xg, session, &arguments),
+                "find_files" => mcp_tools::handle_find_files(xg, &arguments),
                 "build_index" => mcp_tools::handle_build_index(xg),
                 "index_status" => mcp_tools::handle_index_status(xg),
-                "read_file" => mcp_tools::handle_read_file(xg, &arguments),
-                _ => {
-                    return Some(error_response(
-                        id,
-                        -32602,
-                        &format!("Unknown tool: {}", tool_name),
-                    ));
-                }
+                "read_file" => mcp_tools::handle_read_file(xg, session, &arguments),
+                "session_reset" => mcp_tools::handle_session_reset(session),
+                other => match mcp_tools::handle_extra(other, xg, session, &arguments) {
+                    Some(r) => r,
+                    None => {
+                        return Some(error_response(
+                            id,
+                            -32602,
+                            &format!(
+                                "Unknown tool: {}. Available: search, find_definitions, find_references, find_files, outline, repo_map, read_file, index_status, build_index, session_reset",
+                                tool_name
+                            ),
+                        ));
+                    }
+                },
+            };
+            let text = match note {
+                Some(note) => with_note(text, &note),
+                None => text,
             };
 
             Some(success_response(id, tool_result(&text, is_error)))
@@ -347,6 +433,63 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Unknown tool"));
+    }
+
+    fn call(xg: &Xgrep, tool: &str, args: Value) -> (String, bool) {
+        let msg = Message {
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: serde_json::json!({"name": tool, "arguments": args}),
+        };
+        let resp = handle_message(xg, &msg).unwrap();
+        (
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            resp["result"]["isError"].as_bool().unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_unknown_arguments_are_ignored_with_note() {
+        let (_dir, xg) = setup_test_repo();
+        let (text, err) = call(
+            &xg,
+            "search",
+            serde_json::json!({"pattern": "hello", "paht": "x", "zzz": 1}),
+        );
+        assert!(!err, "{text}");
+        let first = text.lines().next().unwrap();
+        assert_eq!(
+            first,
+            "note: ignored unknown argument(s): paht (did you mean path_pattern?), zzz"
+        );
+        assert!(text.contains("Found"), "{text}");
+
+        // Inside queries items too.
+        let (text, err) = call(
+            &xg,
+            "search",
+            serde_json::json!({"queries": [{"pattern": "hello", "max_result": 3}]}),
+        );
+        assert!(!err, "{text}");
+        assert!(
+            text.starts_with(
+                "note: ignored unknown argument(s): queries[0].max_result (did you mean max_results?)\n"
+            ),
+            "{text}"
+        );
+
+        // JSON tools get a "note" field instead of a prefix line.
+        let (text, err) = call(&xg, "index_status", serde_json::json!({"verbose": true}));
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["note"], "note: ignored unknown argument(s): verbose");
+
+        // No note when every argument is known.
+        let (text, _) = call(&xg, "search", serde_json::json!({"pattern": "hello"}));
+        assert!(!text.contains("note: ignored"), "{text}");
     }
 
     #[test]

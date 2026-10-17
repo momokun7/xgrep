@@ -16,6 +16,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -37,7 +38,11 @@ jobs:
         run: cargo build
       - name: Test
         working-directory: rust
-        run: cargo test
+        run: cargo test --no-fail-fast
+      - name: Test without the syntax feature (as shipped in npm/pip)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: rust
+        run: cargo test --no-default-features
       - name: Build release
         working-directory: rust
         run: cargo build --release
@@ -74,7 +79,10 @@ jobs:
           workspaces: rust
       - name: Clippy
         working-directory: rust
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (no default features)
+        working-directory: rust
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Format check
         working-directory: rust
         run: cargo fmt -- --check
@@ -191,6 +199,54 @@ jobs:
       - name: Test
         working-directory: npm
         run: node __test__/index.mjs
+
+  python-bindings:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: python
+      - name: Check
+        working-directory: python
+        run: cargo check
+
+  cross-aarch64:
+    name: Cross build (aarch64-linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: rust
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      # Mirrors the release workflow so C (tree-sitter) cross builds break here, not at release time.
+      - name: Build
+        working-directory: rust
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
 
   release:
     name: Release build

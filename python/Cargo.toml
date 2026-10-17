@@ -17,7 +17,8 @@ default = []
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-xgrep-search = { path = "../rust" }
+# Without the tree-sitter `syntax` feature: keeps cross builds C-compiler free.
+xgrep-search = { path = "../rust", default-features = false }
 pyo3 = "0.22"
 mimalloc = { version = "0.1", default-features = false }
 libc = "0.2"

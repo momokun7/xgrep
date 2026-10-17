@@ -120,6 +120,8 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          # tree-sitter grammars (default `syntax` feature) compile C code.
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
       - name: Package (unix)
         if: matrix.os != 'windows-latest'
         run: |
