@@ -48,6 +48,10 @@ impl Entry {
     }
 }
 
+/// For a cache miss: the content hash and tags of a racily clean entry whose
+/// stat still matches (reused if the content hash is unchanged), else `None`.
+type Recheck = Option<(u64, Arc<FileTags>)>;
+
 fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -142,8 +146,7 @@ impl TagStore {
             })
             .collect();
         let mut out: Vec<Option<Arc<FileTags>>> = vec![None; files.len()];
-        // (index, racy entry with matching stat to verify by content hash)
-        let mut misses: Vec<(usize, Option<(u64, Arc<FileTags>)>)> = Vec::new();
+        let mut misses: Vec<(usize, Recheck)> = Vec::new();
         let mut stats = Stats::default();
         {
             let st = self.lock();
