@@ -16,5 +16,10 @@ dynamic = ["version", "readme"]
 [tool.maturin]
 python-source = "."
 module-name = "xg._xg"
-binaries = ["xg"]
+# The `xg` CLI is shipped through the wheel's `scripts` install scheme, which
+# pip places on PATH (venv `bin/`, or `Scripts\` on Windows). maturin only
+# packages the cdylib of a pyo3 project and ignores bin targets, so the CLI is
+# built from the `rust/` crate and staged as `wheel-data/scripts/xg[.exe]`
+# before `maturin build` (see the build-python job in release.yml).
+data = "wheel-data"
 features = ["extension-module"]
