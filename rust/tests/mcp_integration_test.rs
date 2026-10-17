@@ -130,7 +130,12 @@ fn test_mcp_build_index() {
     let text = responses[1]["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(text.contains("Index built"));
+    // `xg serve` may finish its own startup build first; then the explicit
+    // build finds the index current.
+    assert!(
+        text.contains("Index built") || text.contains("Index is up to date"),
+        "unexpected build_index output: {text}"
+    );
 
     // index_status returns structured JSON
     assert_eq!(responses[2]["id"], 3);
