@@ -1,5 +1,5 @@
-//! CLI regressions: --exclude vs --max-count ordering, -w, and
-//! default-search freshness.
+//! CLI regressions: multiple PATH arguments, --exclude vs --max-count
+//! ordering, and default-search freshness.
 
 use std::path::Path;
 use std::process::Command;
@@ -16,6 +16,48 @@ fn stdout_lines(out: &std::process::Output) -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+#[test]
+fn test_multiple_paths_are_searched_and_prefixed() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b/sub")).unwrap();
+    std::fs::write(root.join("a/x.txt"), "multi_needle in a\n").unwrap();
+    std::fs::write(root.join("b/sub/y.txt"), "multi_needle in b\n").unwrap();
+    std::fs::write(root.join("top.txt"), "multi_needle top\n").unwrap();
+
+    let out = xg_bin(cache.path())
+        .args(["multi_needle", "a", "b/sub/y.txt"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        stdout_lines(&out),
+        vec![
+            "a/x.txt:1:multi_needle in a".to_string(),
+            "b/sub/y.txt:1:multi_needle in b".to_string(),
+        ]
+    );
+
+    // A single PATH keeps paths relative to that PATH (unchanged behaviour).
+    let out = xg_bin(cache.path())
+        .args(["multi_needle", "a"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert_eq!(stdout_lines(&out), vec!["x.txt:1:multi_needle in a"]);
+
+    // Subcommands still parse.
+    let out = xg_bin(cache.path())
+        .args(["status", "a"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
 }
 
 #[test]
