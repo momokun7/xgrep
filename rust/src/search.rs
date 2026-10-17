@@ -437,7 +437,7 @@ impl CompiledQuery {
     }
 
     /// Evaluate the query on one file.
-    fn eval(&self, content: &[u8], file: &str, mode: OutputMode) -> Option<FileMatches> {
+    pub(crate) fn eval(&self, content: &[u8], file: &str, mode: OutputMode) -> Option<FileMatches> {
         with_hay(content, self.needs_lower, |hay| {
             if !self.and.iter().all(|m| is_match(hay, &**m)) {
                 return None;

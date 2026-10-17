@@ -98,6 +98,7 @@ xg "pattern" --log            # Search commit messages
 xg "pattern" --expand block   # Show the enclosing function/class per match
 xg --outline src/lib.rs       # List symbols without bodies
 xg "pattern" dir1 dir2        # Search several paths
+cat app.log | xg "error"      # Search standard input (also: xg "error" -)
 xg "pattern" --exclude vendor  # Exclude paths containing "vendor"
 xg "pattern" --absolute-paths # Show absolute paths
 xg "pattern" --no-hints       # Suppress regex pattern hints
@@ -106,6 +107,8 @@ xg --list-types               # Show supported file types
 xg status                     # Show index status
 xg init                       # Explicitly rebuild index
 ```
+
+Without a PATH, xg searches standard input when it is a pipe or a file with data; otherwise (a terminal, `/dev/null`, `NUL`, or empty input as CI runners often attach) it searches the current directory. `-` always reads standard input. Matches are shown as `<stdin>:LINE:TEXT`.
 
 Search is **smart-case** by default: an all-lowercase pattern matches case-insensitively, while any uppercase letter makes the search case-sensitive. Use `-i` or `-s` to override (priority: `-i` > `-s` > smart-case).
 
