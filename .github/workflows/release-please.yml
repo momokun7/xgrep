@@ -19,11 +19,12 @@ jobs:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
-          # PRs opened with GITHUB_TOKEN do not trigger CI, so required checks
-          # never run on the release PR. RELEASE_PLEASE_TOKEN (a fine-grained
-          # PAT or GitHub App token with contents + pull-requests write on
-          # this repo) fixes that; without it, close and reopen the release PR.
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Release PRs are opened by the maintainer (see CONTRIBUTING.md):
+          # a PR opened with GITHUB_TOKEN never triggers CI, so it could not
+          # pass the required checks. Merging that PR still creates the
+          # GitHub release and starts release.yml here.
+          skip-github-pull-request: true
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
       - name: Trigger release workflow

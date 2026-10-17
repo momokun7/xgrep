@@ -37,6 +37,20 @@ See [REVIEW.md](REVIEW.md) for what reviewers look for and the risk tiers.
 - AI review posts findings only; approval is a human decision.
 - Keep PRs small and revertible. If a review goes three rounds without converging, step back and reconsider the approach.
 
+## Releasing (maintainer)
+
+Releases use [release-please](https://github.com/googleapis/release-please). It does not open release PRs on its own; when you want to release, open one from your machine so CI runs on it:
+
+```bash
+npx release-please release-pr \
+  --repo-url momokun7/xgrep \
+  --token "$(gh auth token)" \
+  --config-file release-please-config.json \
+  --manifest-file .release-please-manifest.json
+```
+
+This computes the next version and CHANGELOG from the conventional commits since the last release. Review the PR, let CI pass, and merge it; the Release Please workflow then tags the release and starts the release build.
+
 ## Code Style
 
 - Follow existing patterns in the codebase
