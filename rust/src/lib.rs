@@ -29,6 +29,7 @@ pub mod cli;
 pub(crate) mod defs;
 pub mod error;
 pub(crate) mod filetype;
+pub(crate) mod fsinfo;
 pub(crate) mod git;
 pub(crate) mod globfilter;
 pub mod hints;
@@ -44,6 +45,7 @@ pub(crate) mod session;
 pub(crate) mod syntax;
 pub(crate) mod trigram;
 pub(crate) mod trigram_query;
+pub(crate) mod watch;
 
 /// Re-exports for fuzz testing. Not part of the public API.
 #[cfg(feature = "fuzz")]
@@ -59,6 +61,7 @@ pub use filetype::extensions_for_type;
 pub use filetype::list_all_types;
 pub use history::{CommitMatch, DiffMatch, DiffSide};
 pub use search::{FileMatches, OutputMode, SearchResult};
+pub use watch::WatchStatus;
 
 /// Returns true if the pattern contains an uppercase letter.
 ///
@@ -348,18 +351,26 @@ impl Freshness {
     }
 }
 
+fn files(n: usize) -> String {
+    if n == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{n} files")
+    }
+}
+
 impl std::fmt::Display for Freshness {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if !self.is_stale() {
-            write!(f, "index fresh")
+            write!(f, "index: fresh")
         } else if self.truncated {
             write!(
                 f,
-                "index stale: {} files changed, not rescanned (rebuild pending)",
-                self.changed_files
+                "index stale: {} changed, not rescanned (rebuild pending)",
+                files(self.changed_files)
             )
         } else {
-            write!(f, "index stale: {} files rescanned", self.rescanned_files)
+            write!(f, "index stale: {} rescanned", files(self.rescanned_files))
         }
     }
 }
@@ -381,6 +392,25 @@ fn overlay_probe_budget() -> std::time::Duration {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(OVERLAY_PROBE_BUDGET_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Default reuse window for a persisted probe result (see
+/// `index::updater::compute_overlay_cached`), set with
+/// `XGREP_PROBE_CACHE_MS`.
+///
+/// Off by default: a cached result hides in-place edits made within the
+/// window (search, edit, search again within a second is exactly what
+/// coding agents do), and nothing cheaper than a stat per file can detect
+/// those. Scripts issuing many searches against a tree they do not modify
+/// can opt in (e.g. `XGREP_PROBE_CACHE_MS=1000`).
+const PROBE_CACHE_TTL_MS: u64 = 0;
+
+fn probe_cache_ttl() -> std::time::Duration {
+    let ms = std::env::var("XGREP_PROBE_CACHE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PROBE_CACHE_TTL_MS);
     std::time::Duration::from_millis(ms)
 }
 
@@ -434,6 +464,20 @@ pub struct Xgrep {
     last_freshness: std::sync::Mutex<Option<Freshness>>,
     /// Set while an in-process background rebuild thread is running.
     rebuild_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes index builds within this process (explicit builds,
+    /// background threads and the watcher), so they wait for each other
+    /// instead of failing on the build lock file.
+    build_mutex: std::sync::Arc<std::sync::Mutex<()>>,
+    /// File watcher, when enabled with [`Xgrep::start_watching`].
+    watcher: std::sync::Mutex<Option<watch::WatchHandle>>,
+    /// Polling mode ([`WatchStatus::Polling`]): `start_watching` on a
+    /// filesystem without reliable change events.
+    polling: std::sync::atomic::AtomicBool,
+    /// Probe result reused for `watch::remote_probe_ttl()` in polling mode.
+    remote_probe: std::sync::Mutex<Option<(std::time::Instant, index::updater::Overlay)>>,
+    /// Where the last search's overlay came from ("probe", "probe-cache",
+    /// "watcher", or "none"); for diagnostics and tests.
+    last_overlay_source: std::sync::Mutex<&'static str>,
 }
 
 impl Xgrep {
@@ -458,6 +502,11 @@ impl Xgrep {
             config: Config::default(),
             last_freshness: std::sync::Mutex::new(None),
             rebuild_running: Default::default(),
+            build_mutex: Default::default(),
+            watcher: std::sync::Mutex::new(None),
+            polling: Default::default(),
+            remote_probe: std::sync::Mutex::new(None),
+            last_overlay_source: std::sync::Mutex::new("none"),
         }
     }
 
@@ -502,7 +551,13 @@ impl Xgrep {
             }
         }
 
-        rebuild_index_files(&self.root, &self.index_path)
+        let _serial = self.build_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let started = std::time::Instant::now();
+        let rebuilt = rebuild_index_files(&self.root, &self.index_path)?;
+        if let Some(w) = self.watcher_guard().as_ref() {
+            w.mark_rebuilt(started);
+        }
+        Ok(rebuilt)
     }
 
     /// Apply word-boundary wrapping. Returns the effective pattern and
@@ -652,8 +707,10 @@ impl Xgrep {
     /// Index-based search with a freshness overlay.
     ///
     /// Before using the index, a cheap probe finds files that changed since
-    /// the index was built (`git status` in a git work tree, mtime/size
-    /// comparison otherwise). Index results for those files are dropped and
+    /// the index was built (stat of every indexed file and directory,
+    /// compared with the index entries), or, while a file watcher is active
+    /// ([`Xgrep::start_watching`]), the watcher's tracked change set is used
+    /// instead. Index results for those files are dropped and
     /// the files are scanned directly, so new and edited code is found even
     /// before the index is rebuilt. The rebuild itself happens in the
     /// background.
@@ -685,30 +742,62 @@ impl Xgrep {
             return self.search_reader(&reader, q, filter, &[], mode, sink);
         }
 
-        let reader = index::reader::IndexReader::open(&self.index_path)?;
         let perf = std::env::var_os("XGREP_PERF_TIMING").is_some();
         let t0 = perf.then(std::time::Instant::now);
+        // The watcher's change set must be read before the index is opened
+        // (see `watch::Snapshot`).
+        let watched = if opts.fresh || overlay_disabled() {
+            None
+        } else {
+            self.watcher_guard().as_ref().map(|w| w.snapshot())
+        };
+        let reader = index::reader::IndexReader::open(&self.index_path)?;
+        let mut source = "probe";
         let overlay = if opts.fresh {
             index::updater::compute_overlay(&self.root, &self.index_path, &reader, None)
-        } else if overlay_disabled() || self.probe_backoff_active() {
+        } else if overlay_disabled() {
+            None
+        } else if let Some(snap) = watched.filter(|s| s.usable) {
+            // Watching: the tracked change set replaces the probe.
+            source = "watcher";
+            Some(index::updater::overlay_from_paths(
+                &self.root,
+                &self.index_path,
+                &reader,
+                snap.paths,
+            ))
+        } else if self.polling.load(std::sync::atomic::Ordering::Relaxed) {
+            source = "probe-polling";
+            self.cached_remote_probe(&reader)
+        } else if self.probe_backoff_active() {
             None
         } else {
             let deadline = std::time::Instant::now() + overlay_probe_budget();
-            let ov = index::updater::compute_overlay(
+            let ov = index::updater::compute_overlay_cached(
                 &self.root,
                 &self.index_path,
                 &reader,
                 Some(deadline),
+                probe_cache_ttl(),
             );
             self.record_probe_outcome(ov.is_some());
-            ov
+            ov.map(|(ov, cached)| {
+                if cached {
+                    source = "probe-cache";
+                }
+                ov
+            })
         };
+        if let Ok(mut g) = self.last_overlay_source.lock() {
+            *g = if overlay.is_some() { source } else { "none" };
+        }
         if let (Some(t), Some(ov)) = (t0, overlay.as_ref()) {
             eprintln!(
-                "[perf] overlay_probe: {:.1}ms  changed={}{}",
+                "[perf] overlay_probe: {:.2}ms  changed={}{}  source={}",
                 t.elapsed().as_secs_f64() * 1000.0,
                 ov.changed.len(),
-                if ov.truncated { "+" } else { "" }
+                if ov.truncated { "+" } else { "" },
+                source
             );
         }
         let Some(overlay) = overlay else {
@@ -859,6 +948,146 @@ impl Xgrep {
         }
     }
 
+    /// Probe result in polling mode, reused for `watch::remote_probe_ttl()`.
+    /// Honors the slow-probe backoff.
+    fn cached_remote_probe(
+        &self,
+        reader: &index::reader::IndexReader,
+    ) -> Option<index::updater::Overlay> {
+        let mut cache = self.remote_probe.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, ov)) = cache.as_ref() {
+            if at.elapsed() < watch::remote_probe_ttl() {
+                return Some(ov.clone());
+            }
+        }
+        if self.probe_backoff_active() {
+            return None;
+        }
+        let deadline = std::time::Instant::now() + overlay_probe_budget();
+        let ov =
+            index::updater::compute_overlay(&self.root, &self.index_path, reader, Some(deadline));
+        self.record_probe_outcome(ov.is_some());
+        if let Some(ov) = &ov {
+            *cache = Some((std::time::Instant::now(), ov.clone()));
+        }
+        ov
+    }
+
+    fn watcher_guard(&self) -> std::sync::MutexGuard<'_, Option<watch::WatchHandle>> {
+        self.watcher.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Watch the root for file changes, for long-lived processes (the MCP
+    /// server enables this; the CLI does not).
+    ///
+    /// While watching, index searches need no freshness probe: changed,
+    /// created and deleted files are tracked in memory (respecting ignore
+    /// files), read directly by searches, and folded into the index by a
+    /// background rebuild once changes have been quiet for ~2 s. Until the
+    /// watcher is in sync, after lost events (queue overflow), or if it fails
+    /// to start, searches fall back to the probe.
+    ///
+    /// Filesystems without reliable change events (WSL `/mnt/<drive>`,
+    /// NFS/SMB/FUSE mounts) are not watched; instead the probe result is
+    /// reused for ~2 s ([`WatchStatus::Polling`], `XGREP_REMOTE_PROBE_CACHE_MS`),
+    /// so edits there may take that long to show up.
+    ///
+    /// Idempotent. Setup runs on a background thread; see
+    /// [`watch_status`](Self::watch_status). Stopped by
+    /// [`stop_watching`](Self::stop_watching) or when `self` is dropped.
+    pub fn start_watching(&self) -> Result<()> {
+        self.start_watching_with(watch::WatchConfig::default())
+    }
+
+    pub(crate) fn start_watching_with(&self, cfg: watch::WatchConfig) -> Result<()> {
+        let mut guard = self.watcher_guard();
+        if guard.is_some() || self.polling.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        if fsinfo::is_remote_fs(&self.root) {
+            self.polling
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        let root = self.root.clone();
+        let index_path = self.index_path.clone();
+        let build_mutex = std::sync::Arc::clone(&self.build_mutex);
+        let rebuild: watch::RebuildFn = Box::new(move || {
+            let _serial = build_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(parent) = index_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            rebuild_index_files(&root, &index_path)
+        });
+        *guard = Some(watch::WatchHandle::start(
+            &self.root,
+            &self.index_path,
+            rebuild,
+            cfg,
+        )?);
+        Ok(())
+    }
+
+    /// Stop the file watcher (no-op if not watching). Waits for an index
+    /// rebuild the watcher is running to finish.
+    pub fn stop_watching(&self) {
+        self.polling
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let handle = self.watcher_guard().take();
+        drop(handle);
+    }
+
+    /// Current state of the file watcher.
+    pub fn watch_status(&self) -> WatchStatus {
+        if self.polling.load(std::sync::atomic::Ordering::Relaxed) {
+            return WatchStatus::Polling;
+        }
+        self.watcher_guard()
+            .as_ref()
+            .map_or(WatchStatus::Off, |w| w.status())
+    }
+
+    /// Block until the watcher is in sync (searches then skip the probe), up
+    /// to `timeout`. Returns `false` on timeout, or if not watching or the
+    /// watcher failed.
+    pub fn wait_for_watcher(&self, timeout: std::time::Duration) -> bool {
+        // Wait in short steps so the watcher mutex is not held for long
+        // (searches need it).
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let step = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(std::time::Duration::from_millis(100));
+            let synced = match self.watcher_guard().as_ref() {
+                None => return false,
+                Some(w) => w.wait_synced(step),
+            };
+            if synced {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline
+                || matches!(self.watch_status(), WatchStatus::Failed(_))
+            {
+                return false;
+            }
+        }
+    }
+
+    /// One-line freshness note for tool output (e.g. MCP responses), such as
+    /// `index: fresh; watching: yes` or
+    /// `index stale: 3 files rescanned; watching: no`.
+    ///
+    /// The first part describes the most recent [`search`](Self::search)
+    /// (see [`last_search_freshness`](Self::last_search_freshness)); the
+    /// second the file watcher ([`watch_status`](Self::watch_status)).
+    pub fn freshness_note(&self) -> String {
+        let index = match self.last_search_freshness() {
+            Some(f) => f.to_string(),
+            None => "index: freshness not checked".to_string(),
+        };
+        format!("{index}; {}", self.watch_status())
+    }
+
     fn set_last_freshness(&self, value: Option<Freshness>) {
         if let Ok(mut guard) = self.last_freshness.lock() {
             *guard = value;
@@ -901,6 +1130,13 @@ impl Xgrep {
     fn spawn_background_rebuild(&self) {
         use std::sync::atomic::Ordering;
 
+        // With a watcher, its worker owns rebuild scheduling.
+        if let Some(w) = self.watcher_guard().as_ref() {
+            if w.is_running() {
+                w.request_rebuild();
+                return;
+            }
+        }
         if self.index_path.with_extension("lock").exists()
             || self.rebuild_running.load(Ordering::Acquire)
         {
@@ -971,9 +1207,11 @@ impl Xgrep {
         let root = self.root.clone();
         let index_path = self.index_path.clone();
         let running = std::sync::Arc::clone(&self.rebuild_running);
+        let build_mutex = std::sync::Arc::clone(&self.build_mutex);
         let spawned = std::thread::Builder::new()
             .name("xgrep-rebuild".into())
             .spawn(move || {
+                let _serial = build_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = rebuild_index_files(&root, &index_path);
                 running.store(false, Ordering::Release);
             });

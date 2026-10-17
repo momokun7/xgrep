@@ -902,6 +902,10 @@ fn render_search(
     for n in &prep.filters.notes {
         head.push_str(&format!("note: {}\n", n));
     }
+    // Only mention freshness when it changed the results; "fresh" is noise.
+    if let Some(f) = xg.last_search_freshness().filter(|f| f.is_stale()) {
+        head.push_str(&format!("note: {}\n", f));
+    }
     if results.is_empty() {
         head.push_str(&format!(
             "No matches for `{}` ({}{}).\n",
