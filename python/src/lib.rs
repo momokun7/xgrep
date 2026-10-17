@@ -60,8 +60,8 @@ pub struct Xgrep {
 impl Xgrep {
     #[staticmethod]
     pub fn open(root: &str) -> PyResult<Xgrep> {
-        let inner = xgrep_search::Xgrep::open(root)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let inner =
+            xgrep_search::Xgrep::open(root).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Xgrep { inner })
     }
 
@@ -129,10 +129,7 @@ impl Xgrep {
             .into_iter()
             .map(|r| {
                 let line_number = u32::try_from(r.line_number).map_err(|_| {
-                    PyRuntimeError::new_err(format!(
-                        "line_number {} overflows u32",
-                        r.line_number
-                    ))
+                    PyRuntimeError::new_err(format!("line_number {} overflows u32", r.line_number))
                 })?;
                 Ok(SearchResult {
                     file: r.file.to_string(),
@@ -151,9 +148,10 @@ impl Xgrep {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let (state, changed_files) = match info.state {
             xgrep_search::IndexState::Fresh => ("fresh".to_string(), None),
-            xgrep_search::IndexState::Stale { changed_files } => {
-                ("stale".to_string(), Some(u32::try_from(changed_files).unwrap_or(u32::MAX)))
-            }
+            xgrep_search::IndexState::Stale { changed_files } => (
+                "stale".to_string(),
+                Some(u32::try_from(changed_files).unwrap_or(u32::MAX)),
+            ),
             xgrep_search::IndexState::Missing => ("missing".to_string(), None),
         };
         Ok(IndexStatus {
