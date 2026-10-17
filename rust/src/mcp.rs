@@ -1,7 +1,10 @@
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
+use std::sync::Mutex;
+
 use crate::mcp_tools;
+use crate::session::Session;
 use crate::Xgrep;
 
 /// JSON-RPC request/notification.
@@ -59,17 +62,51 @@ pub fn tool_result(text: &str, is_error: bool) -> Value {
     })
 }
 
+/// Instructions sent to the client on `initialize`.
+pub const INSTRUCTIONS: &str = "xgrep is an indexed code search engine. Pick the tool by intent: \
+find_definitions = where a symbol is declared; search = where text occurs (usages, strings; \
+word:true for identifiers; output_mode:'locations' or 'files' to survey cheaply; queries:[...] \
+for several searches in one call); find_files = files by name/glob; read_file = a line window \
+of one file. Results are ranked (definitions and source first) and paginated: the header gives \
+the exact total and next_offset. Ranges already returned in this session are collapsed to \
+'already shown: path:L10-40' (include_seen:true or session_reset to repeat). Use fresh:true \
+right after editing files; index_status/build_index manage the index.";
+
+/// MCP server state: the search engine plus per-session memory.
+pub struct Server {
+    xg: Xgrep,
+    session: Mutex<Session>,
+}
+
+impl Server {
+    pub fn new(xg: Xgrep) -> Self {
+        Self {
+            xg,
+            session: Mutex::new(Session::new()),
+        }
+    }
+
+    /// Dispatch a message and return the response.
+    pub fn handle(&self, msg: &Message) -> Option<Value> {
+        handle_message_with(&self.xg, &self.session, msg)
+    }
+}
+
 /// Start the MCP server (stdio transport).
 pub fn start(xg: Xgrep) {
-    run_server(|msg| handle_message(&xg, msg));
+    let server = Server::new(xg);
+    run_server(|msg| server.handle(msg));
+}
+
+/// Dispatch a message with a fresh, throwaway session (used by tests).
+#[cfg(test)]
+pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
+    handle_message_with(xg, &Mutex::new(Session::new()), msg)
 }
 
 /// Dispatch a message and return the response.
-pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
-    let id = match &msg.id {
-        Some(id) => id.clone(),
-        None => return None, // notification
-    };
+pub fn handle_message_with(xg: &Xgrep, session: &Mutex<Session>, msg: &Message) -> Option<Value> {
+    let id = msg.id.clone()?; // no id: notification, no response
 
     match msg.method.as_str() {
         "initialize" => {
@@ -82,7 +119,7 @@ pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
                     "name": "xgrep",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "xgrep is an ultra-fast indexed code search engine. Use 'search' to find patterns, 'find_definitions' to locate symbol definitions, 'read_file' to view full file contents, 'index_status' to check index health, and 'build_index' to rebuild the index."
+                "instructions": INSTRUCTIONS
             });
             Some(success_response(id, result))
         }
@@ -102,18 +139,25 @@ pub fn handle_message(xg: &Xgrep, msg: &Message) -> Option<Value> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
+            let mut session = session.lock().unwrap_or_else(|e| e.into_inner());
+            let session = &mut *session;
 
             let (text, is_error) = match tool_name {
-                "search" => mcp_tools::handle_search(xg, &arguments),
-                "find_definitions" => mcp_tools::handle_find_definitions(xg, &arguments),
+                "search" => mcp_tools::handle_search(xg, session, &arguments),
+                "find_definitions" => mcp_tools::handle_find_definitions(xg, session, &arguments),
+                "find_files" => mcp_tools::handle_find_files(xg, &arguments),
                 "build_index" => mcp_tools::handle_build_index(xg),
                 "index_status" => mcp_tools::handle_index_status(xg),
-                "read_file" => mcp_tools::handle_read_file(xg, &arguments),
+                "read_file" => mcp_tools::handle_read_file(xg, session, &arguments),
+                "session_reset" => mcp_tools::handle_session_reset(session),
                 _ => {
                     return Some(error_response(
                         id,
                         -32602,
-                        &format!("Unknown tool: {}", tool_name),
+                        &format!(
+                            "Unknown tool: {}. Available: search, find_definitions, find_files, read_file, index_status, build_index, session_reset",
+                            tool_name
+                        ),
                     ));
                 }
             };
