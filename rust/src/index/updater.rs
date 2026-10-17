@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::error::Result;
 use crate::git::{bytes_to_path, find_toplevel_fs, git_cmd, split_nul};
@@ -21,11 +21,6 @@ pub enum IndexStatus {
     NeedsFullBuild,
 }
 
-/// Maximum number of build-time dirty paths remembered in the meta file.
-/// Beyond this the meta records an overflow marker and the overlay falls
-/// back to the (more expensive) full stat scan.
-const META_DIRTY_LIMIT: usize = 2000;
-
 /// Metadata stored alongside the index.
 ///
 /// File format (line oriented, backwards compatible with the old single-line
@@ -34,15 +29,15 @@ const META_DIRTY_LIMIT: usize = 2000;
 /// ```text
 /// <commit hash or empty>
 /// verified-ns <start> <end>     # build window (unix nanos); index reflects the tree as of <start>
-/// dirty <root-relative path>    # files that differed from HEAD at build time (repeatable)
-/// dirty-overflow                # too many dirty paths to record
 /// ```
+///
+/// Older versions also wrote `dirty <path>` / `dirty-overflow` lines (git
+/// status at build time); they are ignored now that the freshness probe
+/// compares file timestamps directly.
 #[derive(Debug, Default)]
 struct IndexMeta {
     commit_hash: Option<String>,
     verified_at: Option<Window>,
-    dirty: Vec<PathBuf>,
-    dirty_overflow: bool,
 }
 
 impl IndexMeta {
@@ -65,10 +60,6 @@ impl IndexMeta {
                 if let (Some(Some(start)), end) = (it.next(), it.next()) {
                     meta.verified_at = Some((start, end.flatten().unwrap_or(start)));
                 }
-            } else if let Some(p) = line.strip_prefix("dirty ") {
-                meta.dirty.push(PathBuf::from(p));
-            } else if line == "dirty-overflow" {
-                meta.dirty_overflow = true;
             }
         }
         Some(meta)
@@ -78,28 +69,12 @@ impl IndexMeta {
         index_path: &Path,
         commit_hash: Option<&str>,
         verified_at: Option<Window>,
-        dirty: Option<&[PathBuf]>,
     ) -> Result<()> {
         use std::fmt::Write as _;
         let meta_path = Self::path_for(index_path);
         let mut content = commit_hash.unwrap_or("").to_string();
         if let Some((start, end)) = verified_at {
             let _ = write!(content, "\nverified-ns {start} {end}");
-        }
-        match dirty {
-            Some(d) if d.len() > META_DIRTY_LIMIT => content.push_str("\ndirty-overflow"),
-            Some(d) => {
-                for p in d {
-                    let s = p.to_string_lossy();
-                    if s.contains('\n') {
-                        // Cannot be represented line-wise; force the slow path.
-                        content.push_str("\ndirty-overflow");
-                        break;
-                    }
-                    let _ = write!(content, "\ndirty {s}");
-                }
-            }
-            None => {}
         }
         // Write atomically so concurrent readers never see a truncated file.
         let tmp = meta_path.with_extension("meta.tmp");
@@ -120,44 +95,6 @@ fn unix_nanos(t: std::time::SystemTime) -> u128 {
 }
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
-
-/// True if `t` is at or after `start`.
-///
-/// Timestamps without a sub-second part are assumed to come from a
-/// filesystem with coarse (1-2 s) resolution and are compared at second
-/// granularity, conservatively.
-fn at_or_after(t: std::time::SystemTime, start: u128) -> bool {
-    let ns = unix_nanos(t);
-    if ns % NANOS_PER_SEC == 0 {
-        ns / NANOS_PER_SEC >= start / NANOS_PER_SEC
-    } else {
-        ns >= start
-    }
-}
-
-/// True if a file with mtime `t` may have been modified after the builder
-/// read it while still matching the stored (whole-second) mtime.
-///
-/// The builder read the file at some instant in `[start, end]` and stores
-/// whole seconds, so an edit is invisible to the mtime comparison only if
-/// it happened at or after `start` and within a second no later than the
-/// second containing `end`.
-fn within_window(t: std::time::SystemTime, window: Window) -> bool {
-    at_or_after(t, window.0) && unix_nanos(t) / NANOS_PER_SEC <= window.1 / NANOS_PER_SEC
-}
-
-/// Compare a stored index mtime with the current file mtime.
-///
-/// The builder currently stores whole seconds; millisecond and nanosecond
-/// encodings are accepted too so this keeps working if the on-disk unit is
-/// made finer-grained.
-fn mtime_matches(stored: u64, actual: std::time::SystemTime) -> bool {
-    let d = match actual.duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d,
-        Err(_) => return stored == 0,
-    };
-    stored == d.as_secs() || stored as u128 == d.as_millis() || stored as u128 == d.as_nanos()
-}
 
 /// Get the current git HEAD commit hash.
 fn current_commit_hash(root: &Path) -> Option<String> {
@@ -213,16 +150,15 @@ fn newest_file_mtime(root: &Path, index_path: &Path) -> Option<u64> {
     }
 }
 
-/// Paths reported by `git status --porcelain=v2 -z`, plus the HEAD commit.
+/// Paths reported by `git status --porcelain=v2 -z`.
 ///
 /// Paths are raw bytes relative to the repository top level.
 #[derive(Debug, Default)]
 struct GitStatusSnapshot {
-    head: Option<String>,
     paths: Vec<Vec<u8>>,
 }
 
-/// Parse `git status --porcelain=v2 -z [--branch]` output.
+/// Parse `git status --porcelain=v2 -z` output (`#` header lines are skipped).
 ///
 /// `-z` output is never quoted or escaped, so non-ASCII and otherwise odd
 /// file names (`日本.txt`, names with spaces or quotes) come through intact.
@@ -244,14 +180,7 @@ fn parse_status_v2(out: &[u8]) -> GitStatusSnapshot {
     while let Some(tok) = toks.next() {
         let Some(&kind) = tok.first() else { continue };
         let path = match kind {
-            b'#' => {
-                if let Some(oid) = tok.strip_prefix(b"# branch.oid ") {
-                    if oid != b"(initial)" {
-                        snap.head = Some(String::from_utf8_lossy(oid).into_owned());
-                    }
-                }
-                None
-            }
+            b'#' => None,
             // 1 XY sub mH mI mW hH hI <path>
             b'1' => after_fields(tok, 8),
             // 2 XY sub mH mI mW hH hI Xscore <path>\0<origPath>
@@ -293,8 +222,6 @@ fn git_status(
             "status",
             "--porcelain=v2",
             "-z",
-            "--branch",
-            "--no-ahead-behind",
             "--untracked-files=all",
             "--",
             ".",
@@ -463,31 +390,16 @@ fn diff_tree_paths(
 ///
 /// `build_started` is the time the build began walking the tree; together
 /// with the current time it bounds the window in which a file could have
-/// changed without its mtime differing from the indexed one. Also records
-/// which files differed from HEAD at build time, so that a later revert of
-/// such a file (which removes it from `git status`) is still detected.
+/// changed without its mtime differing from the indexed one.
 pub fn save_meta(
     root: &Path,
     index_path: &Path,
     build_started: Option<std::time::SystemTime>,
 ) -> Result<()> {
     let verified = build_started.map(|s| (unix_nanos(s), unix_nanos(std::time::SystemTime::now())));
-    let snapshot =
-        git_prefix(root).and_then(|pfx| git_status(root, None).ok().flatten().map(|s| (pfx, s)));
-    match snapshot {
-        Some((prefix, snap)) => {
-            let dirty: Vec<PathBuf> = snap
-                .paths
-                .iter()
-                .filter_map(|p| convert_git_bytes(&prefix, p))
-                .collect();
-            IndexMeta::save(index_path, snap.head.as_deref(), verified, Some(&dirty))
-        }
-        None => {
-            let hash = current_commit_hash(root);
-            IndexMeta::save(index_path, hash.as_deref(), verified, None)
-        }
-    }
+    // Only spawn git inside a work tree (cheap filesystem check first).
+    let hash = find_toplevel_fs(root).and_then(|_| current_commit_hash(root));
+    IndexMeta::save(index_path, hash.as_deref(), verified)
 }
 
 /// Check index freshness and return changed file list (does not rebuild).
@@ -513,20 +425,20 @@ pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus>
 // Freshness overlay
 // ---------------------------------------------------------------------------
 
-/// Upper bound on files collected while walking newly created directories
-/// in a non-git tree. Beyond this the overlay reports `truncated`.
+/// Upper bound on files collected while walking newly created directories.
+/// Beyond this the overlay reports `truncated`.
 const NEW_FILE_WALK_LIMIT: usize = 10_000;
 
 /// Result of the cheap freshness probe run before index searches.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Overlay {
     /// Root-relative paths whose index entries are stale: modified, deleted,
     /// or new files the index does not know about. Sorted and deduplicated.
     pub changed: Vec<PathBuf>,
     /// True when detection stopped early; `changed` is then a lower bound.
     pub truncated: bool,
-    /// True when the index metadata is incomplete (old format, or not tied
-    /// to a commit), so a background rebuild is worthwhile even if nothing
+    /// True when the index metadata is incomplete (old format without a
+    /// build window), so a background rebuild is worthwhile even if nothing
     /// changed.
     pub meta_outdated: bool,
 }
@@ -544,24 +456,34 @@ fn verified_window(meta: &IndexMeta, index_path: &Path) -> Window {
 
 /// Determine which files differ from the index, without reading contents.
 ///
-/// - git work tree: candidates come from `git status` (modified, staged,
-///   untracked), `git diff-tree <indexed commit> HEAD`, and files that were
-///   dirty when the index was built. Each candidate is then compared with
-///   its index entry (mtime/size) so that untracked-but-already-indexed
-///   files are not rescanned on every search.
-/// - otherwise: every indexed file is stat'ed (in parallel) and compared
-///   with its entry; directories modified since the build are re-listed to
-///   find new files.
+/// Every indexed file is stat'ed and compared with its index entry (size,
+/// mtime, and on unix also ctime against the build window, which catches
+/// a file replaced by `mv` that kept an old mtime). Every directory that
+/// contains indexed files is stat'ed too, and directories modified since the
+/// build are re-listed with the builder's ignore rules to find new files.
 ///
-/// Returns `None` if the probe did not finish before `deadline` (any git
-/// child is killed); with `deadline: None` it always completes.
+/// The same probe is used inside git work trees: it needs no child process
+/// (a `git status` spawn alone costs more than the whole scan on a typical
+/// repository, and 300+ ms on WSL `/mnt/c`), it sees exactly the files the
+/// builder indexes, and it handles commits, checkouts and reverts through
+/// the files' own timestamps.
+///
+/// Stats run on a few scoped threads, relative to an open handle on the
+/// root, so a 9k-file tree is checked in about a millisecond.
+///
+/// Returns `None` if the probe did not finish before `deadline`; with
+/// `deadline: None` it always completes.
 pub(crate) fn compute_overlay(
     root: &Path,
     index_path: &Path,
     reader: &IndexReader,
     deadline: Option<Instant>,
 ) -> Option<Overlay> {
-    let mut ov = compute_overlay_inner(root, index_path, reader, deadline).ok()?;
+    let meta = IndexMeta::load(index_path);
+    let meta_outdated = meta.as_ref().is_none_or(|m| m.verified_at.is_none());
+    let window = verified_window(&meta.unwrap_or_default(), index_path);
+    let mut ov = stat_scan(root, reader, window, deadline).ok()?;
+    ov.meta_outdated = meta_outdated;
     // The index and its sidecars (meta, cache, stamps) may live inside the
     // root (e.g. tests, custom layouts); they are never source files.
     ov.changed
@@ -569,9 +491,134 @@ pub(crate) fn compute_overlay(
     Some(ov)
 }
 
+// --- persisted probe result ------------------------------------------------
+
+/// First line of a `<index>.probe` file.
+const PROBE_CACHE_MAGIC: &str = "xgrep-probe 1";
+
+fn probe_cache_path(index_path: &Path) -> PathBuf {
+    index_path.with_extension("probe")
+}
+
+/// Identity of the index build a probe compared against: mtime (ns) and
+/// size of the index file, and mtime of its meta file (rewritten after
+/// every build, including no-op ones).
+fn index_identity(index_path: &Path) -> Option<(u128, u64, u128)> {
+    let idx = fs::metadata(index_path).ok()?;
+    let meta = fs::metadata(IndexMeta::path_for(index_path)).ok();
+    Some((
+        idx.modified().map(unix_nanos).unwrap_or(0),
+        idx.len(),
+        meta.and_then(|m| m.modified().ok())
+            .map(unix_nanos)
+            .unwrap_or(0),
+    ))
+}
+
+fn load_probe_cache(
+    index_path: &Path,
+    identity: (u128, u64, u128),
+    ttl: std::time::Duration,
+) -> Option<Overlay> {
+    let content = fs::read_to_string(probe_cache_path(index_path)).ok()?;
+    let mut lines = content.lines();
+    if lines.next()? != PROBE_CACHE_MAGIC {
+        return None;
+    }
+    let f: Vec<u128> = lines
+        .next()?
+        .split_whitespace()
+        .map(|v| v.parse().ok())
+        .collect::<Option<_>>()?;
+    let [start, idx_mtime, idx_size, meta_mtime, truncated, meta_outdated] = f[..] else {
+        return None;
+    };
+    if (idx_mtime, idx_size as u64, meta_mtime) != identity {
+        return None;
+    }
+    let now = unix_nanos(std::time::SystemTime::now());
+    // `now < start`: the clock went backwards; do not trust the entry.
+    if now < start || now - start >= ttl.as_nanos() {
+        return None;
+    }
+    Some(Overlay {
+        changed: lines.map(PathBuf::from).collect(),
+        truncated: truncated != 0,
+        meta_outdated: meta_outdated != 0,
+    })
+}
+
+fn save_probe_cache(index_path: &Path, identity: (u128, u64, u128), start: u128, ov: &Overlay) {
+    use std::fmt::Write as _;
+    let path = probe_cache_path(index_path);
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "{PROBE_CACHE_MAGIC}\n{start} {} {} {} {} {}\n",
+        identity.0,
+        identity.1,
+        identity.2,
+        u8::from(ov.truncated),
+        u8::from(ov.meta_outdated)
+    );
+    for p in &ov.changed {
+        match p.to_str() {
+            Some(s) if !s.contains('\n') => {
+                out.push_str(s);
+                out.push('\n');
+            }
+            // Not representable: do not cache this result.
+            _ => {
+                let _ = fs::remove_file(&path);
+                return;
+            }
+        }
+    }
+    let tmp = index_path.with_extension(format!("probe.tmp{}", std::process::id()));
+    if fs::write(&tmp, out).is_ok() && fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// [`compute_overlay`] with a persisted result reused for `ttl`.
+///
+/// The probe stats every indexed file, which costs ~1 us per file (more on
+/// slow filesystems); back-to-back searches (scripts, an agent issuing
+/// several searches in one turn) reuse the previous result instead. The
+/// entry is valid only while the index and its meta file are unchanged (any
+/// rebuild invalidates it) and for at most `ttl` after the probe *started*,
+/// so an edit is picked up by the first search at least `ttl` after it.
+/// `ttl` of zero disables the cache.
+///
+/// Returns the overlay and whether it came from the cache.
+pub(crate) fn compute_overlay_cached(
+    root: &Path,
+    index_path: &Path,
+    reader: &IndexReader,
+    deadline: Option<Instant>,
+    ttl: std::time::Duration,
+) -> Option<(Overlay, bool)> {
+    let identity = if ttl.is_zero() {
+        None
+    } else {
+        index_identity(index_path)
+    };
+    if let Some(id) = identity {
+        if let Some(ov) = load_probe_cache(index_path, id, ttl) {
+            return Some((ov, true));
+        }
+    }
+    let start = unix_nanos(std::time::SystemTime::now());
+    let ov = compute_overlay(root, index_path, reader, deadline)?;
+    if let Some(id) = identity {
+        save_probe_cache(index_path, id, start, &ov);
+    }
+    Some((ov, false))
+}
+
 /// True if `root/rel` is the index file or one of its sidecars
 /// (`<stem>.meta`, `<stem>.cache`, `<stem>.rebuild`, ...).
-fn is_index_sidecar(root: &Path, index_path: &Path, rel: &Path) -> bool {
+pub(crate) fn is_index_sidecar(root: &Path, index_path: &Path, rel: &Path) -> bool {
     let full = root.join(rel);
     if full.parent() != index_path.parent() {
         return false;
@@ -586,73 +633,6 @@ fn is_index_sidecar(root: &Path, index_path: &Path, rel: &Path) -> bool {
             .is_some_and(|r| r.starts_with('.'))
 }
 
-fn compute_overlay_inner(
-    root: &Path,
-    index_path: &Path,
-    reader: &IndexReader,
-    deadline: Option<Instant>,
-) -> std::result::Result<Overlay, TimedOut> {
-    let meta = IndexMeta::load(index_path);
-    let meta_outdated = meta
-        .as_ref()
-        .is_none_or(|m| m.verified_at.is_none() || m.dirty_overflow);
-    let meta = meta.unwrap_or_default();
-    let window = verified_window(&meta, index_path);
-
-    if let Some(prefix) = git_prefix(root) {
-        if let Some(snap) = git_status(root, deadline)? {
-            if let Some(cands) = git_candidates(root, &prefix, &snap, &meta, deadline)? {
-                let mut ov = filter_candidates(root, reader, window, cands);
-                ov.meta_outdated = meta_outdated;
-                return Ok(ov);
-            }
-            // In a git repo but cannot diff against the indexed state:
-            // fall through to the stat scan and ask for a rebuild so the
-            // next meta is tied to a commit.
-            let mut ov = stat_scan(root, reader, window, deadline)?;
-            ov.meta_outdated = true;
-            return Ok(ov);
-        }
-    }
-    let mut ov = stat_scan(root, reader, window, deadline)?;
-    ov.meta_outdated = meta_outdated;
-    Ok(ov)
-}
-
-/// Candidate paths (root-relative) that may differ from the index in a git
-/// work tree. `None` if the indexed state cannot be related to HEAD.
-fn git_candidates(
-    root: &Path,
-    prefix: &Path,
-    snap: &GitStatusSnapshot,
-    meta: &IndexMeta,
-    deadline: Option<Instant>,
-) -> std::result::Result<Option<HashSet<PathBuf>>, TimedOut> {
-    if meta.dirty_overflow {
-        return Ok(None);
-    }
-    let base = meta.commit_hash.as_deref().filter(|h| !h.is_empty());
-    let mut set: HashSet<PathBuf> = snap
-        .paths
-        .iter()
-        .filter_map(|p| convert_git_bytes(prefix, p))
-        .collect();
-    set.extend(meta.dirty.iter().cloned());
-    match (base, snap.head.as_deref()) {
-        (Some(b), Some(h)) if b != h => match diff_tree_paths(root, b, h, deadline)? {
-            Some(paths) => set.extend(paths),
-            None => return Ok(None),
-        },
-        (Some(_), Some(_)) => {}
-        // Index not tied to a commit (built outside git or before the
-        // first commit): cannot diff.
-        (None, Some(_)) => return Ok(None),
-        // Unborn branch: status already lists every file as untracked.
-        (_, None) => {}
-    }
-    Ok(Some(set))
-}
-
 /// Lookup key matching how the builder stores paths in the index.
 pub(crate) fn index_key(rel: &Path) -> String {
     rel.iter()
@@ -661,41 +641,7 @@ pub(crate) fn index_key(rel: &Path) -> String {
         .into_owned()
 }
 
-/// True if the on-disk file no longer matches its index entry.
-fn entry_is_stale(full: &Path, entry: &FileEntry, window: Window) -> bool {
-    let Ok(md) = fs::metadata(full) else {
-        return true; // deleted
-    };
-    if !md.is_file() || md.len() != entry.size {
-        return true;
-    }
-    match md.modified() {
-        Ok(t) => {
-            if !mtime_matches(entry.mtime, t) {
-                return true;
-            }
-            // Racy entry: modified while the build was reading files, so an
-            // in-place edit may share the stored whole-second mtime.
-            within_window(t, window)
-        }
-        Err(_) => true,
-    }
-}
-
-/// Mirrors the builder's exclusions for a file it has never seen: hidden
-/// path components and xgrep's own files are skipped.
-fn is_indexable_new(root: &Path, rel: &Path) -> bool {
-    let hidden_or_internal = rel.iter().any(|c| {
-        let c = c.to_string_lossy();
-        c.starts_with('.') || is_xgrep_internal_name(&c)
-    });
-    if hidden_or_internal {
-        return false;
-    }
-    fs::symlink_metadata(root.join(rel)).is_ok_and(|m| m.is_file())
-}
-
-fn is_xgrep_internal_name(name: &str) -> bool {
+pub(crate) fn is_xgrep_internal_name(name: &str) -> bool {
     name == ".xgrep"
         || name.ends_with(".xgrep")
         || name.ends_with(".xgrep.fp")
@@ -703,120 +649,365 @@ fn is_xgrep_internal_name(name: &str) -> bool {
         || name.starts_with(".xgrep_tmp_")
 }
 
-/// Reduce git candidates to those that actually differ from the index.
-fn filter_candidates(
-    root: &Path,
-    reader: &IndexReader,
-    window: Window,
-    cands: HashSet<PathBuf>,
-) -> Overlay {
-    if cands.is_empty() {
-        return Overlay::default();
+// --- stat helpers ----------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    File,
+    Dir,
+    Other,
+}
+
+/// The parts of a `stat` the probe needs.
+#[derive(Debug, Clone, Copy)]
+struct ProbeStat {
+    kind: Kind,
+    size: u64,
+    mtime_ns: u128,
+    /// Inode change time (unix only).
+    ctime_ns: Option<u128>,
+}
+
+/// Stats paths relative to the root.
+///
+/// On unix this holds an open directory descriptor and uses `fstatat`, so
+/// the kernel resolves only the root-relative part of each path.
+struct StatRoot {
+    #[cfg(unix)]
+    fd: libc::c_int,
+    #[cfg(not(unix))]
+    root: PathBuf,
+}
+
+#[cfg(unix)]
+impl StatRoot {
+    fn open(root: &Path) -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(root.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c` is a valid NUL-terminated path; the returned fd is
+        // owned by `StatRoot` and closed in `Drop`.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        (fd >= 0).then_some(Self { fd })
     }
-    let mut pending: HashMap<String, PathBuf> =
-        cands.into_iter().map(|p| (index_key(&p), p)).collect();
-    let mut changed = Vec::new();
-    for fid in 0..reader.file_count() {
-        if pending.is_empty() {
-            break;
+
+    /// `buf` is per-thread scratch space for the NUL-terminated path.
+    // `mode_t`, `time_t` etc. differ in width between unix targets.
+    #[allow(clippy::unnecessary_cast)]
+    fn stat(&self, rel: &str, buf: &mut Vec<u8>) -> Option<ProbeStat> {
+        buf.clear();
+        if rel.is_empty() {
+            buf.push(b'.');
+        } else {
+            buf.extend_from_slice(rel.as_bytes());
         }
-        if let Some(rel) = pending.remove(reader.file_path(fid)) {
-            let stale = reader
-                .file_entry(fid)
-                .is_none_or(|e| entry_is_stale(&root.join(&rel), &e, window));
-            if stale {
-                changed.push(rel);
+        if buf.contains(&0) {
+            return None;
+        }
+        buf.push(0);
+        // SAFETY: `buf` is NUL-terminated and `st` is a properly sized,
+        // writable stat buffer; `self.fd` is an open directory descriptor.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                self.fd,
+                buf.as_ptr() as *const libc::c_char,
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let fmt = st.st_mode as u32 & libc::S_IFMT as u32;
+        let kind = if fmt == libc::S_IFREG as u32 {
+            Kind::File
+        } else if fmt == libc::S_IFDIR as u32 {
+            Kind::Dir
+        } else {
+            Kind::Other
+        };
+        let ts = |s: i64, ns: i64| -> u128 {
+            if s < 0 {
+                0
+            } else {
+                s as u128 * NANOS_PER_SEC + ns.clamp(0, 999_999_999) as u128
             }
-        }
-    }
-    // Not in the index: new files (or paths the builder never indexes).
-    changed.extend(
-        pending
-            .into_values()
-            .filter(|rel| is_indexable_new(root, rel)),
-    );
-    changed.sort();
-    changed.dedup();
-    Overlay {
-        changed,
-        ..Default::default()
+        };
+        Some(ProbeStat {
+            kind,
+            size: st.st_size as u64,
+            mtime_ns: ts(st.st_mtime as i64, st.st_mtime_nsec as i64),
+            ctime_ns: Some(ts(st.st_ctime as i64, st.st_ctime_nsec as i64)),
+        })
     }
 }
 
-/// Non-git freshness probe: stat every indexed file and every directory
-/// containing indexed files; re-list directories modified since the build.
+#[cfg(unix)]
+impl Drop for StatRoot {
+    fn drop(&mut self) {
+        // SAFETY: `fd` was opened by `StatRoot::open` and is closed once.
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl StatRoot {
+    fn open(root: &Path) -> Option<Self> {
+        Some(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn stat(&self, rel: &str, _buf: &mut Vec<u8>) -> Option<ProbeStat> {
+        let md = fs::symlink_metadata(self.root.join(rel)).ok()?;
+        let kind = if md.is_file() {
+            Kind::File
+        } else if md.is_dir() {
+            Kind::Dir
+        } else {
+            Kind::Other
+        };
+        Some(ProbeStat {
+            kind,
+            size: md.len(),
+            mtime_ns: md.modified().map(unix_nanos).unwrap_or(0),
+            ctime_ns: None,
+        })
+    }
+}
+
+/// True if `ns` is at or after `start` (second granularity for timestamps
+/// without a sub-second part, see [`at_or_after`]).
+fn ns_at_or_after(ns: u128, start: u128) -> bool {
+    if ns % NANOS_PER_SEC == 0 {
+        ns / NANOS_PER_SEC >= start / NANOS_PER_SEC
+    } else {
+        ns >= start
+    }
+}
+
+/// Compare a stored index mtime (seconds, millis or nanos) with `ns`.
+fn mtime_matches_ns(stored: u64, ns: u128) -> bool {
+    let stored = stored as u128;
+    stored == ns / NANOS_PER_SEC || stored == ns / 1_000_000 || stored == ns
+}
+
+/// True if the on-disk file (`st`, `None` = missing) no longer matches its
+/// index entry, or cannot be proven to match.
+fn entry_is_stale(st: Option<ProbeStat>, entry: &FileEntry, window: Window) -> bool {
+    let Some(st) = st else {
+        return true; // deleted
+    };
+    if st.kind != Kind::File || st.size != entry.size || !mtime_matches_ns(entry.mtime, st.mtime_ns)
+    {
+        return true;
+    }
+    // Racy entry: modified while the build was reading files, so an
+    // in-place edit may share the stored mtime.
+    if ns_at_or_after(st.mtime_ns, window.0)
+        && st.mtime_ns / NANOS_PER_SEC <= window.1 / NANOS_PER_SEC
+    {
+        return true;
+    }
+    // Inode changed after the build started (e.g. replaced via rename by a
+    // file that kept an older mtime and the same size).
+    st.ctime_ns.is_some_and(|c| ns_at_or_after(c, window.0))
+}
+
+/// Number of threads for stat'ing `n` paths.
+fn probe_threads(n: usize, slow_fs: bool) -> usize {
+    static AVAIL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let avail = *AVAIL.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
+    // Each thread costs a spawn (~20-50 us); give it enough work. On
+    // network/9p filesystems a stat is a round trip, so fan out wider.
+    let (per_thread, max) = if slow_fs { (8, 32) } else { (1024, 16) };
+    n.div_ceil(per_thread).clamp(1, max).min(avail.max(1))
+}
+
+/// Run `f` for every index in `0..n` on `threads` scoped threads. Work is
+/// claimed in contiguous chunks; each thread gets its own state from
+/// `init`. Returns everything pushed to the output vectors, in no
+/// particular order.
+fn par_scan<T: Send, L>(
+    n: usize,
+    threads: usize,
+    chunk: usize,
+    deadline: Option<Instant>,
+    init: impl Fn() -> L + Sync,
+    f: impl Fn(usize, &mut L, &mut Vec<T>) + Sync,
+) -> std::result::Result<Vec<T>, TimedOut> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let next = AtomicUsize::new(0);
+    let timed_out = AtomicBool::new(false);
+    let work = || {
+        let mut local = init();
+        let mut out = Vec::new();
+        loop {
+            let start = next.fetch_add(chunk, Ordering::Relaxed);
+            if start >= n || timed_out.load(Ordering::Relaxed) {
+                break;
+            }
+            if check_deadline(deadline).is_err() {
+                timed_out.store(true, Ordering::Relaxed);
+                break;
+            }
+            for i in start..(start + chunk).min(n) {
+                f(i, &mut local, &mut out);
+            }
+        }
+        out
+    };
+    let out = if threads <= 1 {
+        work()
+    } else {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (1..threads).map(|_| s.spawn(work)).collect();
+            let mut all = work();
+            for h in handles {
+                match h.join() {
+                    Ok(v) => all.extend(v),
+                    Err(e) => std::panic::resume_unwind(e),
+                }
+            }
+            all
+        })
+    };
+    if timed_out.load(Ordering::Relaxed) {
+        Err(TimedOut)
+    } else {
+        Ok(out)
+    }
+}
+
+/// Parent of an index path ("" for top-level files), without allocating.
+fn parent_str(p: &str) -> &str {
+    let is_sep = |c: char| c == '/' || c == std::path::MAIN_SEPARATOR;
+    p.rfind(is_sep).map_or("", |i| &p[..i])
+}
+
+/// Directories known to the index: parents of indexed files and their
+/// ancestors ("" is the root). Names are borrowed from the mmap.
+fn indexed_dirs(reader: &IndexReader) -> HashSet<&str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    seen.insert("");
+    let mut prev: Option<&str> = None;
+    for fid in 0..reader.file_count() {
+        let parent = parent_str(reader.file_path(fid));
+        // Paths are sorted, so siblings are adjacent.
+        if prev == Some(parent) {
+            continue;
+        }
+        prev = Some(parent);
+        let mut d = parent;
+        while !d.is_empty() && seen.insert(d) {
+            d = parent_str(d);
+        }
+    }
+    seen
+}
+
+/// Per-thread state of [`stat_scan`].
+struct ScanLocal<'a> {
+    buf: Vec<u8>,
+    /// Directories this thread already stat'ed.
+    dirs_seen: HashSet<&'a str>,
+}
+
+/// Freshness probe: stat every indexed file and every directory containing
+/// indexed files; re-list directories modified since the build.
 fn stat_scan(
     root: &Path,
     reader: &IndexReader,
     window: Window,
     deadline: Option<Instant>,
 ) -> std::result::Result<Overlay, TimedOut> {
-    use rayon::prelude::*;
+    let Some(sr) = StatRoot::open(root) else {
+        // Root is gone or unreadable: nothing in the index can be trusted.
+        let changed = (0..reader.file_count())
+            .map(|fid| PathBuf::from(reader.file_path(fid)))
+            .collect();
+        return Ok(Overlay {
+            changed,
+            ..Default::default()
+        });
+    };
+    let n = reader.file_count() as usize;
+    let slow = crate::fsinfo::is_remote_fs(root);
+    let threads = probe_threads(n, slow);
+    let chunk = if slow { 4 } else { 256 };
 
-    let n = reader.file_count();
-    // Stat every indexed file (parallel) while collecting the directories
-    // known to the index (parents of indexed files and their ancestors;
-    // "" is the root). Directory names are borrowed from the mmap.
-    let (changed, (known, known_list)) = rayon::join(
-        || -> std::result::Result<Vec<Option<PathBuf>>, TimedOut> {
-            (0..n)
-                .into_par_iter()
-                .with_min_len(256)
-                .map(|fid| {
-                    check_deadline(deadline)?;
-                    let rel = reader.file_path(fid);
-                    let Some(entry) = reader.file_entry(fid) else {
-                        return Ok(None);
-                    };
-                    Ok(entry_is_stale(&root.join(rel), &entry, window).then(|| PathBuf::from(rel)))
-                })
-                .collect()
+    // Hits: `Ok(fid)` = stale indexed file, `Err(dir)` = directory
+    // modified since the build. Directories are discovered on the fly from
+    // the (sorted) file paths; each thread stats a directory at most once.
+    let hits = par_scan(
+        n,
+        threads,
+        chunk,
+        deadline,
+        || ScanLocal {
+            buf: Vec::with_capacity(256),
+            dirs_seen: HashSet::new(),
         },
-        || {
-            let mut known: HashSet<&str> = HashSet::new();
-            let mut known_list: Vec<&str> = vec![""];
-            known.insert("");
-            for fid in 0..n {
-                let mut cur = Path::new(reader.file_path(fid)).parent();
-                while let Some(dir) = cur {
-                    let Some(d) = dir.to_str() else { break };
-                    if !known.insert(d) {
-                        break;
-                    }
-                    known_list.push(d);
-                    cur = dir.parent();
+        |i, local, out| {
+            let fid = i as u32;
+            let path = reader.file_path(fid);
+            if let Some(entry) = reader.file_entry(fid) {
+                if entry_is_stale(sr.stat(path, &mut local.buf), &entry, window) {
+                    out.push(Ok(fid));
                 }
             }
-            (known, known_list)
+            let mut d = parent_str(path);
+            loop {
+                if !local.dirs_seen.insert(d) {
+                    break;
+                }
+                if let Some(st) = sr.stat(d, &mut local.buf) {
+                    if st.kind == Kind::Dir && ns_at_or_after(st.mtime_ns, window.0) {
+                        out.push(Err(d));
+                    }
+                }
+                if d.is_empty() {
+                    break;
+                }
+                d = parent_str(d);
+            }
         },
-    );
-    let mut changed: Vec<PathBuf> = changed?.into_iter().flatten().collect();
-    check_deadline(deadline)?;
-    let changed_dirs: Vec<&str> = known_list
-        .par_iter()
-        .with_min_len(128)
-        .filter(|d| {
-            fs::metadata(root.join(d))
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| at_or_after(t, window.0))
-        })
-        .copied()
-        .collect();
+    )?;
+
+    let mut changed = Vec::new();
+    let mut changed_dirs: HashSet<String> = HashSet::new();
+    for h in hits {
+        match h {
+            Ok(fid) => changed.push(PathBuf::from(reader.file_path(fid))),
+            Err(d) => {
+                changed_dirs.insert(d.to_string());
+            }
+        }
+    }
     check_deadline(deadline)?;
 
     let mut truncated = false;
     if !changed_dirs.is_empty() {
-        let indexed: HashSet<&str> = (0..n).map(|fid| reader.file_path(fid)).collect();
-        let owned = |it: &mut dyn Iterator<Item = &str>| -> HashSet<String> {
-            it.map(str::to_string).collect()
-        };
-        let (new_files, hit_limit) = walk_new_files(
-            root,
-            owned(&mut known.into_iter()),
-            owned(&mut changed_dirs.into_iter()),
-            &indexed,
-            deadline,
-        )?;
+        let indexed: HashSet<&str> = (0..reader.file_count())
+            .map(|fid| reader.file_path(fid))
+            .collect();
+        let known: HashSet<String> = indexed_dirs(reader)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let (new_files, hit_limit) = walk_new_files(root, known, changed_dirs, &indexed, deadline)?;
         truncated = hit_limit;
         changed.extend(new_files);
     }
@@ -1103,19 +1294,25 @@ mod tests {
         let index_path = dir.path().join("test.xgrep");
         fs::write(&index_path, "dummy").unwrap();
 
-        IndexMeta::save(&index_path, Some("abc123"), None, None).unwrap();
+        IndexMeta::save(&index_path, Some("abc123"), None).unwrap();
         let meta = IndexMeta::load(&index_path).unwrap();
         assert_eq!(meta.commit_hash, Some("abc123".to_string()));
         assert_eq!(meta.verified_at, None);
-        assert!(meta.dirty.is_empty());
 
-        let dirty = vec![PathBuf::from("a b.txt"), PathBuf::from("日本.txt")];
-        IndexMeta::save(&index_path, Some("def"), Some((10, 12)), Some(&dirty)).unwrap();
+        IndexMeta::save(&index_path, Some("def"), Some((10, 12))).unwrap();
         let meta = IndexMeta::load(&index_path).unwrap();
         assert_eq!(meta.commit_hash, Some("def".to_string()));
         assert_eq!(meta.verified_at, Some((10, 12)));
-        assert_eq!(meta.dirty, dirty);
-        assert!(!meta.dirty_overflow);
+
+        // Lines written by older versions are ignored.
+        fs::write(
+            index_path.with_extension("meta"),
+            "abc\nverified-ns 5 6\ndirty a.txt\ndirty-overflow\n",
+        )
+        .unwrap();
+        let meta = IndexMeta::load(&index_path).unwrap();
+        assert_eq!(meta.commit_hash, Some("abc".to_string()));
+        assert_eq!(meta.verified_at, Some((5, 6)));
     }
 
     #[test]
@@ -1208,7 +1405,6 @@ mod tests {
 u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs\0\
 ? sub/untracked.txt\0";
         let snap = parse_status_v2(out);
-        assert_eq!(snap.head.as_deref(), Some("0123abcd"));
         let paths: Vec<String> = snap
             .paths
             .iter()
@@ -1226,7 +1422,6 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs\0\
     #[test]
     fn test_parse_status_v2_initial_and_empty() {
         let snap = parse_status_v2(b"# branch.oid (initial)\0# branch.head main\0");
-        assert!(snap.head.is_none());
         assert!(snap.paths.is_empty());
         assert!(parse_status_v2(b"").paths.is_empty());
         // Truncated record is ignored rather than mis-parsed.
@@ -1639,5 +1834,168 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs\0\
             "root.txt should be filtered out: {:?}",
             files
         );
+    }
+
+    /// Build the index the way searches do (index + meta with a window).
+    fn build_with_meta(root: &Path, index_path: &Path) {
+        let started = std::time::SystemTime::now();
+        crate::index::builder::build_index(root, index_path).unwrap();
+        save_meta(root, index_path, Some(started)).unwrap();
+    }
+
+    /// Move file mtimes (and the build window) safely into the past so an
+    /// edit is never "racy" just because it shares the build's second.
+    fn backdate(path: &Path, secs: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    fn overlay_paths(ov: &Overlay) -> Vec<String> {
+        ov.changed
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect()
+    }
+
+    #[test]
+    fn test_stat_probe_finds_edits_new_and_deleted_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("keep.rs"), "keep").unwrap();
+        fs::write(root.join("a/edit.rs"), "edit me").unwrap();
+        fs::write(root.join("a/b/gone.rs"), "gone").unwrap();
+        for f in ["keep.rs", "a/edit.rs", "a/b/gone.rs"] {
+            backdate(&root.join(f), 10);
+        }
+        let index_path = dir.path().join("idx").join("index");
+        fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        build_with_meta(&root, &index_path);
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        let ov = compute_overlay(&root, &index_path, &reader, None).unwrap();
+        assert!(ov.changed.is_empty(), "{:?}", ov.changed);
+        assert!(!ov.truncated && !ov.meta_outdated);
+
+        fs::write(root.join("a/edit.rs"), "edited!").unwrap();
+        fs::remove_file(root.join("a/b/gone.rs")).unwrap();
+        fs::create_dir_all(root.join("a/b/new/deeper")).unwrap();
+        fs::write(root.join("a/b/new/deeper/n.rs"), "new").unwrap();
+        fs::write(root.join("top.rs"), "new top").unwrap();
+        fs::write(root.join(".hidden.rs"), "hidden").unwrap();
+
+        let ov = compute_overlay(&root, &index_path, &reader, None).unwrap();
+        assert_eq!(
+            overlay_paths(&ov),
+            vec!["a/b/gone.rs", "a/b/new/deeper/n.rs", "a/edit.rs", "top.rs"]
+        );
+    }
+
+    /// A file replaced by `mv` with one that has the same size and the
+    /// indexed mtime is caught through its inode change time.
+    #[cfg(unix)]
+    #[test]
+    fn test_stat_probe_detects_replacement_with_old_mtime() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "aaaa").unwrap();
+        backdate(&root.join("a.rs"), 10);
+        let old_mtime = fs::metadata(root.join("a.rs")).unwrap().modified().unwrap();
+        let index_path = dir.path().join("index");
+        build_with_meta(&root, &index_path);
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        let tmp = dir.path().join("replacement");
+        fs::write(&tmp, "bbbb").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+        fs::rename(&tmp, root.join("a.rs")).unwrap();
+
+        let ov = compute_overlay(&root, &index_path, &reader, None).unwrap();
+        assert_eq!(overlay_paths(&ov), vec!["a.rs"]);
+    }
+
+    #[test]
+    fn test_stat_probe_deadline_times_out() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "a").unwrap();
+        let index_path = dir.path().join("index");
+        build_with_meta(&root, &index_path);
+        let reader = IndexReader::open(&index_path).unwrap();
+        let past = Instant::now() - std::time::Duration::from_millis(1);
+        assert!(compute_overlay(&root, &index_path, &reader, Some(past)).is_none());
+    }
+
+    #[test]
+    fn test_probe_cache_reuse_and_invalidation() {
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "one").unwrap();
+        backdate(&root.join("a.rs"), 10);
+        let index_path = dir.path().join("index");
+        build_with_meta(&root, &index_path);
+        let ttl = Duration::from_secs(60);
+
+        let reader = IndexReader::open(&index_path).unwrap();
+        let (ov, cached) = compute_overlay_cached(&root, &index_path, &reader, None, ttl).unwrap();
+        assert!(!cached && ov.changed.is_empty());
+        assert!(probe_cache_path(&index_path).exists());
+
+        // Within the TTL the stored result is reused (the documented
+        // trade-off: an in-place edit is not seen yet).
+        fs::write(root.join("a.rs"), "two").unwrap();
+        let (ov, cached) = compute_overlay_cached(&root, &index_path, &reader, None, ttl).unwrap();
+        assert!(cached && ov.changed.is_empty());
+
+        // An expired entry is not reused.
+        let (ov, cached) =
+            compute_overlay_cached(&root, &index_path, &reader, None, Duration::from_nanos(1))
+                .unwrap();
+        assert!(!cached);
+        assert_eq!(overlay_paths(&ov), vec!["a.rs"]);
+        // ... and the fresh result is what gets reused next.
+        let (ov, cached) = compute_overlay_cached(&root, &index_path, &reader, None, ttl).unwrap();
+        assert!(cached);
+        assert_eq!(overlay_paths(&ov), vec!["a.rs"]);
+
+        // A rebuild (index + meta rewritten) invalidates the entry.
+        drop(reader);
+        std::thread::sleep(Duration::from_millis(20));
+        build_with_meta(&root, &index_path);
+        let reader = IndexReader::open(&index_path).unwrap();
+        let (_, cached) = compute_overlay_cached(&root, &index_path, &reader, None, ttl).unwrap();
+        assert!(!cached);
+
+        // Even a meta-only rewrite (no-op build) invalidates it.
+        std::thread::sleep(Duration::from_millis(20));
+        save_meta(&root, &index_path, Some(std::time::SystemTime::now())).unwrap();
+        let (_, cached) = compute_overlay_cached(&root, &index_path, &reader, None, ttl).unwrap();
+        assert!(!cached);
+
+        // A corrupt cache file is ignored, and a zero TTL never reads or
+        // writes it.
+        fs::write(probe_cache_path(&index_path), "garbage").unwrap();
+        let (_, cached) = compute_overlay_cached(&root, &index_path, &reader, None, ttl).unwrap();
+        assert!(!cached);
+        fs::remove_file(probe_cache_path(&index_path)).unwrap();
+        let (_, cached) =
+            compute_overlay_cached(&root, &index_path, &reader, None, Duration::ZERO).unwrap();
+        assert!(!cached);
+        assert!(!probe_cache_path(&index_path).exists());
     }
 }

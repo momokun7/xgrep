@@ -29,6 +29,7 @@ pub mod cli;
 pub(crate) mod defs;
 pub mod error;
 pub(crate) mod filetype;
+pub(crate) mod fsinfo;
 pub(crate) mod git;
 pub(crate) mod globfilter;
 pub mod hints;
@@ -361,6 +362,25 @@ fn overlay_probe_budget() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// Default reuse window for a persisted probe result (see
+/// `index::updater::compute_overlay_cached`), set with
+/// `XGREP_PROBE_CACHE_MS`.
+///
+/// Off by default: a cached result hides in-place edits made within the
+/// window (search, edit, search again within a second is exactly what
+/// coding agents do), and nothing cheaper than a stat per file can detect
+/// those. Scripts issuing many searches against a tree they do not modify
+/// can opt in (e.g. `XGREP_PROBE_CACHE_MS=1000`).
+const PROBE_CACHE_TTL_MS: u64 = 0;
+
+fn probe_cache_ttl() -> std::time::Duration {
+    let ms = std::env::var("XGREP_PROBE_CACHE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PROBE_CACHE_TTL_MS);
+    std::time::Duration::from_millis(ms)
+}
+
 /// Skip background rebuilds if one was attempted within this many seconds.
 const REBUILD_COOLDOWN_SECS: u64 = 30;
 
@@ -563,8 +583,8 @@ impl Xgrep {
     /// Index-based search with a freshness overlay.
     ///
     /// Before using the index, a cheap probe finds files that changed since
-    /// the index was built (`git status` in a git work tree, mtime/size
-    /// comparison otherwise). Index results for those files are dropped and
+    /// the index was built (stat of every indexed file and directory,
+    /// compared with the index entries). Index results for those files are dropped and
     /// the files are scanned directly, so new and edited code is found even
     /// before the index is rebuilt. The rebuild itself happens in the
     /// background.
@@ -597,27 +617,35 @@ impl Xgrep {
         let reader = index::reader::IndexReader::open(&self.index_path)?;
         let perf = std::env::var_os("XGREP_PERF_TIMING").is_some();
         let t0 = perf.then(std::time::Instant::now);
+        let mut source = "probe";
         let overlay = if opts.fresh {
             index::updater::compute_overlay(&self.root, &self.index_path, &reader, None)
         } else if overlay_disabled() || self.probe_backoff_active() {
             None
         } else {
             let deadline = std::time::Instant::now() + overlay_probe_budget();
-            let ov = index::updater::compute_overlay(
+            let ov = index::updater::compute_overlay_cached(
                 &self.root,
                 &self.index_path,
                 &reader,
                 Some(deadline),
+                probe_cache_ttl(),
             );
             self.record_probe_outcome(ov.is_some());
-            ov
+            ov.map(|(ov, cached)| {
+                if cached {
+                    source = "probe-cache";
+                }
+                ov
+            })
         };
         if let (Some(t), Some(ov)) = (t0, overlay.as_ref()) {
             eprintln!(
-                "[perf] overlay_probe: {:.1}ms  changed={}{}",
+                "[perf] overlay_probe: {:.2}ms  changed={}{}  source={}",
                 t.elapsed().as_secs_f64() * 1000.0,
                 ov.changed.len(),
-                if ov.truncated { "+" } else { "" }
+                if ov.truncated { "+" } else { "" },
+                source
             );
         }
         let Some(overlay) = overlay else {
