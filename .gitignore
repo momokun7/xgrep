@@ -1,8 +1,8 @@
-# AI指示書・設定
+# AI assistant instructions and settings
 CLAUDE.md
 .claude/
 
-# データセット・ベンチマーク
+# Datasets and build/benchmark output
 bench/linux-src/
 rust/target/
 zig/zig-out/
@@ -18,3 +18,4 @@ python/.venv/
 python/target/
 python/xg/_xg*.so
 python/xg/__pycache__/
+notes/
