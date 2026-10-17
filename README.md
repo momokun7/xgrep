@@ -18,7 +18,7 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 - **LLM-optimized output** — `--format llm` produces Markdown with language tags, context lines, and token-aware truncation
 - **Git-aware** — search only changed files (`--changed`), recent commits (`--since 1h`), respects `.gitignore`
 - **Zero config** — install via cargo/npm/pip, then `xg "pattern"`. Index builds automatically on first search
-- **Always fresh** — files edited since the last index build are rescanned on every search; `xg serve` watches the tree so this costs ~0.1ms
+- **Always fresh** — files edited since the last index build are rescanned on every search; on Linux, `xg serve` watches the tree so this check costs ~0.1ms
 - **Syntax-aware** — tree-sitter outlines (`--outline`), enclosing-block results (`--expand block`), definitions, references and a repo map for Rust, Python, JS/TS, Go, Java, C/C++ and Ruby
 - **Boolean and history search** — file-level `--and` / `--not`, search inside `git diff` (`--in-diff`) or commit messages (`--log`)
 

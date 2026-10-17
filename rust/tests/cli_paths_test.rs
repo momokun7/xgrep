@@ -11,10 +11,11 @@ fn xg_bin(cache: &Path) -> Command {
     cmd
 }
 
+/// Output lines with path separators normalized to `/` (Windows prints `\`).
 fn stdout_lines(out: &std::process::Output) -> Vec<String> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .map(str::to_string)
+        .map(|l| l.replace('\\', "/"))
         .collect()
 }
 

@@ -301,12 +301,16 @@ impl WatchHandle {
     /// (FSEvents / ReadDirectoryChangesW, where events arrive within
     /// milliseconds) return `true`.
     fn fence(&self) -> bool {
+        // Without a fence (macOS, Windows, or a fence dir that could not be
+        // watched) events for an edit made just before the search may still
+        // be in flight, so the dirty set cannot vouch for freshness and the
+        // search must probe instead.
         let Some(dir) = self.shared.fence_dir.as_ref() else {
-            return true;
+            return false;
         };
         if !self.shared.lock().fence_usable() {
             // No fence event will ever arrive (watcher failed or stopped).
-            return true;
+            return false;
         }
         let mut issued = self
             .shared
@@ -984,6 +988,10 @@ mod tests {
         v
     }
 
+    /// Overlay source of a search while watching: only platforms with a
+    /// fence trust the watcher's change set; others probe.
+    const WATCHED: &str = if PER_DIR_WATCHES { "watcher" } else { "probe" };
+
     fn source(xg: &Xgrep) -> &'static str {
         *xg.last_overlay_source.lock().unwrap()
     }
@@ -1008,7 +1016,7 @@ mod tests {
         assert!(xg.watch_status() == WatchStatus::Active);
 
         assert_eq!(hits(&xg, "alpha_old"), vec!["a.rs"]);
-        assert_eq!(source(&xg), "watcher");
+        assert_eq!(source(&xg), WATCHED);
         assert_eq!(
             xg.freshness_note(),
             format!("index: fresh; {}", xg.watch_status())
@@ -1028,7 +1036,7 @@ mod tests {
         );
 
         assert_eq!(hits(&xg, "alpha_new"), vec!["a.rs"]);
-        assert_eq!(source(&xg), "watcher");
+        assert_eq!(source(&xg), WATCHED);
         assert!(hits(&xg, "alpha_old").is_empty());
         assert_eq!(hits(&xg, "created_sym"), vec!["created.rs"]);
         assert!(hits(&xg, "gone_sym").is_empty());
@@ -1055,7 +1063,7 @@ mod tests {
             let pat = format!("immediate_{i}_sym");
             if PER_DIR_WATCHES {
                 assert_eq!(hits(&xg, &pat), vec![name.clone()], "iteration {i}");
-                assert_eq!(source(&xg), "watcher");
+                assert_eq!(source(&xg), WATCHED);
             } else {
                 assert!(poll(|| hits(&xg, &pat) == vec![name.clone()]));
             }
@@ -1076,7 +1084,7 @@ mod tests {
         assert!(poll(
             || hits(&xg, "deep_new_sym") == vec!["new/deep/er/n.rs"]
         ));
-        assert_eq!(source(&xg), "watcher");
+        assert_eq!(source(&xg), WATCHED);
 
         // Renaming a directory moves its files.
         fs::rename(root.join("old"), root.join("moved")).unwrap();
@@ -1132,7 +1140,7 @@ mod tests {
             xg.last_search_freshness(),
             Some(crate::Freshness::default())
         );
-        assert_eq!(source(&xg), "watcher");
+        assert_eq!(source(&xg), WATCHED);
     }
 
     #[test]
@@ -1162,7 +1170,7 @@ mod tests {
         assert!(xg.wait_for_watcher(TIMEOUT));
         assert!(xg.watch_status() == WatchStatus::Active);
         assert_eq!(hits(&xg, "a_new_after_overflow"), vec!["a.rs"]);
-        assert_eq!(source(&xg), "watcher");
+        assert_eq!(source(&xg), WATCHED);
     }
 
     #[test]
@@ -1235,7 +1243,7 @@ mod tests {
         xg.start_watching_with(no_rebuild_cfg()).unwrap();
         assert!(xg.wait_for_watcher(TIMEOUT));
         assert!(hits(&xg, "unignored_sym").is_empty());
-        assert_eq!(source(&xg), "watcher");
+        assert_eq!(source(&xg), WATCHED);
 
         // Replace (not edit in place) so the root directory's mtime moves
         // and the probe re-lists it.
@@ -1250,7 +1258,7 @@ mod tests {
         xg.build_index().unwrap();
         assert!(xg.wait_for_watcher(TIMEOUT));
         assert_eq!(hits(&xg, "unignored_sym"), vec!["gen/out.rs"]);
-        assert_eq!(source(&xg), "watcher");
+        assert_eq!(source(&xg), WATCHED);
     }
 
     /// A build that started before the watches were in place cannot vouch

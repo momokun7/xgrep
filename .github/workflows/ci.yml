@@ -38,7 +38,7 @@ jobs:
         run: cargo build
       - name: Test
         working-directory: rust
-        run: cargo test
+        run: cargo test --no-fail-fast
       - name: Test without the syntax feature (as shipped in npm/pip)
         if: matrix.os == 'ubuntu-latest'
         working-directory: rust
