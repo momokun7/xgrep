@@ -42,14 +42,14 @@ See [REVIEW.md](REVIEW.md) for what reviewers look for and the risk tiers.
 Releases use [release-please](https://github.com/googleapis/release-please). It does not open release PRs on its own; when you want to release, open one from your machine so CI runs on it:
 
 ```bash
-npx release-please release-pr \
+npx release-please@17.11.2 release-pr \
   --repo-url momokun7/xgrep \
   --token "$(gh auth token)" \
   --config-file release-please-config.json \
   --manifest-file .release-please-manifest.json
 ```
 
-This computes the next version and CHANGELOG from the conventional commits since the last release. Review the PR, let CI pass, and merge it; the Release Please workflow then tags the release and starts the release build.
+This computes the next version and CHANGELOG from the conventional commits since the last release. The whole repository is one release-please package: commits anywhere count, and `rust/Cargo.toml`, `rust/Cargo.lock` and `rust/CHANGELOG.md` are updated. Before 1.0, `feat` bumps the patch version and breaking changes bump the minor version. The version is pinned because the `Cargo.lock` update relies on how this release-please version parses TOML. Add `--release-as X.Y.Z` to choose the version yourself. Review the PR: a merge commit repeats the PR title in its body, which release-please lists as a second entry, so remove duplicate lines from both `rust/CHANGELOG.md` and the PR description (the release notes are taken from the description). Then let CI pass and merge it; the Release Please workflow then tags the release and starts the release build.
 
 ## Code Style
 
