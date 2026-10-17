@@ -4,8 +4,7 @@ use crate::index::reader::IndexReader;
 use crate::trigram;
 use memchr::memmem;
 use rayon::prelude::*;
-use regex::RegexBuilder;
-use std::borrow::Cow;
+use regex::bytes::RegexBuilder;
 use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -163,22 +162,17 @@ impl Matcher for CaseInsensitiveMatcher {
 
 /// Regex matcher.
 struct RegexMatcher {
-    re: regex::Regex,
+    re: regex::bytes::Regex,
 }
 
 impl Matcher for RegexMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        let content_str: Cow<'_, str> = match std::str::from_utf8(content) {
-            Ok(s) => Cow::Borrowed(s),
-            Err(_) => String::from_utf8_lossy(content),
-        };
-
         let line_offsets = build_line_offsets(content);
         let file: Arc<str> = Arc::from(rel_path);
         let mut results = Vec::new();
         let mut last_line = 0usize;
 
-        for m in self.re.find_iter(&content_str) {
+        for m in self.re.find_iter(content) {
             let line_num = line_number_at(&line_offsets, m.start());
             if line_num == last_line {
                 continue;
@@ -374,6 +368,17 @@ pub(crate) fn search_files(
     Ok(results)
 }
 
+/// Compile a search regex. `^`/`$` match at line boundaries (LF or CRLF),
+/// and matching runs on raw bytes so non-UTF-8 files keep exact offsets.
+fn build_regex(pattern: &str, case_insensitive: bool) -> Result<regex::bytes::Regex> {
+    RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .multi_line(true)
+        .crlf(true)
+        .build()
+        .map_err(|e| XgrepError::InvalidPattern(e.to_string()))
+}
+
 /// Regex search: extract literal trigrams from pattern for index lookup,
 /// then verify with full regex on candidate files
 pub(crate) fn search_regex(
@@ -383,10 +388,7 @@ pub(crate) fn search_regex(
     case_insensitive: bool,
     quiet: bool,
 ) -> Result<Vec<SearchResult>> {
-    let re = RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()
-        .map_err(|e| XgrepError::InvalidPattern(e.to_string()))?;
+    let re = build_regex(pattern, case_insensitive)?;
 
     let candidate_ids = resolve_regex_candidates(reader, pattern, case_insensitive, quiet);
 
@@ -404,10 +406,7 @@ pub(crate) fn search_files_regex(
     case_insensitive: bool,
     quiet: bool,
 ) -> Result<Vec<SearchResult>> {
-    let re = RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()
-        .map_err(|e| XgrepError::InvalidPattern(e.to_string()))?;
+    let re = build_regex(pattern, case_insensitive)?;
 
     let matcher = RegexMatcher { re };
     let results = scan_direct(root, files, &matcher, quiet);
@@ -946,6 +945,54 @@ mod tests {
         let reader = IndexReader::open(&index_path).unwrap();
         let results = search(&reader, root, "hello world", true, false).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_regex_anchors_match_per_line() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("a.rs"),
+            "// header\nuse std::fs;\nfoo();\nbar();\n",
+        )
+        .unwrap();
+        fs::write(root.join("b.rs"), "x\r\nuse std::io;\r\nbaz();\r\n").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        let results = search_regex(&reader, root, "^use std", false, false).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.line_number == 2));
+
+        let results = search_regex(&reader, root, r"\);$", false, false).unwrap();
+        let got: Vec<(&str, usize)> = results
+            .iter()
+            .map(|r| (r.file.as_ref(), r.line_number))
+            .collect();
+        assert_eq!(got, vec![("a.rs", 3), ("a.rs", 4), ("b.rs", 3)]);
+
+        let files = vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")];
+        let results = search_files_regex(root, &files, "^use std", false, false).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_regex_non_utf8_line_numbers() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("a.txt"),
+            b"\xff\xff\xff\xff\xff\xff\nab\ncd\nef\ntarget here\nzz\n",
+        )
+        .unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let results = search_regex(&reader, root, "target", false, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].line_number, 5);
+        assert_eq!(results[0].line, "target here");
     }
 
     #[test]
