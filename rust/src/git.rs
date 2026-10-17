@@ -93,6 +93,23 @@ pub(crate) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     }
 }
 
+/// Locate the git working-tree root by walking up from `root` looking for a
+/// `.git` entry (directory, or file for worktrees/submodules).
+///
+/// This avoids spawning `git rev-parse --show-toplevel` on hot paths. The
+/// result is canonicalized. Callers must still handle git commands failing
+/// (e.g. a stray `.git` that is not a repository).
+pub(crate) fn find_toplevel_fs(root: &Path) -> Option<PathBuf> {
+    let canon = std::fs::canonicalize(root).ok()?;
+    let mut dir: &Path = &canon;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
 /// Collect git-changed file paths from `-z` output, converting to root-relative paths.
 fn collect_git_paths(root: &Path, git_root: &Option<PathBuf>, out: &[u8]) -> HashSet<PathBuf> {
     let mut files = HashSet::new();

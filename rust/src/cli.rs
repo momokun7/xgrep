@@ -378,6 +378,11 @@ fn run() -> Result<()> {
                 !crate::pattern_has_uppercase(&pattern, cli.regex)
             };
 
+            // One-shot CLI: background index rebuilds may spawn a detached
+            // `xg init` (this executable) instead of a thread that would die
+            // with the process.
+            crate::set_background_rebuild_process(true);
+
             let resolved = resolve_path(cli.path.as_deref())?;
             let (dir, results) = match resolved {
                 ResolvedPath::Dir(dir) => {
