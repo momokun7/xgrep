@@ -76,24 +76,106 @@ Register it with Claude Code (`.mcp.json` or settings):
 
 ### Tools
 
+Pick the tool by intent:
+
+| Intent | Tool |
+|--------|------|
+| Where is `X` declared? | `find_definitions` |
+| Where is `X` used / where does this text occur? | `search` (add `word: true` for identifiers) |
+| Which files are named like `X`? | `find_files` |
+| Show me lines 120-180 of a file | `read_file` with `start_line`/`end_line` |
+
 | Tool | Purpose | Key parameters |
 |------|---------|----------------|
-| `search` | Trigram-indexed pattern search returning matching lines with context. | `pattern` (required), `regex`, `case_insensitive`, `file_type`, `path_pattern`, `max_results` (default 20), `context_lines` (default 3), `max_tokens` (default 4000) |
-| `find_definitions` | Locate likely symbol definitions via regex heuristics (`fn`/`struct`/`class`/`def`…). Not AST-based; may include false positives. | `symbol` (required), `file_type`, `path_pattern` |
-| `read_file` | Read a file (optionally a line range) with line numbers. Use after `search` for full context. | `path` (required, relative to project root), `start_line`, `end_line` |
+| `search` | Trigram-indexed search. Results are ranked and paginated (see below). | `pattern` (literal unless `regex: true`), `queries` (array of searches run in parallel), `case_insensitive` (default: smart-case), `word`, `file_type`, `path_pattern` (substring; globs are applied as globs), `glob` / `exclude` (ripgrep `-g` semantics, `!` excludes), `output_mode` / `mode` (`content`, `files`, `count`, `locations`), `context_lines` (default 0), `max_results` (default 20), `offset`, `max_tokens` (default 4000), `changed_only`, `since`, `fresh`, `include_seen` |
+| `find_definitions` | Where a symbol is defined, via per-language heuristics: Rust `fn`/`struct`/`impl … for X`/`macro_rules!`, Go `func (r *T) X`, C/C++/Java `type X(`, `#define X`, TS/JS functions, classes, class methods and top-level consts, Python `def`/`class`, and more. Comment lines, Markdown and local variables (`let`, indented `const`) are excluded. Not a parser: verify with `read_file` when it matters. | `symbol` (required; `Type::method` uses the last segment), filters as in `search`, `context_lines` (lines after the definition, default 2), `max_results`, `offset`, `max_tokens`, `output_mode`, `include_seen` |
+| `find_files` | File names/paths from the index, like `xg --find`. Substring (case-insensitive) or glob (`*.rs` matches at any depth). Exact file-name matches rank first. | `pattern` (required), `file_type`, `glob`, `exclude`, `max_results` (default 50), `offset` |
+| `read_file` | Read a file with line numbers. Capped at 2000 lines or ~10k tokens; the header shows the total line count and a cut response ends with `next start_line=N`. Lines over 1000 chars are shortened. Files with NUL bytes, paths inside `.git/` and paths outside the project are refused; `start_line` past the end or `end_line < start_line` is an error (`end_line` past the end is clamped). | `path` (required), `start_line`, `end_line`, `max_tokens` |
 | `index_status` | Report index health. Returns JSON: `state` (`"fresh"`, `"stale"`, or `"missing"`), `changed_files` (count, present only when `state` is `"stale"`), `indexed_files`, `index_size_bytes`, `index_path`. | none |
 | `build_index` | Build or rebuild the search index for the codebase. | none |
+| `session_reset` | Forget which ranges were already returned (see *Session dedup*). | none |
+
+Unknown argument names, unknown `file_type`s and unknown `output_mode`s are
+errors that name the valid choices, instead of being silently ignored.
 
 The `index_status` JSON lets an agent branch on freshness without parsing prose:
 call `build_index` when `state` is `"missing"`, or proceed directly when `state`
 is `"fresh"`.
+
+### Reading `search` / `find_definitions` responses
+
+Every response starts with a header like:
+
+```
+Found 75 matches in 16 files for `SearchOptions` (smart-case: case-sensitive). Ranked: definitions and source files first.
+Collapsed 12 matches in 3 files with content identical to a higher-ranked file.
+Showing results 1-20 of 63; more available: pass offset=20 (next_offset=20).
+```
+
+- **Exact totals and pagination.** The total is exact. Pass `offset` to get
+  the next page; `next_offset` is present whenever more results remain. When
+  `max_tokens` cannot fit `max_results` matches the page is shortened and
+  `next_offset` points at the first match that was not shown, so nothing is
+  silently skipped.
+- **Ranking.** Definition lines first, then source files, then tests,
+  examples/benches, docs, vendored code and CHANGELOGs. File names containing
+  the query get a boost, comment lines are ranked last, and at most 5 matches
+  per file come before other files' matches. Files with byte-identical content
+  (xxh64) are collapsed into the highest-ranked copy.
+- **Smart-case.** An all-lowercase ASCII pattern is case-insensitive; any
+  uppercase letter makes it case-sensitive. `case_insensitive: true/false`
+  overrides this.
+- **Zero results come with hints**: a literal pattern with backslash escapes
+  (`handleLogin\(`) reports how many matches the unescaped text has, an
+  uppercase pattern reports the case-insensitive count, filtered searches
+  report how many matches exist outside the filters, and `fresh: true` is
+  suggested for code written moments ago.
+- **Long lines** (minified JS, data) are shown as a ~300 character window
+  around the match.
+- **Why `context_lines` defaults to 0:** on this repository 20 results cost
+  1.9k characters with 0 lines of context, 3.2k with 1 and 5.3k with 3; with
+  the default 4000-token budget, 3 lines of context fits only 49 of 75
+  `SearchOptions` matches, 0 lines fits all of them. Ask for context
+  (or call `read_file` on a hit) when you need it.
+
+### Output modes and multi-query
+
+`output_mode` (alias `mode`) controls the shape of each result; in all modes
+except `content` pagination counts files:
+
+| Mode | Output |
+|------|--------|
+| `content` | Markdown code blocks with the matching lines (default) |
+| `files` | `path (N matches, first L12)` per file |
+| `count` | `path:N` per file |
+| `locations` | `path: L12,L40-42` per file, no line text: the cheapest way to survey usages |
+
+Several searches can be issued in one round trip; they run in parallel and the
+top-level fields act as defaults for every item (`max_tokens` is split between
+them unless an item sets its own):
+
+```json
+{"queries": [{"pattern": "handleLogin", "word": true},
+             {"pattern": "LoginError", "output_mode": "files"},
+             "session_token"],
+ "mode": "locations", "glob": "!**/tests/**"}
+```
+
+### Session dedup
+
+The server remembers which `(file, line range)` it has returned during the
+session (search blocks, definitions and `read_file` windows). Later results
+inside those ranges are collapsed to one line such as
+`already shown: src/auth.rs:L10-40 (2 matches)` instead of repeating the code.
+Pass `include_seen: true` to repeat them for one call, or call
+`session_reset` to forget everything.
 
 ## Recipes for agents
 
 ```bash
 # 1. Find where a symbol is defined (definitions only, not call sites)
 xg -e "(?:pub\s+)?(?:fn|struct|enum|trait)\s+TokenStream\b" /path -t rs --format llm
-# (the find_definitions MCP tool wraps this heuristic for you)
+# (the find_definitions MCP tool does this per language, ranked, without comments/locals)
 
 # 2. Search only files changed since the last commit (fast, scoped review)
 xg "unwrap\(\)" /path --changed -e --format llm
