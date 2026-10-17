@@ -363,7 +363,7 @@ pub fn tools_list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "index_status",
-            "description": "Check the status of the search index. Returns a JSON object: state (\"fresh\", \"stale\", or \"missing\"), changed_files (count, present only when state is \"stale\"), indexed_files (count), index_size_bytes, and index_path.",
+            "description": "Check the status of the search index. Returns a JSON object: state (\"fresh\", \"stale\", or \"missing\"), changed_files (count, present only when state is \"stale\"), indexed_files (count), index_size_bytes, index_path, and oversize_files ({count, limit_bytes, examples}, present only when files over the max file size were left out of the index).",
             "inputSchema": {"type": "object", "properties": {}}
         }),
         serde_json::json!({
@@ -520,8 +520,8 @@ fn osa_distance(a: &str, b: &str) -> usize {
     for (i, row) in d.iter_mut().enumerate() {
         row[0] = i;
     }
-    for j in 0..=b.len() {
-        d[0][j] = j;
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
     }
     for i in 1..=a.len() {
         for j in 1..=b.len() {
@@ -1042,6 +1042,12 @@ fn zero_result_hints(xg: &Xgrep, prep: &Prepared) -> Vec<String> {
             "If the code was written moments ago, retry with fresh:true (the index may lag behind the working tree)."
                 .to_string(),
         );
+    }
+    if let Some(o) = xg.oversize_files() {
+        hints.push(format!(
+            "{}.",
+            o.hint("search them outside the index (e.g. `xg PATTERN FILE` or rg)")
+        ));
     }
     hints
 }
@@ -1584,6 +1590,13 @@ pub fn handle_index_status(xg: &Xgrep) -> (String, bool) {
             });
             if let Some(c) = changed_files {
                 json["changed_files"] = c.into();
+            }
+            if let Some(o) = info.oversize {
+                json["oversize_files"] = serde_json::json!({
+                    "count": o.count,
+                    "limit_bytes": o.limit,
+                    "examples": o.examples,
+                });
             }
             (json.to_string(), false)
         }
@@ -2241,6 +2254,43 @@ mod tests {
         );
         assert!(is_error);
         assert!(output.contains("Invalid parameters"));
+    }
+
+    #[test]
+    fn test_oversize_files_in_index_status_and_zero_result_hint() {
+        let (_dir, xg) = setup_test_repo();
+        // Without skipped files: no field, no hint.
+        let (s, _) = handle_index_status(&xg);
+        assert!(!s.contains("oversize_files"), "{s}");
+        let (t, _) = search(&xg, serde_json::json!({"pattern": "zzz_nothing"}));
+        assert!(!t.contains("not indexed"), "{t}");
+
+        let info = crate::OversizeInfo {
+            limit: 10 << 20,
+            count: 2,
+            examples: vec!["data/dump.sql".into(), "logs/a.log".into()],
+        };
+        fs::write(
+            crate::index::builder::oversize_path(xg.index_path()),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+        let (s, err) = handle_index_status(&xg);
+        assert!(!err, "{s}");
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["oversize_files"]["count"], 2);
+        assert_eq!(v["oversize_files"]["limit_bytes"], 10 << 20);
+        assert_eq!(v["oversize_files"]["examples"][0], "data/dump.sql");
+
+        let (t, _) = search(&xg, serde_json::json!({"pattern": "zzz_nothing"}));
+        assert!(
+            t.contains("hint: 2 files over 10MB are not indexed (e.g. data/dump.sql)")
+                && t.contains("XGREP_MAX_FILESIZE=0"),
+            "{t}"
+        );
+        // Not added to non-empty results.
+        let (t, _) = search(&xg, serde_json::json!({"pattern": "hello"}));
+        assert!(!t.contains("not indexed"), "{t}");
     }
 
     #[test]

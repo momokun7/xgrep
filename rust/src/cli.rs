@@ -729,6 +729,25 @@ fn run() -> Result<()> {
             }
 
             if total == 0 {
+                let hints_on = !cli.no_hints
+                    && std::env::var("XGREP_NO_HINTS")
+                        .map(|v| v != "1")
+                        .unwrap_or(true);
+                if hints_on {
+                    // Files over the max file size are not in the index, so
+                    // an indexed search cannot have found anything in them.
+                    for (target, dir) in resolved.iter().zip(&dirs) {
+                        if !matches!(target, ResolvedPath::Dir(_)) {
+                            continue;
+                        }
+                        if let Some(o) = Xgrep::open(dir).ok().and_then(|x| x.oversize_files()) {
+                            eprintln!(
+                                "hint: {}",
+                                o.hint("search them directly with `xg PATTERN FILE`")
+                            );
+                        }
+                    }
+                }
                 std::process::exit(1);
             }
             if expand_block {

@@ -192,6 +192,7 @@ your own hardware; the script runs both focused and distributed queries for a co
 
 - **Single-character queries** bypass the index (full scan) — no speed advantage over ripgrep; 2-character literals use a coarser trigram-prefix lookup
 - **Tiny files (< 3 bytes)** hold no trigrams and are invisible to indexed content search — a deliberate trade-off of the trigram index
+- **Large files (> 10MB by default)** are left out of the index; `xg status`, MCP `index_status` and zero-result hints report how many. Set `XGREP_MAX_FILESIZE` (e.g. `50M`, or `0` for no limit) and rebuild to index them
 - **Index staleness** — background rebuild runs every ~30s. Use `--fresh` for up-to-date results
 - **find_definitions** uses regex heuristics, not AST analysis — false positives expected
 
