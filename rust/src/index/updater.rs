@@ -6,6 +6,7 @@ use std::collections::HashSet;
 
 use crate::error::Result;
 use crate::git::{bytes_to_path, find_toplevel_fs, git_cmd, split_nul};
+use crate::index::builder::is_xgrep_internal;
 use crate::index::format::FileEntry;
 use crate::index::reader::IndexReader;
 use ignore::WalkBuilder;
@@ -682,7 +683,7 @@ fn walk_subtree(root: &Path, rel: &Path, limit: usize) -> (Vec<PathBuf>, bool) {
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .filter_entry(|e| !is_xgrep_internal_name(&e.file_name().to_string_lossy()))
+        .filter_entry(|e| !is_xgrep_internal(&e.file_name().to_string_lossy()))
         .build();
     let mut out = Vec::new();
     for entry in walker.flatten() {
@@ -722,14 +723,6 @@ pub(crate) fn index_key(rel: &Path) -> String {
         .collect::<PathBuf>()
         .to_string_lossy()
         .into_owned()
-}
-
-pub(crate) fn is_xgrep_internal_name(name: &str) -> bool {
-    name == ".xgrep"
-        || name.ends_with(".xgrep")
-        || name.ends_with(".xgrep.fp")
-        || name.ends_with(".xgrep.lock")
-        || name.starts_with(".xgrep_tmp_")
 }
 
 // --- stat helpers ----------------------------------------------------------
@@ -1135,7 +1128,7 @@ fn walk_new_files(
         .git_global(true)
         .git_exclude(true)
         .filter_entry(move |e| {
-            if is_xgrep_internal_name(&e.file_name().to_string_lossy()) {
+            if is_xgrep_internal(&e.file_name().to_string_lossy()) {
                 return false;
             }
             let Ok(rel) = e.path().strip_prefix(&root_owned) else {
@@ -2112,5 +2105,37 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs\0\
             overlay_paths(&ov),
             vec!["keep.rs", "new/x.rs", "new/y.rs", "old", "old/x.rs", "old/y.rs"]
         );
+    }
+
+    /// Files the builder never indexes (its `is_xgrep_internal` list, e.g.
+    /// sidecars of an index stored inside the tree) are not reported as new
+    /// by the probe or the watcher overlay either.
+    #[test]
+    fn test_overlay_skips_builder_internal_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.rs"), "a").unwrap();
+        backdate(&root.join("sub/a.rs"), 10);
+        let index_path = dir.path().join("index");
+        build_with_meta(&root, &index_path);
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        let internal = [
+            "i.xgrep.cache",
+            "i.xgrep.bincache",
+            "i.xgrep.fp.tmp",
+            ".xgrep_cache_tmp_1",
+        ];
+        for name in internal {
+            assert!(crate::index::builder::is_xgrep_internal(name), "{name}");
+            fs::write(root.join("sub").join(name), "x").unwrap();
+        }
+        fs::write(root.join("sub/new.rs"), "n").unwrap();
+
+        let ov = compute_overlay(&root, &index_path, &reader, None).unwrap();
+        assert_eq!(overlay_paths(&ov), vec!["sub/new.rs"]);
+        let ov = overlay_from_paths(&root, &index_path, &reader, vec![PathBuf::from("sub")]);
+        assert_eq!(overlay_paths(&ov), vec!["sub/a.rs", "sub/new.rs"]);
     }
 }

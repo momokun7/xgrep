@@ -292,7 +292,7 @@ fn save_binary_cache(cache_path: &Path, cache: &HashMap<String, (u64, u64)>) {
 
 /// Returns `true` for files and directories that are xgrep internal artefacts
 /// and should never be included in the corpus walk.
-fn is_xgrep_internal(name: &str) -> bool {
+pub(crate) fn is_xgrep_internal(name: &str) -> bool {
     name == ".xgrep"              // index directory
         || name.ends_with(".xgrep")   // index file (e.g. index.xgrep)
         || name.ends_with(".xgrep.fp")    // fingerprint file

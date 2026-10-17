@@ -50,7 +50,7 @@ use ignore::{Match, WalkBuilder};
 use notify::event::{EventKind, ModifyKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 
-use crate::index::updater::is_xgrep_internal_name;
+use crate::index::builder::is_xgrep_internal;
 
 /// Default reuse window for probe results in polling mode.
 const REMOTE_PROBE_TTL_MS: u64 = 2000;
@@ -524,7 +524,7 @@ fn watchable_dirs(dir: &Path) -> impl Iterator<Item = PathBuf> {
         .git_exclude(true)
         .filter_entry(|e| {
             e.file_type().is_some_and(|t| t.is_dir())
-                && !is_xgrep_internal_name(&e.file_name().to_string_lossy())
+                && !is_xgrep_internal(&e.file_name().to_string_lossy())
         })
         .build()
         .flatten()
@@ -648,7 +648,7 @@ fn handle_event(
         }
         let hidden_or_internal = rel.iter().any(|c| {
             let c = c.to_string_lossy();
-            c.starts_with('.') || is_xgrep_internal_name(&c)
+            c.starts_with('.') || is_xgrep_internal(&c)
         });
         if hidden_or_internal || index_dir.is_some_and(|d| rel.starts_with(d)) {
             continue;
