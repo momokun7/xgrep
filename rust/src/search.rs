@@ -27,33 +27,71 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
         .is_some()
 }
 
-/// Build a table of byte offsets for the start of each line.
-/// line_offsets[i] = byte offset of the start of line i+1.
-fn build_line_offsets(content: &[u8]) -> Vec<usize> {
-    let mut offsets = vec![0]; // Line 1 starts at offset 0
-    for (i, &b) in content.iter().enumerate() {
-        if b == b'\n' {
-            offsets.push(i + 1);
+/// Maps non-decreasing byte positions to (line number, line start, line end)
+/// incrementally, without building a full line-offset table.
+struct LineCursor<'a> {
+    content: &'a [u8],
+    /// Start of the line containing the last located position.
+    line_start: usize,
+    /// 1-based line number of `line_start`.
+    line: usize,
+}
+
+impl<'a> LineCursor<'a> {
+    fn new(content: &'a [u8]) -> Self {
+        Self {
+            content,
+            line_start: 0,
+            line: 1,
         }
     }
-    offsets
-}
 
-/// Find the line number (1-based) for a byte position using binary search on precomputed offsets.
-fn line_number_at(line_offsets: &[usize], pos: usize) -> usize {
-    match line_offsets.binary_search(&pos) {
-        Ok(i) => i + 1,
-        Err(i) => i, // pos is within line i (0-indexed), so line number is i
+    fn locate(&mut self, pos: usize) -> (usize, usize, usize) {
+        let content = self.content;
+        let ls = memchr::memrchr(b'\n', &content[self.line_start..pos])
+            .map_or(self.line_start, |i| self.line_start + i + 1);
+        self.line += memchr::memchr_iter(b'\n', &content[self.line_start..ls]).count();
+        self.line_start = ls;
+        let le = memchr::memchr(b'\n', &content[pos..]).map_or(content.len(), |i| pos + i);
+        (self.line, ls, le)
     }
 }
 
-/// Get the byte offset for the start of a line number (1-based).
-fn line_start(line_offsets: &[usize], line_num: usize) -> usize {
-    if line_num <= 1 {
-        0
-    } else {
-        line_offsets.get(line_num - 1).copied().unwrap_or(0)
+/// Collect one result per matching line.
+///
+/// `find(hay, from)` returns the next match `(start, end)` at or after `from`.
+/// After a hit, searching resumes at the next line, so each line is searched
+/// at most once. Line text is taken from `content`, which must have the same
+/// layout as `hay` (e.g. `hay` may be an ASCII-lowercased copy).
+fn collect_lines(
+    hay: &[u8],
+    content: &[u8],
+    rel_path: &str,
+    mut find: impl FnMut(&[u8], usize) -> Option<(usize, usize)>,
+) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let mut file: Option<Arc<str>> = None;
+    let mut cursor = LineCursor::new(hay);
+    let mut from = 0usize;
+    while from <= hay.len() {
+        let Some((start, end)) = find(hay, from) else {
+            break;
+        };
+        // An empty match after a trailing newline is not a line.
+        if start == hay.len() && start > 0 && hay[start - 1] == b'\n' {
+            break;
+        }
+        let (line_number, ls, le) = cursor.locate(start);
+        let line = std::str::from_utf8(&content[ls..le]).unwrap_or("<binary>");
+        let file = file.get_or_insert_with(|| Arc::from(rel_path));
+        results.push(SearchResult {
+            file: Arc::clone(file),
+            line_number,
+            line: line.to_string(),
+        });
+        from = end.max(le + 1);
     }
+    results
 }
 
 #[derive(Debug, Clone)]
@@ -73,90 +111,68 @@ trait Matcher: Send + Sync {
 
 /// Case-sensitive literal string matcher (using memmem SIMD search).
 struct LiteralMatcher {
-    pattern: Vec<u8>,
+    finder: memmem::Finder<'static>,
+}
+
+impl LiteralMatcher {
+    fn new(pattern: &[u8]) -> Self {
+        Self {
+            finder: memmem::Finder::new(pattern).into_owned(),
+        }
+    }
 }
 
 impl Matcher for LiteralMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        let finder = memmem::Finder::new(&self.pattern);
-        if finder.find(content).is_none() {
-            return vec![];
-        }
-
-        let file: Arc<str> = Arc::from(rel_path);
-        let line_offsets = build_line_offsets(content);
-        let mut results = Vec::new();
-        let mut last_line = 0usize;
-
-        for abs_pos in finder.find_iter(content) {
-            let line_num = line_number_at(&line_offsets, abs_pos);
-            if line_num == last_line {
-                continue;
-            }
-            last_line = line_num;
-            let ls = line_start(&line_offsets, line_num);
-            let le = if line_num < line_offsets.len() {
-                line_offsets[line_num].saturating_sub(1)
-            } else {
-                content.len()
-            };
-            let line = std::str::from_utf8(&content[ls..le]).unwrap_or("<binary>");
-            results.push(SearchResult {
-                file: Arc::clone(&file),
-                line_number: line_num,
-                line: line.to_string(),
-            });
-        }
-
-        results
+        let len = self.finder.needle().len();
+        collect_lines(content, content, rel_path, |hay, from| {
+            self.finder
+                .find(&hay[from..])
+                .map(|p| (from + p, from + p + len))
+        })
     }
 }
 
-/// Case-insensitive literal string matcher.
-/// Per-file lowercasing reuses a thread-local buffer to avoid repeated allocation.
+/// Case-insensitive (ASCII folding) literal string matcher.
+/// Searches an ASCII-lowercased copy of the whole file, reusing a
+/// thread-local buffer to avoid repeated allocation.
 struct CaseInsensitiveMatcher {
-    pattern_lower: Vec<u8>,
+    finder: memmem::Finder<'static>,
+}
+
+impl CaseInsensitiveMatcher {
+    fn new(pattern_lower: &[u8]) -> Self {
+        Self {
+            finder: memmem::Finder::new(pattern_lower).into_owned(),
+        }
+    }
 }
 
 impl Matcher for CaseInsensitiveMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        let finder = memmem::Finder::new(&self.pattern_lower);
+        let len = self.finder.needle().len();
         LOWER_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
-            buf.resize(content.len(), 0);
-            buf.copy_from_slice(content);
+            buf.clear();
+            buf.extend_from_slice(content);
             buf.make_ascii_lowercase();
-
-            if finder.find(&buf).is_none() {
-                return vec![];
-            }
-
-            let file: Arc<str> = Arc::from(rel_path);
-            let mut results = Vec::new();
-            let mut line_num = 0usize;
-            let mut start = 0usize;
-
-            while start < buf.len() {
-                line_num += 1;
-                let line_end = buf[start..]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .map_or(buf.len(), |p| start + p);
-
-                if finder.find(&buf[start..line_end]).is_some() {
-                    let original_line = &content[start..line_end];
-                    let line = std::str::from_utf8(original_line).unwrap_or("<binary>");
-                    results.push(SearchResult {
-                        file: Arc::clone(&file),
-                        line_number: line_num,
-                        line: line.to_string(),
-                    });
-                }
-
-                start = line_end + 1;
-            }
-            results
+            collect_lines(&buf, content, rel_path, |hay, from| {
+                self.finder
+                    .find(&hay[from..])
+                    .map(|p| (from + p, from + p + len))
+            })
         })
+    }
+}
+
+/// Literal matcher; uses the copy-free case-sensitive path when case folding
+/// cannot change the result (no ASCII letters in the pattern).
+fn literal_matcher(pattern: &str, case_insensitive: bool) -> Box<dyn Matcher> {
+    let lower = pattern.to_ascii_lowercase();
+    if case_insensitive && lower.bytes().any(|b| b.is_ascii_lowercase()) {
+        Box::new(CaseInsensitiveMatcher::new(lower.as_bytes()))
+    } else {
+        Box::new(LiteralMatcher::new(pattern.as_bytes()))
     }
 }
 
@@ -167,31 +183,9 @@ struct RegexMatcher {
 
 impl Matcher for RegexMatcher {
     fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
-        let line_offsets = build_line_offsets(content);
-        let file: Arc<str> = Arc::from(rel_path);
-        let mut results = Vec::new();
-        let mut last_line = 0usize;
-
-        for m in self.re.find_iter(content) {
-            let line_num = line_number_at(&line_offsets, m.start());
-            if line_num == last_line {
-                continue;
-            }
-            last_line = line_num;
-            let ls = line_start(&line_offsets, line_num);
-            let le = if line_num < line_offsets.len() {
-                line_offsets[line_num].saturating_sub(1)
-            } else {
-                content.len()
-            };
-            let line = std::str::from_utf8(&content[ls..le]).unwrap_or("<binary>");
-            results.push(SearchResult {
-                file: Arc::clone(&file),
-                line_number: line_num,
-                line: line.to_string(),
-            });
-        }
-        results
+        collect_lines(content, content, rel_path, |hay, from| {
+            self.re.find_at(hay, from).map(|m| (m.start(), m.end()))
+        })
     }
 }
 
@@ -200,7 +194,7 @@ impl Matcher for RegexMatcher {
 // ---------------------------------------------------------------------------
 
 /// Scan files directly from index candidate ID list (no intermediate Vec).
-fn scan_indexed<M: Matcher>(
+fn scan_indexed<M: Matcher + ?Sized>(
     reader: &IndexReader,
     root: &Path,
     candidate_ids: &[u32],
@@ -229,7 +223,7 @@ fn scan_indexed<M: Matcher>(
 }
 
 /// Scan files directly from a file path list (skipping binary files).
-fn scan_direct<M: Matcher>(
+fn scan_direct<M: Matcher + ?Sized>(
     root: &Path,
     files: &[PathBuf],
     matcher: &M,
@@ -316,17 +310,8 @@ pub(crate) fn search(
     }
     let t1 = perf.then(std::time::Instant::now);
 
-    let results = if case_insensitive {
-        let matcher = CaseInsensitiveMatcher {
-            pattern_lower: search_pattern.into_bytes(),
-        };
-        scan_indexed(reader, root, &candidate_ids, &matcher, quiet)
-    } else {
-        let matcher = LiteralMatcher {
-            pattern: pattern.as_bytes().to_vec(),
-        };
-        scan_indexed(reader, root, &candidate_ids, &matcher, quiet)
-    };
+    let matcher = literal_matcher(pattern, case_insensitive);
+    let results = scan_indexed(reader, root, &candidate_ids, &*matcher, quiet);
 
     if let Some(t) = t1 {
         eprintln!(
@@ -354,17 +339,8 @@ pub(crate) fn search_files(
         );
     }
 
-    let results = if case_insensitive {
-        let matcher = CaseInsensitiveMatcher {
-            pattern_lower: pattern.to_ascii_lowercase().into_bytes(),
-        };
-        scan_direct(root, files, &matcher, quiet)
-    } else {
-        let matcher = LiteralMatcher {
-            pattern: pattern.as_bytes().to_vec(),
-        };
-        scan_direct(root, files, &matcher, quiet)
-    };
+    let matcher = literal_matcher(pattern, case_insensitive);
+    let results = scan_direct(root, files, &*matcher, quiet);
 
     Ok(results)
 }
@@ -997,20 +973,51 @@ mod tests {
     }
 
     #[test]
-    fn test_build_line_offsets() {
+    fn test_line_cursor() {
         let content = b"line1\nline2\nline3";
-        let offsets = build_line_offsets(content);
-        assert_eq!(offsets, vec![0, 6, 12]);
+        let mut c = LineCursor::new(content);
+        assert_eq!(c.locate(0), (1, 0, 5));
+        assert_eq!(c.locate(3), (1, 0, 5));
+        assert_eq!(c.locate(6), (2, 6, 11));
+        assert_eq!(c.locate(8), (2, 6, 11));
+        assert_eq!(c.locate(12), (3, 12, 17));
+        assert_eq!(c.locate(17), (3, 12, 17));
     }
 
     #[test]
-    fn test_line_number_at() {
-        let offsets = vec![0, 6, 12];
-        assert_eq!(line_number_at(&offsets, 0), 1); // start of line 1
-        assert_eq!(line_number_at(&offsets, 3), 1); // middle of line 1
-        assert_eq!(line_number_at(&offsets, 6), 2); // start of line 2
-        assert_eq!(line_number_at(&offsets, 8), 2); // middle of line 2
-        assert_eq!(line_number_at(&offsets, 12), 3); // start of line 3
-        assert_eq!(line_number_at(&offsets, 15), 3); // end of line 3
+    fn test_collect_lines_one_result_per_line() {
+        let m = LiteralMatcher::new(b"ab");
+        let r = m.find_matches(b"ab ab\nxx\n\nab\nabab", "f");
+        let lines: Vec<(usize, &str)> =
+            r.iter().map(|r| (r.line_number, r.line.as_str())).collect();
+        assert_eq!(lines, vec![(1, "ab ab"), (4, "ab"), (5, "abab")]);
+    }
+
+    #[test]
+    fn test_case_insensitive_matcher_lines() {
+        let m = CaseInsensitiveMatcher::new(b"hello");
+        let content = b"x\nHeLLo there hello\nnope\nsay HELLO";
+        let r = m.find_matches(content, "f");
+        let lines: Vec<(usize, &str)> =
+            r.iter().map(|r| (r.line_number, r.line.as_str())).collect();
+        assert_eq!(lines, vec![(2, "HeLLo there hello"), (4, "say HELLO")]);
+    }
+
+    #[test]
+    fn test_case_insensitive_without_letters_uses_literal_path() {
+        let m = literal_matcher("123", true);
+        let r = m.find_matches(b"a\nx123\n", "f");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].line_number, 2);
+    }
+
+    #[test]
+    fn test_regex_empty_match_ignores_trailing_newline() {
+        let re = build_regex(".*", false).unwrap();
+        let m = RegexMatcher { re };
+        let r = m.find_matches(b"hello\nworld\n", "f");
+        assert_eq!(r.len(), 2);
+        let r = m.find_matches(b"a\n\nb", "f");
+        assert_eq!(r.len(), 3);
     }
 }
