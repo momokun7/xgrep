@@ -14,6 +14,7 @@ use crate::defs::{DefinitionBackend, HeuristicBackend};
 use crate::globfilter::GlobFilter;
 use crate::mcp_render::{self, OutputMode, Page, RenderCfg};
 use crate::rank::{self, QueryTerm, Scored};
+use crate::safefs;
 use crate::session::Session;
 use crate::{filetype, output, SearchOptions, SearchResult, Xgrep};
 
@@ -33,6 +34,12 @@ const DEFAULT_FIND_FILES: usize = 50;
 const READ_MAX_LINES: usize = 2000;
 const READ_DEFAULT_TOKENS: usize = 10_000;
 const READ_LINE_CHARS: usize = 1000;
+/// Largest file `read_file` loads (it reads the whole file to slice lines).
+const READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Upper bound for any `max_tokens`, and for the number of `queries` items.
+pub(crate) const MAX_TOKENS_CAP: usize = 100_000;
+const MAX_QUERIES: usize = 20;
+const OUTSIDE_ROOT: &str = "Error: path is outside the project root";
 /// Minimum per-query budget when `queries` splits `max_tokens`.
 const MIN_QUERY_TOKENS: usize = 400;
 
@@ -697,6 +704,11 @@ pub(crate) fn resolve_project_path(
     xg: &Xgrep,
     path: &str,
 ) -> Result<(std::path::PathBuf, String), String> {
+    // Reject absolute, drive, UNC and `..` paths before touching the
+    // filesystem: on Windows, resolving a UNC path already contacts the server.
+    if !safefs::is_contained_rel(std::path::Path::new(path)) {
+        return Err(OUTSIDE_ROOT.to_string());
+    }
     let full_path = xg.root().join(path);
     let canonical = full_path.canonicalize().map_err(|e| {
         format!(
@@ -709,7 +721,7 @@ pub(crate) fn resolve_project_path(
         .canonicalize()
         .map_err(|e| format!("Cannot resolve root: {}", e))?;
     let Ok(rel) = canonical.strip_prefix(&root_canonical) else {
-        return Err("Error: path traversal detected, file is outside project root".to_string());
+        return Err(OUTSIDE_ROOT.to_string());
     };
     if rel.components().any(|c| c.as_os_str() == ".git") {
         return Err(format!(
@@ -840,7 +852,10 @@ fn prepare(p: SearchParams) -> Result<Prepared, String> {
         max_results: check_max_results(p.max_results, DEFAULT_MAX_RESULTS)?,
         offset: p.offset,
         context: p.context_lines.unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT),
-        max_tokens: p.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(50),
+        max_tokens: p
+            .max_tokens
+            .unwrap_or(DEFAULT_MAX_TOKENS)
+            .clamp(50, MAX_TOKENS_CAP),
         include_seen: p.include_seen,
         expand_block,
     })
@@ -1219,6 +1234,12 @@ pub fn handle_search(xg: &Xgrep, session: &mut Session, params: &Value) -> (Stri
     if queries.is_empty() {
         return ("queries must not be empty".to_string(), true);
     }
+    if queries.len() > MAX_QUERIES {
+        return (
+            format!("queries accepts at most {} items", MAX_QUERIES),
+            true,
+        );
+    }
     if p.pattern.is_some() {
         return (
             "Pass either pattern or queries, not both (put the pattern inside queries)".to_string(),
@@ -1228,7 +1249,10 @@ pub fn handle_search(xg: &Xgrep, session: &mut Session, params: &Value) -> (Stri
     let Value::Object(base) = params else {
         return ("Invalid parameters: expected an object".to_string(), true);
     };
-    let total_budget = p.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    let total_budget = p
+        .max_tokens
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+        .min(MAX_TOKENS_CAP);
     let share = (total_budget / queries.len()).max(MIN_QUERY_TOKENS);
     let mut preps = Vec::with_capacity(queries.len());
     for (i, q) in queries.iter().enumerate() {
@@ -1390,7 +1414,10 @@ pub fn handle_find_definitions(
                 .min(MAX_CONTEXT),
             max_results,
             offset: p.offset,
-            max_tokens: p.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(50),
+            max_tokens: p
+                .max_tokens
+                .unwrap_or(DEFAULT_MAX_TOKENS)
+                .clamp(50, MAX_TOKENS_CAP),
             include_seen: p.include_seen,
             highlight,
         },
@@ -1627,43 +1654,31 @@ pub fn handle_read_file(xg: &Xgrep, session: &mut Session, params: &Value) -> (S
         Err(e) => return (e, true),
     };
 
-    let full_path = xg.root().join(&p.path);
-
-    // Security: prevent path traversal
-    let canonical = match full_path.canonicalize() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                format!(
-                    "Cannot read file '{}': {}. Use find_files to locate files by name.",
-                    p.path, e
-                ),
-                true,
-            )
-        }
+    let (canonical, display) = match resolve_project_path(xg, &p.path) {
+        Ok(v) => v,
+        Err(e) => return (e, true),
     };
-    let root_canonical = match xg.root().canonicalize() {
-        Ok(c) => c,
-        Err(e) => return (format!("Cannot resolve root: {}", e), true),
+    let meta = match std::fs::metadata(&canonical) {
+        Ok(m) => m,
+        Err(e) => return (format!("Cannot read file '{}': {}", p.path, e), true),
     };
-    let Ok(rel) = canonical.strip_prefix(&root_canonical) else {
+    if meta.is_dir() {
         return (
-            "Error: path traversal detected, file is outside project root".to_string(),
-            true,
-        );
-    };
-    if rel.components().any(|c| c.as_os_str() == ".git") {
-        return (
-            format!(
-                "Refusing to read '{}': files inside .git/ are not project sources.",
-                p.path
-            ),
+            format!("'{}' is a directory. Use find_files to list files.", p.path),
             true,
         );
     }
-    if canonical.is_dir() {
+    if !meta.is_file() {
+        return (format!("'{}' is not a regular file.", p.path), true);
+    }
+    if meta.len() > READ_MAX_BYTES {
         return (
-            format!("'{}' is a directory. Use find_files to list files.", p.path),
+            format!(
+                "'{}' is too large to read ({} bytes, limit {}). Use search to find text inside it.",
+                p.path,
+                meta.len(),
+                READ_MAX_BYTES
+            ),
             true,
         );
     }
@@ -1685,7 +1700,6 @@ pub fn handle_read_file(xg: &Xgrep, session: &mut Session, params: &Value) -> (S
     let content = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
-    let display = rel.to_string_lossy().replace('\\', "/");
 
     if total == 0 {
         return (format!("## {}\n\nFile is empty.\n", display), false);
@@ -1725,7 +1739,10 @@ pub fn handle_read_file(xg: &Xgrep, session: &mut Session, params: &Value) -> (S
         ));
     }
     let hard_end = requested_end.min(total);
-    let budget = p.max_tokens.unwrap_or(READ_DEFAULT_TOKENS).max(100);
+    let budget = p
+        .max_tokens
+        .unwrap_or(READ_DEFAULT_TOKENS)
+        .clamp(100, MAX_TOKENS_CAP);
 
     let mut body = String::new();
     let mut used = 0usize;
@@ -2213,6 +2230,48 @@ mod tests {
         let xg = crate::Xgrep::open(dir.path()).unwrap();
         let (_, is_error) = read(&xg, serde_json::json!({"path": "../../etc/passwd"}));
         assert!(is_error);
+    }
+
+    #[test]
+    fn test_handle_read_file_rejects_absolute_paths_before_resolving() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("hello.rs"), "safe").unwrap();
+        let xg = crate::Xgrep::open(dir.path()).unwrap();
+        let abs = dir.path().join("hello.rs");
+        let mut paths = vec![abs.to_string_lossy().into_owned(), "/etc/passwd".into()];
+        if cfg!(windows) {
+            paths.extend([r"\\192.0.2.1\share\x".into(), r"C:\Windows\win.ini".into()]);
+        }
+        for p in paths {
+            let (text, is_error) = read(&xg, serde_json::json!({ "path": p }));
+            assert!(is_error, "{p}");
+            assert_eq!(text, OUTSIDE_ROOT, "{p}");
+        }
+        // Paths that stay inside the root still work.
+        let (_, is_error) = read(&xg, serde_json::json!({"path": "./hello.rs"}));
+        assert!(!is_error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_read_file_rejects_symlink_out_of_root() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret"), "s3cret").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
+        let xg = crate::Xgrep::open(dir.path()).unwrap();
+        let (text, is_error) = read(&xg, serde_json::json!({"path": "link"}));
+        assert!(is_error);
+        assert!(!text.contains("s3cret"));
+    }
+
+    #[test]
+    fn test_handle_search_rejects_too_many_queries() {
+        let (_dir, xg) = setup_test_repo();
+        let queries: Vec<Value> = (0..=MAX_QUERIES).map(|_| "hello".into()).collect();
+        let (text, is_error) = search(&xg, serde_json::json!({ "queries": queries }));
+        assert!(is_error);
+        assert!(text.contains("at most"));
     }
 
     #[test]

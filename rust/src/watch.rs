@@ -239,7 +239,7 @@ impl WatchHandle {
         let canon = std::fs::canonicalize(root)?;
         let fence_dir = if PER_DIR_WATCHES {
             let d = index_path.with_extension("watch");
-            std::fs::create_dir_all(&d)
+            crate::safefs::create_real_dir(&d)
                 .ok()
                 .and_then(|_| std::fs::canonicalize(&d).ok())
         } else {
@@ -320,7 +320,13 @@ impl WatchHandle {
         *issued += 1;
         let token = *issued;
         let file = dir.join(format!("{}-{token}", std::process::id()));
-        if std::fs::File::create(&file).is_err() {
+        // A new name per fence; never open an existing entry.
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+            .is_err()
+        {
             return false;
         }
         let deadline = Instant::now() + FENCE_TIMEOUT;

@@ -16,7 +16,7 @@ use crate::defs::{DefinitionBackend, HeuristicBackend};
 use crate::globfilter::GlobFilter;
 use crate::mcp_tools::{
     build_filters, check_max_results, normalize_symbol, parse, plural, resolve_project_path,
-    Filters, StrOrList,
+    Filters, StrOrList, MAX_TOKENS_CAP,
 };
 use crate::rank::{self, is_comment_line, Scored};
 use crate::{filetype, SearchOptions, SearchResult, Xgrep};
@@ -199,7 +199,10 @@ pub fn handle_outline(xg: &Xgrep, params: &Value) -> (String, bool) {
         Ok(v) => v,
         Err(e) => return (e, true),
     };
-    let budget = p.max_tokens.unwrap_or(OUTLINE_DEFAULT_TOKENS).max(100);
+    let budget = p
+        .max_tokens
+        .unwrap_or(OUTLINE_DEFAULT_TOKENS)
+        .clamp(100, MAX_TOKENS_CAP);
     let paths = match p.path {
         StrOrList::One(s) => vec![s],
         StrOrList::Many(v) => v,
@@ -404,7 +407,10 @@ pub fn handle_find_references(xg: &Xgrep, params: &Value) -> (String, bool) {
         Ok(v) => v,
         Err(e) => return (e, true),
     };
-    let budget = p.max_tokens.unwrap_or(REFS_DEFAULT_TOKENS).max(100);
+    let budget = p
+        .max_tokens
+        .unwrap_or(REFS_DEFAULT_TOKENS)
+        .clamp(100, MAX_TOKENS_CAP);
     let pattern = format!(r"\b{}\b", regex::escape(&symbol));
     let opts = SearchOptions {
         regex: true,
@@ -729,7 +735,10 @@ pub fn handle_repo_map(xg: &Xgrep, params: &Value) -> (String, bool) {
         &MapOptions {
             focus: focus.clone(),
             focus_symbols,
-            max_tokens: p.max_tokens.unwrap_or(MAP_DEFAULT_TOKENS),
+            max_tokens: p
+                .max_tokens
+                .unwrap_or(MAP_DEFAULT_TOKENS)
+                .min(MAX_TOKENS_CAP),
         },
     );
     let rank_ms = t1.elapsed().as_millis();

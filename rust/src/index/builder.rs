@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::error::{Result, XgrepError};
+use crate::safefs;
 use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
 use xxhash_rust::xxh64::Xxh64;
@@ -203,12 +204,7 @@ fn write_oversize(index_path: &Path, walk: &[WalkEntry], max: Option<u64>) {
     let Ok(json) = serde_json::to_vec(&info) else {
         return;
     };
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    if fs::write(&tmp, json).is_ok() && fs::rename(&tmp, &path).is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
+    let _ = safefs::write_atomic(&path, &json);
 }
 
 fn exceeds_max(size: u64, max: Option<u64>) -> bool {
@@ -349,14 +345,10 @@ fn read_fingerprint(fp_path: &Path) -> Option<(u64, Option<u64>)> {
 }
 
 fn write_fingerprint(fp_path: &Path, fingerprint: u64, build_start_ns: u64) -> Result<()> {
-    let mut tmp_s = fp_path.as_os_str().to_os_string();
-    tmp_s.push(".tmp");
-    let tmp = PathBuf::from(tmp_s);
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&fingerprint.to_le_bytes());
     buf[8..].copy_from_slice(&build_start_ns.to_le_bytes());
-    fs::write(&tmp, buf)?;
-    fs::rename(&tmp, fp_path)?;
+    safefs::write_atomic(fp_path, &buf)?;
     Ok(())
 }
 
@@ -402,7 +394,7 @@ fn save_binary_cache(cache_path: &Path, cache: &HashMap<String, (u64, u64)>) {
         data.push_str(&size.to_string());
         data.push('\n');
     }
-    let _ = fs::write(cache_path, data.as_bytes());
+    let _ = safefs::write_atomic(cache_path, data.as_bytes());
 }
 
 /// Returns `true` for files and directories that are xgrep internal artefacts
@@ -547,13 +539,15 @@ fn acquire_lock(index_path: &Path) -> Result<LockGuard> {
 
     let lock_path = index_path.with_extension("lock");
     for _ in 0..10 {
-        let mut f = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| XgrepError::LockError(format!("failed to create lock file: {}", e)))?;
+        let mut f = safefs::no_follow(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+        )
+        .open(&lock_path)
+        .map_err(|e| XgrepError::LockError(format!("failed to create lock file: {}", e)))?;
         // SAFETY: flock only operates on the open file descriptor owned by `f`.
         let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
@@ -919,11 +913,11 @@ where
     let file_count_u32 = u32::try_from(files.len()).map_err(|_| index_too_large("file count"))?;
 
     let parent = index_path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    let temp_path = parent.join(format!(".xgrep_tmp_{}", std::process::id()));
+    safefs::create_real_dir(parent)?;
+    let (temp_file, temp_path) = safefs::temp_file_in(parent)?.into_parts();
 
     let result = (|| -> Result<()> {
-        let mut w = BufWriter::with_capacity(256 * 1024, fs::File::create(&temp_path)?);
+        let mut w = BufWriter::with_capacity(256 * 1024, temp_file);
         let mut header = Header {
             magic: MAGIC,
             version: VERSION,
@@ -983,11 +977,9 @@ where
         Ok(())
     })();
 
-    if let Err(e) = result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(e);
-    }
-    fs::rename(&temp_path, index_path)?;
+    // On error, dropping `temp_path` removes the temp file.
+    result?;
+    safefs::rename_into_place(temp_path, index_path)?;
     sync_dir(parent);
     Ok(())
 }
