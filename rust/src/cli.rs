@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::env;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::{output, Config, SearchOptions, Xgrep};
@@ -21,6 +22,16 @@ struct Cli {
     /// Output format (default, llm)
     #[arg(long, default_value = "default")]
     format: String,
+
+    /// Approximate token budget for --format llm output; output stops with a
+    /// "truncated" notice once the next line would exceed it (default: unlimited)
+    #[arg(long, value_name = "NUM")]
+    max_tokens: Option<usize>,
+
+    /// Truncate lines longer than NUM characters, showing "…[+N chars]"
+    /// (0 = no limit; default: no limit, 300 for --format llm)
+    #[arg(long, short = 'M', value_name = "NUM")]
+    max_columns: Option<usize>,
 
     /// Case-insensitive search (default: smart-case — insensitive unless
     /// the pattern contains an uppercase letter)
@@ -260,6 +271,10 @@ fn run() -> Result<()> {
                 eprintln!("error: -c, -l, and --json are mutually exclusive");
                 std::process::exit(2);
             }
+            if cli.max_tokens.is_some() && (cli.format != "llm" || cli.count || cli.files_only) {
+                eprintln!("error: --max-tokens requires --format llm");
+                std::process::exit(2);
+            }
 
             let pattern = cli.pattern.unwrap_or_else(|| {
                 eprintln!("Usage: xgrep <pattern> or xgrep init");
@@ -439,6 +454,13 @@ fn run() -> Result<()> {
                 }
             };
 
+            // Stream everything through one buffered handle instead of building
+            // the whole output in memory first.
+            let stdout = std::io::stdout();
+            let mut out = std::io::BufWriter::new(stdout.lock());
+            // 0 means "no limit", like ripgrep's --max-columns.
+            let max_columns = cli.max_columns.filter(|&n| n > 0);
+
             if cli.count {
                 let mut counts: std::collections::BTreeMap<String, usize> =
                     std::collections::BTreeMap::new();
@@ -446,14 +468,14 @@ fn run() -> Result<()> {
                     *counts.entry(make_path(&r.file)).or_insert(0) += 1;
                 }
                 for (file, count) in counts {
-                    println!("{}:{}", file, count);
+                    writeln!(out, "{}:{}", file, count)?;
                 }
             } else if cli.files_only {
                 let mut seen = std::collections::BTreeSet::new();
                 for r in &results {
                     let p = make_path(&r.file);
                     if seen.insert(p.clone()) {
-                        println!("{}", p);
+                        writeln!(out, "{}", p)?;
                     }
                 }
             } else if cli.json_output {
@@ -466,55 +488,47 @@ fn run() -> Result<()> {
                             line: r.line.clone(),
                         })
                         .collect();
-                    println!("{}", output::format_json(&abs_results));
+                    writeln!(out, "{}", output::format_json(&abs_results))?;
                 } else {
-                    println!("{}", output::format_json(&results));
+                    writeln!(out, "{}", output::format_json(&results))?;
                 }
-            } else {
-                let output_str = match cli.format.as_str() {
-                    "llm" => {
-                        let base = cli.context.unwrap_or_else(|| {
-                            std::env::var("XGREP_LLM_CONTEXT")
-                                .ok()
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(3)
-                        });
-                        let before = cli.before_context.unwrap_or(base);
-                        let after = cli.after_context.unwrap_or(base);
-                        output::format_llm(&results, &dir, before, after, None, use_absolute)?
-                    }
-                    _ => {
-                        let has_context = cli.context.is_some()
-                            || cli.before_context.is_some()
-                            || cli.after_context.is_some();
-                        if has_context {
-                            let base = cli.context.unwrap_or(0);
-                            let before = cli.before_context.unwrap_or(base);
-                            let after = cli.after_context.unwrap_or(base);
-                            output::format_default_context(
-                                &results,
-                                &dir,
-                                before,
-                                after,
-                                use_absolute,
-                            )?
-                        } else if use_absolute {
-                            let abs_results: Vec<_> = results
-                                .iter()
-                                .map(|r| crate::SearchResult {
-                                    file: make_path(&r.file).into(),
-                                    line_number: r.line_number,
-                                    line: r.line.clone(),
-                                })
-                                .collect();
-                            output::format_default(&abs_results)
-                        } else {
-                            output::format_default(&results)
-                        }
-                    }
+            } else if cli.format == "llm" {
+                let base = cli.context.unwrap_or_else(|| {
+                    std::env::var("XGREP_LLM_CONTEXT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(3)
+                });
+                let opts = output::LlmOptions {
+                    before_context: cli.before_context.unwrap_or(base),
+                    after_context: cli.after_context.unwrap_or(base),
+                    max_tokens: cli.max_tokens,
+                    absolute_paths: use_absolute,
+                    max_line_chars: match cli.max_columns {
+                        Some(0) => None,
+                        Some(n) => Some(n),
+                        None => Some(output::DEFAULT_LLM_MAX_LINE_CHARS),
+                    },
                 };
-                println!("{}", output_str);
+                output::write_llm(&mut out, &results, &dir, &opts)?;
+            } else {
+                let has_context = cli.context.is_some()
+                    || cli.before_context.is_some()
+                    || cli.after_context.is_some();
+                let base = cli.context.unwrap_or(0);
+                let opts = output::TextOptions {
+                    before_context: cli.before_context.unwrap_or(base),
+                    after_context: cli.after_context.unwrap_or(base),
+                    absolute_paths: use_absolute,
+                    max_columns,
+                };
+                if has_context {
+                    output::write_default_context(&mut out, &results, &dir, &opts)?;
+                } else {
+                    output::write_default(&mut out, &results, &dir, &opts)?;
+                }
             }
+            out.flush()?;
         }
     }
     Ok(())
