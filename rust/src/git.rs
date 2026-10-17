@@ -197,7 +197,7 @@ pub fn since_files(root: &Path, duration: &str) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 
-fn parse_duration(duration: &str) -> Result<Option<String>> {
+pub(crate) fn parse_duration(duration: &str) -> Result<Option<String>> {
     if duration.ends_with(".commits") {
         let n = duration.strip_suffix(".commits").unwrap();
         if n.parse::<u32>().is_err() {

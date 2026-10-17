@@ -513,6 +513,33 @@ fn pattern_candidates(
     )
 }
 
+/// Matches single lines (e.g. diff lines or commit message lines) with the
+/// same semantics as file search.
+pub(crate) struct LineMatcher {
+    m: Box<dyn Matcher>,
+}
+
+impl LineMatcher {
+    pub(crate) fn new(spec: &PatternSpec, case_insensitive: bool, quiet: bool) -> Result<Self> {
+        Ok(Self {
+            m: compile_pattern(spec, case_insensitive, quiet)?,
+        })
+    }
+
+    /// Byte column of the first match in `line` (which must not contain a
+    /// newline), or `None`.
+    pub(crate) fn find(&self, line: &[u8]) -> Option<usize> {
+        with_hay(line, self.m.needs_lower(), |hay| {
+            let mut col = None;
+            for_each_match_line(hay, &*self.m, |start, _| {
+                col = Some(self.m.column(hay, start, 0));
+                false
+            });
+            col
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Path filters and limits (applied before files are read)
 // ---------------------------------------------------------------------------
@@ -1721,6 +1748,25 @@ mod tests {
         let m = LiteralMatcher::new(b"zzz");
         assert_eq!(count_lines(&hay, &m), 0);
         assert!(!is_match(&hay, &m));
+    }
+
+    #[test]
+    fn test_line_matcher() {
+        let spec = PatternSpec {
+            pattern: "world".into(),
+            regex: false,
+            word: false,
+        };
+        let m = LineMatcher::new(&spec, true, true).unwrap();
+        assert_eq!(m.find(b"hello WORLD"), Some(6));
+        assert_eq!(m.find(b"nothing"), None);
+        let spec = PatternSpec {
+            pattern: r"\d+".into(),
+            regex: true,
+            word: false,
+        };
+        let m = LineMatcher::new(&spec, false, true).unwrap();
+        assert_eq!(m.find(b"abc 42"), Some(4));
     }
 
     fn many_files(n: usize) -> (tempfile::TempDir, IndexReader) {

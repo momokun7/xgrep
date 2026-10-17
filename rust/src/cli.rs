@@ -130,6 +130,17 @@ struct Cli {
     /// Interpreted like the main pattern (-e, -w, case)
     #[arg(long = "not", value_name = "PATTERN")]
     not_patterns: Vec<String>,
+
+    /// Search only the lines added/removed by `git diff <REV-RANGE>`
+    /// (e.g. HEAD~3..HEAD, main...HEAD, HEAD for uncommitted changes).
+    /// Output: path:+N:text (new-file line) or path:-N:text (old-file line)
+    #[arg(long = "in-diff", value_name = "REV-RANGE", conflicts_with_all = ["log", "find", "changed", "since"])]
+    in_diff: Option<String>,
+
+    /// Search commit messages instead of files (newest first; prints
+    /// hash, date and subject). Combine with --since to limit the history
+    #[arg(long = "log", conflicts_with_all = ["find", "changed"])]
+    log: bool,
 }
 
 #[derive(Subcommand)]
@@ -447,6 +458,83 @@ fn run() -> Result<()> {
                     None => Some(output::DEFAULT_LLM_MAX_LINE_CHARS),
                 },
             };
+
+            if cli.in_diff.is_some() || cli.log {
+                if cli.paths.len() > 1 {
+                    anyhow::bail!("--in-diff and --log accept a single PATH");
+                }
+                let dir = resolve_dir(cli.paths.first().map(PathBuf::as_path))?;
+                let xg = Xgrep::open(&dir)?;
+                let opts = SearchOptions {
+                    file_type: cli.file_type.clone(),
+                    since: cli.since.clone(),
+                    max_count: if cli.exclude.is_empty() {
+                        cli.max_count
+                    } else {
+                        None
+                    },
+                    ..base_opts
+                };
+                let stdout = std::io::stdout();
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                if let Some(range) = cli.in_diff.as_deref() {
+                    let mut diffs = xg.search_diff(range, &pattern, &opts)?;
+                    diffs.retain(|d| !excluded(&d.file));
+                    if let Some(max) = cli.max_count {
+                        diffs.truncate(max);
+                    }
+                    if diffs.is_empty() {
+                        std::process::exit(1);
+                    }
+                    let hit_max = cli.max_count.is_some_and(|m| diffs.len() >= m);
+                    let path = |f: &str| make_display_path(&dir, f, use_absolute);
+                    if cli.count {
+                        let mut i = 0;
+                        while i < diffs.len() {
+                            let n = diffs[i..]
+                                .iter()
+                                .take_while(|d| d.file == diffs[i].file)
+                                .count();
+                            writeln!(out, "{}:{}", path(&diffs[i].file), n)?;
+                            i += n;
+                        }
+                    } else if cli.files_only {
+                        let mut seen = std::collections::HashSet::new();
+                        for d in &diffs {
+                            if seen.insert(d.file.clone()) {
+                                writeln!(out, "{}", path(&d.file))?;
+                            }
+                        }
+                    } else if cli.json_output {
+                        output::write_diff_json(&mut out, &diffs, &dir, use_absolute, hit_max)?;
+                    } else if cli.format == "llm" {
+                        output::write_diff_llm(&mut out, &diffs, &dir, &llm_opts)?;
+                    } else {
+                        output::write_diff_default(&mut out, &diffs, &dir, &text_opts(0))?;
+                    }
+                } else {
+                    let commits = xg.search_commits(&pattern, &opts)?;
+                    if commits.is_empty() {
+                        std::process::exit(1);
+                    }
+                    let hit_max = cli.max_count.is_some_and(|m| commits.len() >= m);
+                    if cli.count {
+                        writeln!(out, "{}", commits.len())?;
+                    } else if cli.files_only {
+                        for c in &commits {
+                            writeln!(out, "{}", c.hash)?;
+                        }
+                    } else if cli.json_output {
+                        output::write_commits_json(&mut out, &commits, hit_max)?;
+                    } else if cli.format == "llm" {
+                        output::write_commits_llm(&mut out, &commits, &llm_opts)?;
+                    } else {
+                        output::write_commits_default(&mut out, &commits, &text_opts(0))?;
+                    }
+                }
+                out.flush()?;
+                return Ok(());
+            }
 
             let targets: Vec<Option<&Path>> = if cli.paths.is_empty() {
                 vec![None]

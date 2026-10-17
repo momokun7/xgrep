@@ -32,6 +32,7 @@ pub(crate) mod filetype;
 pub(crate) mod git;
 pub(crate) mod globfilter;
 pub mod hints;
+pub(crate) mod history;
 pub(crate) mod index;
 pub(crate) mod mcp;
 pub(crate) mod mcp_render;
@@ -55,6 +56,7 @@ use std::path::{Path, PathBuf};
 pub use error::{Result, XgrepError};
 pub use filetype::extensions_for_type;
 pub use filetype::list_all_types;
+pub use history::{CommitMatch, DiffMatch, DiffSide};
 pub use search::{FileMatches, OutputMode, SearchResult};
 
 /// Returns true if the pattern contains an uppercase letter.
@@ -1084,6 +1086,58 @@ impl Xgrep {
             sink,
         );
         Ok(())
+    }
+
+    /// Search the lines added and removed by `git diff <range>`.
+    ///
+    /// `range` is anything `git diff` accepts as a revision argument, e.g.
+    /// `HEAD~3..HEAD`, `main...feature` or `HEAD` (working tree against
+    /// HEAD). Only `+`/`-` lines are searched; added lines carry their line
+    /// number in the new file, removed lines in the old file. Paths are
+    /// relative to the search root, and only changes under the root are
+    /// searched. Results are in diff order (by file, then hunk).
+    ///
+    /// Honoured options: `regex`, `word`, `case_insensitive`, `file_type`,
+    /// `path_pattern`, `globs`, `max_count`. `and_patterns` / `not_patterns`
+    /// apply per file: a file's lines are reported only if its added and
+    /// removed lines (together) match every AND pattern and no NOT pattern.
+    pub fn search_diff(
+        &self,
+        range: &str,
+        pattern: &str,
+        opts: &SearchOptions,
+    ) -> Result<Vec<DiffMatch>> {
+        let filter = self.scan_filter(opts)?;
+        let quiet = self.config.quiet;
+        let ci = opts.case_insensitive;
+        let main = search::LineMatcher::new(&Self::pattern_spec(pattern, opts), ci, quiet)?;
+        let compile_all = |pats: &[String]| -> Result<Vec<search::LineMatcher>> {
+            pats.iter()
+                .map(|p| search::LineMatcher::new(&Self::pattern_spec(p, opts), ci, quiet))
+                .collect()
+        };
+        let gates = history::FileGates {
+            and: compile_all(&opts.and_patterns)?,
+            not: compile_all(&opts.not_patterns)?,
+        };
+        history::search_diff(&self.root, range, &main, &gates, &filter)
+    }
+
+    /// Search commit messages (subject and body) of the history reachable
+    /// from HEAD, newest first. Each matching commit is reported once, with
+    /// its first matching message line.
+    ///
+    /// Only commits touching files under the search root are considered when
+    /// the root is a subdirectory of the repository. Honoured options:
+    /// `regex`, `word`, `case_insensitive`, `max_count`, and `since`
+    /// (`"2d"`, `"1w"`, `"20.commits"`, ...).
+    pub fn search_commits(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<CommitMatch>> {
+        let matcher = search::LineMatcher::new(
+            &Self::pattern_spec(pattern, opts),
+            opts.case_insensitive,
+            self.config.quiet,
+        )?;
+        history::search_commits(&self.root, &matcher, opts.since.as_deref(), opts.max_count)
     }
 
     /// Find files matching a glob or substring pattern.

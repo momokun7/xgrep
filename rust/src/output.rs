@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 
+use crate::history::{CommitMatch, DiffMatch};
 use crate::search::SearchResult;
 
 /// Default maximum characters shown per line in LLM output (`--format llm`, MCP).
@@ -759,6 +760,206 @@ pub fn format_llm(
         ..LlmOptions::default()
     };
     Ok(format_llm_with(results, root, &opts))
+}
+
+// ---------------------------------------------------------------------------
+// Git history results (`--in-diff`, `--log`)
+// ---------------------------------------------------------------------------
+
+/// Write diff matches as `path:+N:text` (added, new-file line number) or
+/// `path:-N:text` (removed, old-file line number).
+pub fn write_diff_default<W: Write>(
+    w: &mut W,
+    matches: &[DiffMatch],
+    root: &Path,
+    opts: &TextOptions,
+) -> io::Result<()> {
+    for m in matches {
+        writeln!(
+            w,
+            "{}:{}{}:{}",
+            display_path(root, &m.file, opts.absolute_paths),
+            m.side.marker(),
+            m.line_number,
+            truncate_line_at(&m.line, opts.max_columns, Some(m.column))
+        )?;
+    }
+    Ok(())
+}
+
+/// Write diff matches as JSON Lines: `{"type":"diff","file":..,"side":
+/// "added"|"removed","line_number":..,"column":..,"line":..}` per line, then
+/// a summary object.
+pub fn write_diff_json<W: Write>(
+    w: &mut W,
+    matches: &[DiffMatch],
+    root: &Path,
+    absolute_paths: bool,
+    truncated: bool,
+) -> io::Result<()> {
+    let mut files = std::collections::HashSet::new();
+    for m in matches {
+        files.insert(&m.file);
+        w.write_all(b"{\"type\":\"diff\",\"file\":")?;
+        serde_json::to_writer(&mut *w, &*display_path(root, &m.file, absolute_paths))?;
+        write!(
+            w,
+            ",\"side\":\"{}\",\"line_number\":{},\"column\":{},\"line\":",
+            m.side.as_str(),
+            m.line_number,
+            m.column + 1
+        )?;
+        serde_json::to_writer(&mut *w, &m.line)?;
+        w.write_all(b"}\n")?;
+    }
+    writeln!(
+        w,
+        "{{\"type\":\"summary\",\"total_matches\":{},\"total_files\":{},\"truncated\":{}}}",
+        matches.len(),
+        files.len(),
+        truncated
+    )
+}
+
+/// Write diff matches as Markdown for LLMs: one `diff` block per file with
+/// `+N` / `-N` prefixed lines.
+pub fn write_diff_llm<W: Write>(
+    w: &mut W,
+    matches: &[DiffMatch],
+    root: &Path,
+    opts: &LlmOptions,
+) -> io::Result<()> {
+    let mut i = 0;
+    let mut first = true;
+    while i < matches.len() {
+        let file = &matches[i].file;
+        let end = matches[i..]
+            .iter()
+            .position(|m| m.file != *file)
+            .map_or(matches.len(), |p| i + p);
+        let group = &matches[i..end];
+        let lines: Vec<String> = group
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}{} {}",
+                    m.side.marker(),
+                    m.line_number,
+                    truncate_line_at(&m.line, opts.max_line_chars, Some(m.column))
+                )
+            })
+            .collect();
+        let fence_len = lines
+            .iter()
+            .map(|l| longest_backtick_run(l) + 1)
+            .max()
+            .unwrap_or(0)
+            .max(3);
+        let fence = "`".repeat(fence_len);
+        if !first {
+            w.write_all(b"\n")?;
+        }
+        first = false;
+        writeln!(
+            w,
+            "## {} (diff)\n\n{}diff",
+            display_path(root, file, opts.absolute_paths),
+            fence
+        )?;
+        for l in &lines {
+            writeln!(w, "{}", l)?;
+        }
+        writeln!(w, "{}", fence)?;
+        i = end;
+    }
+    Ok(())
+}
+
+/// Write commit matches as `<hash10> <YYYY-MM-DD> <subject>`; a body match adds an
+/// indented `L<n>: <line>` row.
+pub fn write_commits_default<W: Write>(
+    w: &mut W,
+    commits: &[CommitMatch],
+    opts: &TextOptions,
+) -> io::Result<()> {
+    for c in commits {
+        writeln!(
+            w,
+            "{} {} {}",
+            short_hash(&c.hash),
+            c.date.get(..10).unwrap_or(&c.date),
+            truncate_line(&c.subject, opts.max_columns)
+        )?;
+        if c.line_number > 1 {
+            writeln!(
+                w,
+                "    L{}: {}",
+                c.line_number,
+                truncate_line_at(&c.line, opts.max_columns, Some(c.column))
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Write commit matches as JSON Lines (`{"type":"commit",...}`), then a
+/// summary object.
+pub fn write_commits_json<W: Write>(
+    w: &mut W,
+    commits: &[CommitMatch],
+    truncated: bool,
+) -> io::Result<()> {
+    for c in commits {
+        let obj = serde_json::json!({
+            "type": "commit",
+            "hash": c.hash,
+            "date": c.date,
+            "author": c.author,
+            "subject": c.subject,
+            "line_number": c.line_number,
+            "column": c.column + 1,
+            "line": c.line,
+        });
+        serde_json::to_writer(&mut *w, &obj)?;
+        w.write_all(b"\n")?;
+    }
+    writeln!(
+        w,
+        "{{\"type\":\"summary\",\"total_matches\":{},\"truncated\":{}}}",
+        commits.len(),
+        truncated
+    )
+}
+
+/// Write commit matches as a Markdown list for LLMs.
+pub fn write_commits_llm<W: Write>(
+    w: &mut W,
+    commits: &[CommitMatch],
+    opts: &LlmOptions,
+) -> io::Result<()> {
+    for c in commits {
+        writeln!(
+            w,
+            "- `{}` {} {}: {}",
+            short_hash(&c.hash),
+            c.date.get(..10).unwrap_or(&c.date),
+            c.author,
+            truncate_line(&c.subject, opts.max_line_chars)
+        )?;
+        if c.line_number > 1 {
+            writeln!(
+                w,
+                "  - L{}: {}",
+                c.line_number,
+                truncate_line_at(&c.line, opts.max_line_chars, Some(c.column))
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn short_hash(hash: &str) -> &str {
+    hash.get(..10).unwrap_or(hash)
 }
 
 #[cfg(test)]
@@ -1595,5 +1796,66 @@ mod tests {
         }
         jw.finish(&mut streamed, true).unwrap();
         assert_eq!(batch, streamed);
+    }
+
+    #[test]
+    fn test_diff_and_commit_writers() {
+        use crate::history::DiffSide;
+        let diffs = vec![
+            DiffMatch {
+                file: "a.rs".into(),
+                side: DiffSide::Removed,
+                line_number: 3,
+                line: "old foo".into(),
+                column: 4,
+            },
+            DiffMatch {
+                file: "a.rs".into(),
+                side: DiffSide::Added,
+                line_number: 4,
+                line: "new foo".into(),
+                column: 4,
+            },
+        ];
+        let mut buf = Vec::new();
+        write_diff_default(&mut buf, &diffs, Path::new(""), &TextOptions::default()).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "a.rs:-3:old foo\na.rs:+4:new foo\n"
+        );
+        let mut buf = Vec::new();
+        write_diff_json(&mut buf, &diffs, Path::new(""), false, false).unwrap();
+        let parsed = parse_ndjson(&String::from_utf8(buf).unwrap());
+        assert_eq!(parsed[0]["side"], "removed");
+        assert_eq!(parsed[1]["column"], 5);
+        assert_eq!(parsed[2]["total_files"], 1);
+        let mut buf = Vec::new();
+        write_diff_llm(&mut buf, &diffs, Path::new(""), &LlmOptions::default()).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "## a.rs (diff)\n\n```diff\n-3 old foo\n+4 new foo\n```\n"
+        );
+
+        let commits = vec![CommitMatch {
+            hash: "0123456789abcdef".into(),
+            date: "2026-10-17T10:00:00+09:00".into(),
+            author: "A".into(),
+            subject: "fix: thing".into(),
+            line_number: 3,
+            line: "body foo".into(),
+            column: 5,
+        }];
+        let mut buf = Vec::new();
+        write_commits_default(&mut buf, &commits, &TextOptions::default()).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "0123456789 2026-10-17 fix: thing\n    L3: body foo\n"
+        );
+        let mut buf = Vec::new();
+        write_commits_json(&mut buf, &commits, false).unwrap();
+        let parsed = parse_ndjson(&String::from_utf8(buf).unwrap());
+        assert_eq!(parsed[0]["hash"], "0123456789abcdef");
+        assert_eq!(parsed[0]["column"], 6);
+        assert_eq!(parsed[1]["total_matches"], 1);
     }
 }
