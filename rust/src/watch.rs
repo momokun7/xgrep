@@ -610,10 +610,12 @@ fn setup_watcher(
                 shared.lock().fence_ready = true;
             }
         }
-        #[cfg(test)]
-        if shared.cfg.fail_setup {
-            return Err(notify::Error::generic("injected setup failure"));
-        }
+    }
+    #[cfg(test)]
+    if shared.cfg.fail_setup {
+        return Err(notify::Error::generic("injected setup failure"));
+    }
+    if PER_DIR_WATCHES {
         for d in watchable_dirs(&shared.root) {
             watcher.watch(&d, RecursiveMode::NonRecursive)?;
         }
@@ -1171,6 +1173,10 @@ mod tests {
         assert!(xg.wait_for_watcher(TIMEOUT));
         fs::write(root.join("b.rs"), "fn b_sym() {}\n").unwrap();
         assert!(poll(|| !dirty(&xg).is_empty()));
+        // Let trailing events for the write (create, then modify) arrive:
+        // one landing after the build starts is kept dirty, which is safe
+        // but would fail the assertion below on a slow CI runner.
+        std::thread::sleep(Duration::from_millis(500));
         // An explicit build covers the change and clears the dirty set.
         xg.build_index().unwrap();
         assert!(dirty(&xg).is_empty());
