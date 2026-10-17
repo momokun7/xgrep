@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.1](https://github.com/momokun7/xgrep/compare/v0.8.0...v0.8.1) (2026-10-17)
+
+
+### Features
+
+* **cli:** search standard input and exit quietly on a closed pipe ([7de219e](https://github.com/momokun7/xgrep/commit/7de219e35e16882dca7e94079d56a369ed20bd35))
+* **cli:** search standard input and exit quietly on a closed pipe ([27b594d](https://github.com/momokun7/xgrep/commit/27b594d28eca8184a05bd48d4cb2758d8a42428d))
+
+
+### Bug Fixes
+
+* **cli:** search the directory when piped standard input is empty ([0f560df](https://github.com/momokun7/xgrep/commit/0f560dfc4bdf327f9ec0695f4f1d0f0610c0db20))
+
 ## [0.8.0](https://github.com/momokun7/xgrep/compare/v0.7.0...v0.8.0) (2026-10-17)
 
 
