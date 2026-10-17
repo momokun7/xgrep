@@ -76,57 +76,21 @@ pub(crate) fn resolve_regex_candidates(
     case_insensitive: bool,
     quiet: bool,
 ) -> Vec<u32> {
-    if case_insensitive {
-        let query = trigram_query::regex_to_query(pattern);
-        if query.is_all() && !quiet {
-            eprintln!(
-                "xgrep: warning: regex '{}' cannot be optimized with trigram index (full scan)",
-                pattern
-            );
-        }
-        let query = expand_case_variants_query(query);
-        query.evaluate(reader)
-    } else {
-        let query = trigram_query::regex_to_query(pattern);
-        if query.is_all() && !quiet {
-            eprintln!(
-                "xgrep: warning: regex '{}' cannot be optimized with trigram index (full scan)",
-                pattern
-            );
-        }
-        query.evaluate(reader)
+    // Case folding is expanded inside the query (Unicode simple folding,
+    // matching the regex engine), so `(?i)` and `[Hh]` still use the index.
+    let query = trigram_query::regex_to_query_with(pattern, case_insensitive);
+    if query.is_all() && !quiet {
+        eprintln!(
+            "xgrep: warning: regex '{}' cannot be optimized with trigram index (full scan)",
+            pattern
+        );
     }
+    query.evaluate(reader)
 }
 
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Expand each Trigram node in a TrigramQuery tree into case variants.
-fn expand_case_variants_query(query: trigram_query::TrigramQuery) -> trigram_query::TrigramQuery {
-    match query {
-        trigram_query::TrigramQuery::Trigram(t) => {
-            let variants = case_variants(t);
-            if variants.len() == 1 {
-                trigram_query::TrigramQuery::Trigram(variants[0])
-            } else {
-                trigram_query::TrigramQuery::Or(
-                    variants
-                        .into_iter()
-                        .map(trigram_query::TrigramQuery::Trigram)
-                        .collect(),
-                )
-            }
-        }
-        trigram_query::TrigramQuery::And(qs) => trigram_query::TrigramQuery::And(
-            qs.into_iter().map(expand_case_variants_query).collect(),
-        ),
-        trigram_query::TrigramQuery::Or(qs) => trigram_query::TrigramQuery::Or(
-            qs.into_iter().map(expand_case_variants_query).collect(),
-        ),
-        other => other,
-    }
-}
 
 /// Generate upper/lowercase variants for each ASCII byte in a trigram.
 /// Up to 8 variants (when all 3 bytes are ASCII letters).
