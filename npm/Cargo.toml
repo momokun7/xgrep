@@ -10,12 +10,12 @@ crate-type = ["cdylib"]
 [dependencies]
 # Without the tree-sitter `syntax` feature: keeps cross builds C-compiler free.
 xgrep-search = { path = "../rust", default-features = false }
-napi = { version = "2", features = ["napi4"] }
-napi-derive = "2"
+napi = { version = "3", features = ["napi4"] }
+napi-derive = "3"
 anyhow = "1"
 
 [build-dependencies]
-napi-build = "2"
+napi-build = "2.6"
 
 [profile.release]
 lto = true
