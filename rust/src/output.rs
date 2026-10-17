@@ -227,25 +227,28 @@ pub fn format_default_context(
             file.to_string()
         };
 
-        let mut ranges: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
         for &ln in matches.keys() {
             let start = ln.saturating_sub(before_context).max(1);
             let end = (ln + after_context).min(total_lines).max(ln);
             if let Some(last) = ranges.last_mut() {
                 if start <= last.1 + 1 {
                     last.1 = last.1.max(end);
-                    last.2.push(ln);
                     continue;
                 }
             }
-            ranges.push((start, end, vec![ln]));
+            ranges.push((start, end));
         }
 
-        for (start, end, match_lines) in ranges {
+        for (start, end) in ranges {
             let mut block = String::new();
+            // Both the lines and the match keys ascend, so walk them together
+            // instead of searching the match list for every line.
+            let mut match_cursor = matches.range(start..=end).map(|(&k, _)| k).peekable();
             for i in start..=end {
+                let is_match = match_cursor.next_if_eq(&i).is_some();
                 if let Some(text) = line_text(&lines, matches, i) {
-                    if match_lines.contains(&i) {
+                    if is_match {
                         block.push_str(&format!("{}:{}:{}\n", display_path, i, text));
                     } else {
                         block.push_str(&format!("{}-{}-{}\n", display_path, i, text));
@@ -455,6 +458,53 @@ mod tests {
         let ctx = format_default_context(&results, root, 1, 1, false).unwrap();
         assert!(ctx.contains("gone.rs:5:hit in deleted file"));
         assert!(ctx.contains("ok.rs-1-a"));
+    }
+
+    #[test]
+    fn test_format_default_context_many_matches_is_linear() {
+        // 200k matching lines used to take seconds with -C 1 (O(n^2) lookup).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let n = 200_000;
+        let content: String = (1..=n).map(|i| format!("m{}\n", i)).collect();
+        fs::write(root.join("big.txt"), content).unwrap();
+        let results: Vec<SearchResult> = (1..=n)
+            .map(|i| SearchResult {
+                file: "big.txt".into(),
+                line_number: i,
+                line: format!("m{}", i),
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let output = format_default_context(&results, root, 1, 1, false).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(output.lines().count(), n);
+        assert!(output.lines().all(|l| l.starts_with("big.txt:")));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "context output too slow: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_format_default_context_marks_only_matches() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("t.rs"), "a\nm\nb\nc\nm\nd\n").unwrap();
+        let results: Vec<SearchResult> = [2, 5]
+            .iter()
+            .map(|&i| SearchResult {
+                file: "t.rs".into(),
+                line_number: i,
+                line: "m".to_string(),
+            })
+            .collect();
+        let output = format_default_context(&results, root, 1, 1, false).unwrap();
+        assert_eq!(
+            output,
+            "t.rs-1-a\nt.rs:2:m\nt.rs-3-b\nt.rs-4-c\nt.rs:5:m\nt.rs-6-d"
+        );
     }
 
     #[test]
