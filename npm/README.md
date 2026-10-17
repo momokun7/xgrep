@@ -41,8 +41,9 @@ const filtered = xg.search('TODO', {
 // Regex search
 const regexResults = xg.search('fn\\s+\\w+', { regex: true });
 
-// Index status
-console.log(xg.indexStatus());
+// Index status: { state: 'fresh' | 'stale' | 'missing', indexedFiles, ... }
+const status = xg.indexStatus();
+console.log(status.state, status.indexedFiles);
 ```
 
 ## API
@@ -74,7 +75,9 @@ Search for a pattern in the indexed codebase.
 | `changedOnly` | `boolean` | `false` | Only search git-changed files |
 | `since` | `string` | - | Files changed within duration (`"1h"`, `"2d"`, `"3.commits"`) |
 | `pathPattern` | `string` | - | Filter by path substring |
-| `fresh` | `boolean` | `false` | Check index freshness before searching |
+| `fresh` | `boolean` | `false` | Run the full freshness check and rebuild the index first if too many files changed (default searches already rescan edited files) |
+| `word` | `boolean` | `false` | Match only at word boundaries |
+| `globs` | `string[]` | - | Include/exclude paths by glob (ripgrep `-g` style; prefix `!` to exclude) |
 
 **SearchResult:**
 
@@ -84,9 +87,19 @@ Search for a pattern in the indexed codebase.
 | `lineNumber` | `number` | Line number (1-based) |
 | `line` | `string` | The matching line content |
 
-### `xg.indexStatus(): string`
+### `xg.indexStatus(): IndexStatus`
 
 Get the current index status.
+
+**IndexStatus:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | `string` | `"fresh"`, `"stale"` or `"missing"` |
+| `changedFiles` | `number` | Files changed since the last build (only when `state` is `"stale"`) |
+| `indexedFiles` | `number` | Files in the index (0 if missing) |
+| `indexSizeBytes` | `number` | Index file size in bytes (0 if missing) |
+| `indexPath` | `string` | Path to the index file |
 
 ### `xg.root: string` (getter)
 

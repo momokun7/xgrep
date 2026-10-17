@@ -57,7 +57,10 @@ export interface SearchOptions {
   since?: string
   /** Filter by path substring. */
   pathPattern?: string
-  /** Check index freshness before searching. */
+  /**
+   * Run the full freshness check and rebuild the index first if too many
+   * files changed. Default searches already rescan edited files.
+   */
   fresh?: boolean
   /**
    * Match only at word boundaries (wraps the pattern in `\b(?:...)\b`).
