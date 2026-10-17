@@ -62,6 +62,18 @@ pub fn tool_result(text: &str, is_error: bool) -> Value {
     })
 }
 
+/// Add `note` to a tool's text: as a `"note"` field when the text is a JSON
+/// object (`index_status`), otherwise as a first line.
+fn with_note(text: String, note: &str) -> String {
+    if text.starts_with('{') {
+        if let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(&text) {
+            m.insert("note".into(), note.into());
+            return Value::Object(m).to_string();
+        }
+    }
+    format!("{}\n{}", note, text)
+}
+
 /// Instructions sent to the client on `initialize`.
 pub const INSTRUCTIONS: &str = "xgrep is an indexed code search engine. Pick the tool by intent: \
 repo_map = ranked overview of the important symbols (start here in an unfamiliar repo); \
@@ -160,6 +172,8 @@ pub fn handle_message_with(xg: &Xgrep, session: &Mutex<Session>, msg: &Message) 
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
+            // Unknown argument names are ignored (with a note), not errors.
+            let (arguments, note) = mcp_tools::strip_unknown_args(tool_name, &arguments);
             let mut session = session.lock().unwrap_or_else(|e| e.into_inner());
             let session = &mut *session;
 
@@ -184,6 +198,10 @@ pub fn handle_message_with(xg: &Xgrep, session: &Mutex<Session>, msg: &Message) 
                         ));
                     }
                 },
+            };
+            let text = match note {
+                Some(note) => with_note(text, &note),
+                None => text,
             };
 
             Some(success_response(id, tool_result(&text, is_error)))
@@ -415,6 +433,63 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Unknown tool"));
+    }
+
+    fn call(xg: &Xgrep, tool: &str, args: Value) -> (String, bool) {
+        let msg = Message {
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: serde_json::json!({"name": tool, "arguments": args}),
+        };
+        let resp = handle_message(xg, &msg).unwrap();
+        (
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            resp["result"]["isError"].as_bool().unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_unknown_arguments_are_ignored_with_note() {
+        let (_dir, xg) = setup_test_repo();
+        let (text, err) = call(
+            &xg,
+            "search",
+            serde_json::json!({"pattern": "hello", "paht": "x", "zzz": 1}),
+        );
+        assert!(!err, "{text}");
+        let first = text.lines().next().unwrap();
+        assert_eq!(
+            first,
+            "note: ignored unknown argument(s): paht (did you mean path_pattern?), zzz"
+        );
+        assert!(text.contains("Found"), "{text}");
+
+        // Inside queries items too.
+        let (text, err) = call(
+            &xg,
+            "search",
+            serde_json::json!({"queries": [{"pattern": "hello", "max_result": 3}]}),
+        );
+        assert!(!err, "{text}");
+        assert!(
+            text.starts_with(
+                "note: ignored unknown argument(s): queries[0].max_result (did you mean max_results?)\n"
+            ),
+            "{text}"
+        );
+
+        // JSON tools get a "note" field instead of a prefix line.
+        let (text, err) = call(&xg, "index_status", serde_json::json!({"verbose": true}));
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["note"], "note: ignored unknown argument(s): verbose");
+
+        // No note when every argument is known.
+        let (text, _) = call(&xg, "search", serde_json::json!({"pattern": "hello"}));
+        assert!(!text.contains("note: ignored"), "{text}");
     }
 
     #[test]

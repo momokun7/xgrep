@@ -418,7 +418,14 @@ fn test_mcp_validation_and_hints() {
     let (t, _) = &out[7];
     assert!(t.contains("3 matches exist outside"), "{t}");
     let (t, e) = &out[8];
-    assert!(*e && t.contains("unknown field `pathpattern`"), "{t}");
+    // Unknown arguments are ignored with a note, not an error.
+    assert!(!*e, "{t}");
+    assert!(
+        t.starts_with(
+            "note: ignored unknown argument(s): pathpattern (did you mean path_pattern?)\n"
+        ),
+        "{t}"
+    );
 }
 
 // ---------------------------------------------------------------------------

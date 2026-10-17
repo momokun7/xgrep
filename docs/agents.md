@@ -101,8 +101,10 @@ Pick the tool by intent:
 | `build_index` | Build or rebuild the search index for the codebase. | none |
 | `session_reset` | Forget which ranges were already returned (see *Session dedup*). | none |
 
-Unknown argument names, unknown `file_type`s and unknown `output_mode`s are
-errors that name the valid choices, instead of being silently ignored.
+Unknown argument names are ignored, and the response starts with a one-line
+`note: ignored unknown argument(s): paht (did you mean path_pattern?)` (a
+`"note"` field for `index_status`). Unknown `file_type`s and unknown
+`output_mode`s are errors that name the valid choices.
 
 The `index_status` JSON lets an agent branch on freshness without parsing prose:
 call `build_index` when `state` is `"missing"`, or proceed directly when `state`
