@@ -53,7 +53,7 @@ fn bench_candidate_resolution(c: &mut Criterion) {
             let results = xg
                 .search("xgrep_unique_target_pattern", &SearchOptions::default())
                 .unwrap();
-            let match_files: HashSet<&str> = results.iter().map(|r| r.file.as_str()).collect();
+            let match_files: HashSet<&str> = results.iter().map(|r| &*r.file).collect();
             criterion::black_box(match_files.len());
         });
     });
@@ -62,7 +62,7 @@ fn bench_candidate_resolution(c: &mut Criterion) {
     let results = xg
         .search("xgrep_unique_target_pattern", &SearchOptions::default())
         .unwrap();
-    let match_files: HashSet<&str> = results.iter().map(|r| r.file.as_str()).collect();
+    let match_files: HashSet<&str> = results.iter().map(|r| &*r.file).collect();
     let total_files = 200;
     let expected_matches = total_files / 10;
     eprintln!(

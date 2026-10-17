@@ -6,6 +6,7 @@ use crate::error::{Result, XgrepError};
 ///
 /// Globs without a path separator also match against any path depth
 /// (`*.rs` behaves like `**/*.rs`), mirroring ripgrep's -g semantics.
+#[derive(Clone)]
 pub(crate) struct GlobFilter {
     includes: Vec<Vec<glob::Pattern>>,
     excludes: Vec<Vec<glob::Pattern>>,

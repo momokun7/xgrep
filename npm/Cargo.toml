@@ -8,7 +8,8 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-xgrep-search = { path = "../rust" }
+# Without the tree-sitter `syntax` feature: keeps cross builds C-compiler free.
+xgrep-search = { path = "../rust", default-features = false }
 napi = { version = "2", features = ["napi4"] }
 napi-derive = "2"
 anyhow = "1"

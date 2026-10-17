@@ -54,6 +54,10 @@ Benchmarked with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple M4, 
 | Index size | 175MB (8%) | 3.0GB (155%) | N/A |
 | Breakeven | ~2 searches | - | - |
 
+> The xgrep numbers above were measured with v0.7 (index format v3). Index format v4 adds a 2-byte
+> mask per posting and a build-only sidecar: on the crates.io registry sources (361MB) the searched
+> index is 48MB (~13%) plus a 22MB sidecar, and builds take ~0.2s on a 28-core machine.
+
 > zoekt numbers are CLI mode. In server mode, zoekt search latency is significantly lower.
 
 ## Reproduce
@@ -98,7 +102,7 @@ xgrep prioritizes simplicity and small index size over search precision.
 
 | Approach | Index size | Precision | Trade-off |
 |----------|-----------|-----------|-----------|
-| **Trigram** (xgrep, zoekt) | ~8% of source | Moderate (false positives) | Simple, small, fast to build |
+| **Trigram** (xgrep, zoekt) | ~10-20% of source | Moderate (false positives) | Simple, small, fast to build |
 | **Suffix array** (Livegrep) | 2-5x source | High | Large index, slow to build |
 | **AST/Symbol** (Searkt, LSP) | Varies | Exact | Language-specific, complex |
 
