@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -26,6 +27,33 @@ pub fn lang_from_ext(ext: &str) -> &'static str {
         "css" => "css",
         "sql" => "sql",
         _ => "",
+    }
+}
+
+/// Read a file for display, never failing on its contents.
+///
+/// Bytes that are not valid UTF-8 are replaced with U+FFFD. Line splitting
+/// happens on `\n` just like the searcher, so line numbers stay aligned.
+/// Returns `None` when the file cannot be read (deleted, permission denied,
+/// ...); callers then fall back to the matched lines carried in the results.
+fn read_display_text(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
+}
+
+/// Return the text of line `n` (1-based): from the file when available,
+/// otherwise from the search result for that line (if it is a match).
+fn line_text<'a>(
+    lines: &[&'a str],
+    matches: &BTreeMap<usize, &'a str>,
+    n: usize,
+) -> Option<&'a str> {
+    match lines.get(n - 1) {
+        Some(l) => Some(l),
+        None => matches.get(&n).copied(),
     }
 }
 
@@ -74,9 +102,12 @@ pub fn format_llm(
     }
 
     // Group by file
-    let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut by_file: BTreeMap<&str, BTreeMap<usize, &str>> = BTreeMap::new();
     for r in results {
-        by_file.entry(&r.file).or_default().push(r.line_number);
+        by_file
+            .entry(&r.file)
+            .or_default()
+            .insert(r.line_number, r.line.as_str());
     }
 
     let mut output = String::new();
@@ -84,9 +115,9 @@ pub fn format_llm(
     let mut files_shown = 0;
     let total_files = by_file.len();
 
-    for (file, line_numbers) in &by_file {
+    for (file, matches) in &by_file {
         let full_path = root.join(file);
-        let content = fs::read_to_string(&full_path)?;
+        let content = read_display_text(&full_path).unwrap_or_default();
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
@@ -104,9 +135,10 @@ pub fn format_llm(
 
         // Calculate context ranges and merge overlapping
         let mut ranges: Vec<(usize, usize)> = Vec::new();
-        for &line_num in line_numbers {
+        for &line_num in matches.keys() {
             let start = line_num.saturating_sub(before_context).max(1);
-            let end = (line_num + after_context).min(total_lines);
+            // Never end before the match itself (file shrank or unreadable).
+            let end = (line_num + after_context).min(total_lines).max(line_num);
 
             if let Some(last) = ranges.last_mut() {
                 if start <= last.1 + 1 {
@@ -131,8 +163,8 @@ pub fn format_llm(
 
             output.push_str(&format!("```{}\n", lang));
             for i in start..=end {
-                if i <= lines.len() {
-                    output.push_str(lines[i - 1]);
+                if let Some(text) = line_text(&lines, matches, i) {
+                    output.push_str(text);
                     output.push('\n');
                 }
             }
@@ -145,11 +177,8 @@ pub fn format_llm(
         if let Some(max) = max_tokens {
             if estimate_tokens(&output) >= max {
                 let remaining_files = total_files - files_shown;
-                let remaining_matches: usize = by_file
-                    .iter()
-                    .skip(files_shown)
-                    .map(|(_, lines)| lines.len())
-                    .sum();
+                let remaining_matches: usize =
+                    by_file.iter().skip(files_shown).map(|(_, m)| m.len()).sum();
                 if remaining_files > 0 || remaining_matches > 0 {
                     output.push_str(&format!(
                         "\n... (truncated, {} more matches in {} more files)\n",
@@ -176,16 +205,19 @@ pub fn format_default_context(
         return Ok(String::new());
     }
 
-    let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut by_file: BTreeMap<&str, BTreeMap<usize, &str>> = BTreeMap::new();
     for r in results {
-        by_file.entry(&r.file).or_default().push(r.line_number);
+        by_file
+            .entry(&r.file)
+            .or_default()
+            .insert(r.line_number, r.line.as_str());
     }
 
     let mut parts: Vec<String> = Vec::new();
 
-    for (file, line_numbers) in &by_file {
+    for (file, matches) in &by_file {
         let full_path = root.join(file);
-        let content = fs::read_to_string(&full_path)?;
+        let content = read_display_text(&full_path).unwrap_or_default();
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
@@ -196,9 +228,9 @@ pub fn format_default_context(
         };
 
         let mut ranges: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-        for &ln in line_numbers {
+        for &ln in matches.keys() {
             let start = ln.saturating_sub(before_context).max(1);
-            let end = (ln + after_context).min(total_lines);
+            let end = (ln + after_context).min(total_lines).max(ln);
             if let Some(last) = ranges.last_mut() {
                 if start <= last.1 + 1 {
                     last.1 = last.1.max(end);
@@ -212,11 +244,11 @@ pub fn format_default_context(
         for (start, end, match_lines) in ranges {
             let mut block = String::new();
             for i in start..=end {
-                if i <= lines.len() {
+                if let Some(text) = line_text(&lines, matches, i) {
                     if match_lines.contains(&i) {
-                        block.push_str(&format!("{}:{}:{}\n", display_path, i, lines[i - 1]));
+                        block.push_str(&format!("{}:{}:{}\n", display_path, i, text));
                     } else {
-                        block.push_str(&format!("{}-{}-{}\n", display_path, i, lines[i - 1]));
+                        block.push_str(&format!("{}-{}-{}\n", display_path, i, text));
                     }
                 }
             }
@@ -379,6 +411,50 @@ mod tests {
         assert!(output.contains("test.rs-2-line2")); // context line uses -
         assert!(output.contains("test.rs:3:match_line")); // match line uses :
         assert!(output.contains("test.rs-4-line4")); // context line uses -
+    }
+
+    #[test]
+    fn test_context_output_non_utf8_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("bin.rs"), b"ok1\n\xff\xfe target \xc3\n ok3\n").unwrap();
+        let results = vec![SearchResult {
+            file: "bin.rs".into(),
+            line_number: 2,
+            line: "\u{fffd}\u{fffd} target \u{fffd}".to_string(),
+        }];
+        let llm = format_llm(&results, root, 1, 1, None, false).unwrap();
+        assert!(llm.contains("ok1"));
+        assert!(llm.contains("\u{fffd}\u{fffd} target \u{fffd}"));
+        assert!(llm.contains("ok3"));
+        let ctx = format_default_context(&results, root, 1, 1, false).unwrap();
+        assert!(ctx.contains("bin.rs-1-ok1"));
+        assert!(ctx.contains("bin.rs:2:\u{fffd}\u{fffd} target \u{fffd}"));
+    }
+
+    #[test]
+    fn test_context_output_unreadable_file_falls_back_to_matches() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("ok.rs"), "a\nhit\nb\n").unwrap();
+        let results = vec![
+            SearchResult {
+                file: "gone.rs".into(),
+                line_number: 5,
+                line: "hit in deleted file".to_string(),
+            },
+            SearchResult {
+                file: "ok.rs".into(),
+                line_number: 2,
+                line: "hit".to_string(),
+            },
+        ];
+        let llm = format_llm(&results, root, 1, 1, None, false).unwrap();
+        assert!(llm.contains("hit in deleted file"));
+        assert!(llm.contains("## ok.rs:1-3"));
+        let ctx = format_default_context(&results, root, 1, 1, false).unwrap();
+        assert!(ctx.contains("gone.rs:5:hit in deleted file"));
+        assert!(ctx.contains("ok.rs-1-a"));
     }
 
     #[test]
