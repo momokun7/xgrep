@@ -285,19 +285,45 @@ pub fn format_default_context(
     render_to_string(|buf| write_default_context(buf, results, root, &opts))
 }
 
-/// Format output as JSON.
+/// Write results as JSON Lines (NDJSON): one object per matched line,
+///
+/// `{"type":"match","file":"src/a.rs","line_number":3,"line":"..."}`
+///
+/// followed by one summary object:
+///
+/// `{"type":"summary","total_matches":N,"total_files":M,"truncated":false}`
+///
+/// `truncated` tells whether the results were cut short by a result limit.
+/// Objects are written directly, without building a JSON tree in memory.
+pub fn write_json_lines<W: Write>(
+    w: &mut W,
+    results: &[SearchResult],
+    root: &Path,
+    absolute_paths: bool,
+    truncated: bool,
+) -> io::Result<()> {
+    let mut files: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for r in results {
+        files.insert(&r.file);
+        w.write_all(b"{\"type\":\"match\",\"file\":")?;
+        serde_json::to_writer(&mut *w, &*display_path(root, &r.file, absolute_paths))?;
+        write!(w, ",\"line_number\":{},\"line\":", r.line_number)?;
+        serde_json::to_writer(&mut *w, &r.line)?;
+        w.write_all(b"}\n")?;
+    }
+    writeln!(
+        w,
+        "{{\"type\":\"summary\",\"total_matches\":{},\"total_files\":{},\"truncated\":{}}}",
+        results.len(),
+        files.len(),
+        truncated
+    )
+}
+
+/// Format output as JSON Lines (see [`write_json_lines`]).
 pub fn format_json(results: &[SearchResult]) -> String {
-    let json_results: Vec<serde_json::Value> = results
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "file": &*r.file,
-                "line_number": r.line_number,
-                "line": r.line
-            })
-        })
-        .collect();
-    serde_json::to_string_pretty(&json_results).unwrap_or_else(|_| "[]".to_string())
+    render_to_string(|buf| write_json_lines(buf, results, Path::new(""), false, false))
+        .unwrap_or_default()
 }
 
 /// Estimate token count. ASCII ~4 bytes/token, non-ASCII (CJK etc.) ~2 bytes/token.
@@ -561,17 +587,56 @@ mod tests {
             line: "fn handle_auth() {}".to_string(),
         }];
         let json = format_json(&results);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsed = parse_ndjson(&json);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["type"], "match");
         assert_eq!(parsed[0]["file"], "src/main.rs");
         assert_eq!(parsed[0]["line_number"], 42);
         assert_eq!(parsed[0]["line"], "fn handle_auth() {}");
+        assert_eq!(parsed[1]["type"], "summary");
+        assert_eq!(parsed[1]["total_matches"], 1);
+        assert_eq!(parsed[1]["total_files"], 1);
+        assert_eq!(parsed[1]["truncated"], false);
+    }
+
+    fn parse_ndjson(s: &str) -> Vec<serde_json::Value> {
+        s.lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{}: {}", e, l)))
+            .collect()
     }
 
     #[test]
     fn test_format_json_empty() {
         let json = format_json(&[]);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.as_array().unwrap().is_empty());
+        let parsed = parse_ndjson(&json);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["type"], "summary");
+        assert_eq!(parsed[0]["total_matches"], 0);
+    }
+
+    #[test]
+    fn test_write_json_lines_escaping_absolute_and_truncated() {
+        let results = vec![
+            result("a \"q\".rs", 1, "tab\there \\ \"quoted\" \u{1} ünï"),
+            result("a \"q\".rs", 2, "second"),
+        ];
+        let mut buf = Vec::new();
+        write_json_lines(&mut buf, &results, Path::new("/root"), true, true).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.ends_with('\n'));
+        let parsed = parse_ndjson(&text);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(
+            parsed[0]["file"],
+            Path::new("/root")
+                .join("a \"q\".rs")
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(parsed[0]["line"], "tab\there \\ \"quoted\" \u{1} ünï");
+        assert_eq!(parsed[2]["total_matches"], 2);
+        assert_eq!(parsed[2]["total_files"], 1);
+        assert_eq!(parsed[2]["truncated"], true);
     }
 
     #[test]
@@ -589,9 +654,10 @@ mod tests {
             },
         ];
         let json = format_json(&results);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        let parsed = parse_ndjson(&json);
+        assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[1]["file"], "b.rs");
+        assert_eq!(parsed[2]["total_files"], 2);
     }
 
     #[test]

@@ -88,6 +88,39 @@ fn test_max_tokens_requires_llm_format() {
 }
 
 #[test]
+fn test_json_output_is_ndjson_with_summary() {
+    let (dir, cache) = setup(&[
+        ("a.txt", b"needle one\nnope\nneedle two\n"),
+        ("b.txt", b"needle \"three\"\n"),
+    ]);
+    let o = xg(dir.path(), cache.path(), &["--json", "needle"]);
+    assert!(o.status.success(), "{:?}", o);
+    let lines: Vec<serde_json::Value> = stdout(&o)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+        .collect();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[0]["type"], "match");
+    assert_eq!(lines[0]["file"], "a.txt");
+    assert_eq!(lines[1]["line_number"], 3);
+    assert_eq!(lines[1]["line"], "needle two");
+    assert_eq!(lines[2]["line"], "needle \"three\"");
+    assert_eq!(lines[3]["type"], "summary");
+    assert_eq!(lines[3]["total_matches"], 3);
+    assert_eq!(lines[3]["total_files"], 2);
+    assert_eq!(lines[3]["truncated"], false);
+
+    let o = xg(
+        dir.path(),
+        cache.path(),
+        &["--json", "--max-count", "2", "needle"],
+    );
+    let last: serde_json::Value = serde_json::from_str(stdout(&o).lines().last().unwrap()).unwrap();
+    assert_eq!(last["total_matches"], 2);
+    assert_eq!(last["truncated"], true);
+}
+
+#[test]
 fn test_max_columns() {
     let long = format!("needle{}\n", "z".repeat(1000));
     let (dir, cache) = setup(&[("long.txt", long.as_bytes())]);

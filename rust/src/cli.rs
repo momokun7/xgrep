@@ -86,7 +86,8 @@ struct Cli {
     #[arg(long)]
     max_count: Option<usize>,
 
-    /// Output as JSON
+    /// Output as JSON Lines: one {"type":"match",...} object per matching
+    /// line, then a {"type":"summary",...} object (with --find: a JSON array)
     #[arg(long = "json")]
     json_output: bool,
 
@@ -428,6 +429,9 @@ fn run() -> Result<()> {
                 }
             };
 
+            // The search stopped at --max-count, so there may be more matches.
+            let hit_max_count = cli.max_count.is_some_and(|m| results.len() >= m);
+
             // Apply --exclude filter
             let results = if cli.exclude.is_empty() {
                 results
@@ -479,19 +483,7 @@ fn run() -> Result<()> {
                     }
                 }
             } else if cli.json_output {
-                if use_absolute {
-                    let abs_results: Vec<_> = results
-                        .iter()
-                        .map(|r| crate::SearchResult {
-                            file: make_path(&r.file).into(),
-                            line_number: r.line_number,
-                            line: r.line.clone(),
-                        })
-                        .collect();
-                    writeln!(out, "{}", output::format_json(&abs_results))?;
-                } else {
-                    writeln!(out, "{}", output::format_json(&results))?;
-                }
+                output::write_json_lines(&mut out, &results, &dir, use_absolute, hit_max_count)?;
             } else if cli.format == "llm" {
                 let base = cli.context.unwrap_or_else(|| {
                     std::env::var("XGREP_LLM_CONTEXT")

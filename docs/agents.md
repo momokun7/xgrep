@@ -9,7 +9,16 @@ natively instead of re-scanning it on every query.
 
 ```bash
 xg "pattern" /path --format llm   # Markdown output sized for context windows
+xg "pattern" /path --format llm --max-tokens 4000   # stop at ~4000 tokens
 ```
+
+- **`--format llm` layout:** one `## path:start-end` block per match group;
+  each line is prefixed by its number, with `>` on matched lines
+  (`181> ...`) and a space on context lines (`178  ...`). Lines over 300
+  characters are cut with `…[+N chars]` (change with `--max-columns`, `0` = off).
+  `--max-tokens` is unlimited by default for the CLI.
+- **`--json`** prints JSON Lines: `{"type":"match","file",...,"line_number",...,"line",...}`
+  per matching line, then `{"type":"summary","total_matches",...,"total_files",...,"truncated",...}`.
 
 - **Exit codes:** `0` = matches found, `1` = no matches (not an error), `2` = error.
 - **Path argument is optional.** Omit it to search the current directory, or pass
