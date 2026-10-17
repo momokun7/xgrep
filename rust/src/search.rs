@@ -656,7 +656,7 @@ pub(crate) fn file_targets<'a>(files: &'a [PathBuf], filter: &ScanFilter) -> Vec
         .iter()
         .map(|p| Target {
             path: Cow::Borrowed(p.as_path()),
-            name: p.to_string_lossy(),
+            name: Cow::Owned(crate::index::rel_key(p)),
             skip_binary: true,
         })
         .filter(|t| !filter.has_path_filter() || filter.accepts(&t.name))

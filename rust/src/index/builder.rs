@@ -472,15 +472,16 @@ fn walk_corpus(root: &Path, lock_path: &Path) -> Vec<WalkEntry> {
                 let Ok(rel) = path.strip_prefix(root) else {
                     return WalkState::Continue;
                 };
-                let Some(rel) = rel.to_str() else {
+                if rel.to_str().is_none() {
                     debug_log!("skipping file with non-UTF-8 path: {}", path.display());
                     return WalkState::Continue;
-                };
+                }
+                let rel = crate::index::rel_key(rel);
                 let Ok(meta) = entry.metadata() else {
                     return WalkState::Continue;
                 };
                 sink.local.push(WalkEntry {
-                    rel: rel.to_owned(),
+                    rel,
                     stat: FileStat::from_metadata(&meta),
                 });
                 WalkState::Continue

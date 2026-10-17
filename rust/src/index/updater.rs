@@ -795,10 +795,7 @@ pub(crate) fn is_index_sidecar(root: &Path, index_path: &Path, rel: &Path) -> bo
 
 /// Lookup key matching how the builder stores paths in the index.
 pub(crate) fn index_key(rel: &Path) -> String {
-    rel.iter()
-        .collect::<PathBuf>()
-        .to_string_lossy()
-        .into_owned()
+    crate::index::rel_key(rel)
 }
 
 // --- stat helpers ----------------------------------------------------------
@@ -1203,7 +1200,7 @@ fn walk_new_files(
     for d in &changed_dirs {
         let mut cur = Path::new(d.as_str()).parent();
         while let Some(a) = cur {
-            if !ancestors.insert(a.to_string_lossy().into_owned()) {
+            if !ancestors.insert(index_key(a)) {
                 break;
             }
             cur = a.parent();
@@ -1225,21 +1222,21 @@ fn walk_new_files(
             let Ok(rel) = e.path().strip_prefix(&root_owned) else {
                 return true;
             };
-            let rel_s = rel.to_string_lossy();
+            let rel_s = index_key(rel);
             if rel_s.is_empty() {
                 return true;
             }
             let is_dir = e.file_type().is_some_and(|t| t.is_dir());
-            if is_dir && known.contains(rel_s.as_ref()) {
-                return ancestors.contains(rel_s.as_ref()) || changed_dirs.contains(rel_s.as_ref());
+            if is_dir && known.contains(rel_s.as_str()) {
+                return ancestors.contains(rel_s.as_str()) || changed_dirs.contains(rel_s.as_str());
             }
             // Unknown dir or a file: include only if its nearest known
             // ancestor directory was modified since the build.
             let mut cur = rel.parent();
             while let Some(a) = cur {
-                let a_s = a.to_string_lossy();
-                if known.contains(a_s.as_ref()) {
-                    return changed_dirs.contains(a_s.as_ref());
+                let a_s = index_key(a);
+                if known.contains(a_s.as_str()) {
+                    return changed_dirs.contains(a_s.as_str());
                 }
                 cur = a.parent();
             }
@@ -1256,7 +1253,7 @@ fn walk_new_files(
         let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
-        if indexed.contains(rel.to_string_lossy().as_ref()) {
+        if indexed.contains(index_key(rel).as_str()) {
             continue;
         }
         out.push(rel.to_path_buf());
