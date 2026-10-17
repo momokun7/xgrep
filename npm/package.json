@@ -18,7 +18,7 @@
     "napi"
   ],
   "author": "nakui",
-  "license": "MIT",
+  "license": "(MIT OR Apache-2.0)",
   "homepage": "https://github.com/momokun7/xgrep",
   "engines": {
     "node": ">= 14"
