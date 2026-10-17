@@ -564,14 +564,8 @@ fn run() -> Result<()> {
                     let hit_max = cli.max_count.is_some_and(|m| diffs.len() >= m);
                     let path = |f: &str| make_display_path(&dir, f, use_absolute);
                     if cli.count {
-                        let mut i = 0;
-                        while i < diffs.len() {
-                            let n = diffs[i..]
-                                .iter()
-                                .take_while(|d| d.file == diffs[i].file)
-                                .count();
-                            writeln!(out, "{}:{}", path(&diffs[i].file), n)?;
-                            i += n;
+                        for (file, n) in diff_counts(&diffs) {
+                            writeln!(out, "{}:{}", path(file), n)?;
                         }
                     } else if cli.files_only {
                         let mut seen = std::collections::HashSet::new();
@@ -777,6 +771,22 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// Matches per file in order of first appearance. Not grouped by runs:
+/// a renamed file alternates old (removed) and new (added) paths across
+/// hunks, so the same path can come back after another one.
+fn diff_counts(diffs: &[crate::DiffMatch]) -> Vec<(&str, usize)> {
+    let mut out: Vec<(&str, usize)> = Vec::new();
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for d in diffs {
+        let i = *index.entry(&d.file).or_insert_with(|| {
+            out.push((&d.file, 0));
+            out.len() - 1
+        });
+        out[i].1 += 1;
+    }
+    out
+}
+
 /// Path as printed: relative to `root`, or joined with it.
 fn make_display_path(root: &Path, rel: &str, absolute: bool) -> String {
     if absolute {
@@ -838,5 +848,38 @@ impl Emitter<'_> {
             Emitter::Llm(lw) => lw.finish(w).map(|_| ()),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DiffMatch, DiffSide};
+
+    fn dm(file: &str, side: DiffSide) -> DiffMatch {
+        DiffMatch {
+            file: Arc::from(file),
+            side,
+            line_number: 1,
+            line: String::new(),
+            column: 0,
+        }
+    }
+
+    #[test]
+    fn diff_counts_aggregates_alternating_rename_paths() {
+        // A renamed file: hunks alternate removed (old path) / added (new path).
+        let diffs = vec![
+            dm("old.rs", DiffSide::Removed),
+            dm("new.rs", DiffSide::Added),
+            dm("old.rs", DiffSide::Removed),
+            dm("new.rs", DiffSide::Added),
+            dm("new.rs", DiffSide::Added),
+            dm("other.rs", DiffSide::Added),
+        ];
+        assert_eq!(
+            diff_counts(&diffs),
+            vec![("old.rs", 2), ("new.rs", 3), ("other.rs", 1)]
+        );
     }
 }
