@@ -1,5 +1,15 @@
 # Security Policy
 
+## Supported Versions
+
+Security fixes are released for the latest minor version of each package:
+the `xgrep-search` crate and PyPI package, and the `xgrep` npm package.
+
+| Version | Supported |
+|---------|-----------|
+| 0.8.x   | Yes       |
+| < 0.8   | No        |
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in xgrep, please report it responsibly.
