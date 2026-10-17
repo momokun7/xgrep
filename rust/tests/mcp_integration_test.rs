@@ -73,7 +73,7 @@ fn test_mcp_initialize_and_search() {
     // tools/list response (notification has no response, so index 1)
     assert_eq!(responses[1]["id"], 2);
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 10);
 
     // search response
     assert_eq!(responses[2]["id"], 3);

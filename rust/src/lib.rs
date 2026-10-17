@@ -40,6 +40,7 @@ pub mod output;
 pub(crate) mod rank;
 pub mod search;
 pub(crate) mod session;
+pub(crate) mod syntax;
 pub(crate) mod trigram;
 pub(crate) mod trigram_query;
 

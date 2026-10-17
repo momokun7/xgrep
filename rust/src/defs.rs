@@ -1,13 +1,15 @@
 //! Symbol definition detection used by the MCP `find_definitions` tool and by
 //! result ranking.
 //!
-//! Detection is behind the [`DefinitionBackend`] trait so the regex heuristics
-//! here can later be swapped for a tree-sitter (tags query) backend without
-//! touching the MCP layer. The flow is:
+//! The flow is:
 //!
 //! 1. [`DefinitionBackend::prefilter`] gives a regex run through the trigram
 //!    index (every line that mentions the symbol as a word).
-//! 2. [`CompiledDefs::classify`] decides, per line and per language, whether the
+//! 2. Candidate files with syntax support (Rust, Python, JS/TS, Go, Java,
+//!    C/C++, Ruby) are parsed with tree-sitter and classified from their tags
+//!    (`crate::syntax::tools::classify_definitions`, cached in `<index>.tags`).
+//! 3. Other files fall back to [`CompiledDefs::classify`], the regex
+//!    heuristics below, which decide per line and per language whether the
 //!    line *defines* the symbol and how confident that is.
 
 use regex::Regex;

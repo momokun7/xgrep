@@ -150,16 +150,19 @@ pub fn handle_message_with(xg: &Xgrep, session: &Mutex<Session>, msg: &Message) 
                 "index_status" => mcp_tools::handle_index_status(xg),
                 "read_file" => mcp_tools::handle_read_file(xg, session, &arguments),
                 "session_reset" => mcp_tools::handle_session_reset(session),
-                _ => {
-                    return Some(error_response(
-                        id,
-                        -32602,
-                        &format!(
-                            "Unknown tool: {}. Available: search, find_definitions, find_files, read_file, index_status, build_index, session_reset",
-                            tool_name
-                        ),
-                    ));
-                }
+                other => match mcp_tools::handle_extra(other, xg, session, &arguments) {
+                    Some(r) => r,
+                    None => {
+                        return Some(error_response(
+                            id,
+                            -32602,
+                            &format!(
+                                "Unknown tool: {}. Available: search, find_definitions, find_references, find_files, outline, repo_map, read_file, index_status, build_index, session_reset",
+                                tool_name
+                            ),
+                        ));
+                    }
+                },
             };
 
             Some(success_response(id, tool_result(&text, is_error)))

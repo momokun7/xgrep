@@ -119,6 +119,17 @@ struct Cli {
     /// Include or exclude files by glob (prefix with ! to exclude; repeatable)
     #[arg(short = 'g', long = "glob", value_name = "GLOB")]
     globs: Vec<String>,
+
+    /// List the symbols of the given file(s) (kind, signature, line range,
+    /// nesting) instead of searching: `xg --outline src/lib.rs`
+    #[arg(long)]
+    outline: bool,
+
+    /// Show each match inside its enclosing block: `block` prints the
+    /// smallest enclosing function/class/impl (tree-sitter), `none` (default)
+    /// prints lines
+    #[arg(long, value_name = "MODE", value_parser = ["none", "block"])]
+    expand: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -241,6 +252,52 @@ fn merge_path_groups(
     (base, merged)
 }
 
+/// `xg --outline FILE...`: symbols of each file without bodies.
+fn print_outlines(files: &[PathBuf]) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut failed = false;
+    for (i, f) in files.iter().enumerate() {
+        let display = f.to_string_lossy().replace('\\', "/");
+        let Some(lang) = crate::syntax::lang_for_path(&display) else {
+            eprintln!(
+                "error: no outline support for '{}'. Supported: {}",
+                display,
+                crate::syntax::supported_languages()
+            );
+            failed = true;
+            continue;
+        };
+        let bytes = match std::fs::read(f) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: cannot read '{}': {}", display, e);
+                failed = true;
+                continue;
+            }
+        };
+        let src = String::from_utf8_lossy(&bytes);
+        let Some(tags) = crate::syntax::tags_for_source(lang, &src) else {
+            eprintln!("error: could not parse '{}'", display);
+            failed = true;
+            continue;
+        };
+        if i > 0 {
+            writeln!(out)?;
+        }
+        write!(
+            out,
+            "{}",
+            crate::syntax::tools::render_outline(&display, lang.name(), &tags, None)
+        )?;
+    }
+    out.flush()?;
+    if failed {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -317,10 +374,24 @@ fn run() -> Result<()> {
                 std::process::exit(2);
             }
 
+            if cli.outline {
+                let mut files: Vec<PathBuf> = cli.pattern.iter().map(PathBuf::from).collect();
+                files.extend(cli.paths.iter().cloned());
+                if files.is_empty() {
+                    anyhow::bail!("--outline needs a file: xg --outline <FILE>...");
+                }
+                return print_outlines(&files);
+            }
+
             let pattern = cli.pattern.unwrap_or_else(|| {
                 eprintln!("Usage: xgrep <pattern> or xgrep init");
                 std::process::exit(2);
             });
+            let expand_block = cli.expand.as_deref() == Some("block");
+            if expand_block && (cli.count || cli.files_only || cli.json_output) {
+                eprintln!("error: --expand block cannot be combined with -c, -l or --json");
+                std::process::exit(2);
+            }
 
             let use_absolute = cli.absolute_paths
                 || std::env::var("XGREP_ABSOLUTE_PATHS")
@@ -548,6 +619,34 @@ fn run() -> Result<()> {
                     if seen.insert(p.clone()) {
                         writeln!(out, "{}", p)?;
                     }
+                }
+            } else if expand_block {
+                let xg = Xgrep::open(&dir)?;
+                let (blocks, _) = crate::syntax::tools::expand_blocks(&xg, &results);
+                let dups = std::collections::HashMap::new();
+                let cfg = crate::mcp_render::RenderCfg {
+                    root: &dir,
+                    before: 0,
+                    after: 0,
+                    max_results: usize::MAX,
+                    offset: 0,
+                    max_tokens: cli.max_tokens.unwrap_or(usize::MAX / 8),
+                    include_seen: true,
+                    highlight: None,
+                    duplicates: &dups,
+                };
+                let page = crate::mcp_render::render_blocks(
+                    &blocks,
+                    &cfg,
+                    &mut crate::session::Session::new(),
+                );
+                write!(out, "{}", page.body)?;
+                if let Some(next) = page.next_offset {
+                    writeln!(
+                        out,
+                        "\n... (truncated at --max-tokens; {} more blocks)",
+                        blocks.len() - next
+                    )?;
                 }
             } else if cli.json_output {
                 output::write_json_lines(&mut out, &results, &dir, use_absolute, hit_max_count)?;

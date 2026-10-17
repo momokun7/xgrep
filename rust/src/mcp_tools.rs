@@ -42,13 +42,13 @@ const MIN_QUERY_TOKENS: usize = 400;
 
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
-enum StrOrList {
+pub(crate) enum StrOrList {
     One(String),
     Many(Vec<String>),
 }
 
 impl StrOrList {
-    fn into_vec(self) -> Vec<String> {
+    pub(crate) fn into_vec(self) -> Vec<String> {
         match self {
             StrOrList::One(s) => vec![s],
             StrOrList::Many(v) => v,
@@ -84,6 +84,7 @@ struct SearchParams {
     fresh: bool,
     #[serde(default)]
     include_seen: bool,
+    expand: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -127,7 +128,7 @@ struct ReadFileParams {
     max_tokens: Option<usize>,
 }
 
-fn parse<T: for<'de> Deserialize<'de>>(params: &Value) -> Result<T, String> {
+pub(crate) fn parse<T: for<'de> Deserialize<'de>>(params: &Value) -> Result<T, String> {
     serde_json::from_value(params.clone()).map_err(|e| format!("Invalid parameters: {}", e))
 }
 
@@ -229,6 +230,11 @@ pub fn tools_list() -> Vec<Value> {
             "type": "integer",
             "description": "Lines of context before and after each match (default 0, max 50). Prefer read_file on a hit when you need more."
         },
+        "expand": {
+            "type": "string",
+            "enum": ["none", "block"],
+            "description": "block: return the smallest enclosing function/method/class/impl of each match (tree-sitter) instead of single lines; matches in the same block are merged and marked with '>'. Long blocks keep the signature and windows around the matches. Pagination then counts blocks. Saves a read_file round-trip."
+        },
         "changed_only": {"type": "boolean", "description": "Only search files with uncommitted git changes."},
         "since": {"type": "string", "description": "Only search files changed within a duration or commit count, e.g. '2h', '3d', '5.commits'."}
     });
@@ -249,6 +255,51 @@ pub fn tools_list() -> Vec<Value> {
         unreachable!()
     };
     let def_props = merged(def_own, vec![filter_props(), paging_props()]);
+
+    let refs_own = serde_json::json!({
+        "symbol": {
+            "type": "string",
+            "description": "Exact identifier (case-sensitive). 'Type::method' / 'obj.method' use the last segment."
+        },
+        "include_definitions": {"type": "boolean", "description": "Also list the definition lines (default false)."},
+        "include_imports": {"type": "boolean", "description": "Also list import/use/include lines (default false)."},
+        "max_results": {"type": "integer", "description": "References per page (default 50)."},
+        "offset": {"type": "integer", "description": "Skip this many ranked references."},
+        "max_tokens": {"type": "integer", "description": "Approximate response budget (default 4000)."},
+        "fresh": {"type": "boolean", "description": "Scan files changed since the last index build directly."}
+    });
+    let Value::Object(refs_own) = refs_own else {
+        unreachable!()
+    };
+    let refs_props = merged(refs_own, vec![filter_props()]);
+
+    let outline_props = serde_json::json!({
+        "path": {
+            "type": ["string", "array"],
+            "items": {"type": "string"},
+            "description": "File (or directory, or a list of them) relative to the project root."
+        },
+        "max_depth": {"type": "integer", "description": "Hide symbols nested deeper than this (0 = top level only). Default: all for files, 0 for directories."},
+        "max_tokens": {"type": "integer", "description": "Approximate response budget (default 4000)."}
+    });
+
+    let map_own = serde_json::json!({
+        "focus": {
+            "type": ["string", "array"],
+            "items": {"type": "string"},
+            "description": "Files or directories to personalize the ranking to (e.g. the files you are editing)."
+        },
+        "focus_symbols": {
+            "type": ["string", "array"],
+            "items": {"type": "string"},
+            "description": "Identifiers to weight up (x10), e.g. names mentioned in the task."
+        },
+        "max_tokens": {"type": "integer", "description": "Token budget for the map (default 1500)."}
+    });
+    let Value::Object(map_own) = map_own else {
+        unreachable!()
+    };
+    let map_props = merged(map_own, vec![filter_props()]);
 
     let mut ff_filters = filter_props();
     ff_filters.remove("path_pattern");
@@ -275,6 +326,21 @@ pub fn tools_list() -> Vec<Value> {
             "name": "find_definitions",
             "description": "Find where a symbol is defined (fn/struct/class/def/func incl. Go receiver methods, C/Java 'type name(', TS/JS class methods and top-level consts, Rust impl blocks and macro_rules!, C #define, Python def/class). Local variables, comment lines and Markdown are excluded; results are ranked source-first. Heuristic (regex per language, not a parser): verify with read_file when it matters. For usages/call sites use search with word:true.",
             "inputSchema": {"type": "object", "properties": def_props, "required": ["symbol"]}
+        }),
+        serde_json::json!({
+            "name": "find_references",
+            "description": "Find usages of an identifier: whole-word, case-sensitive matches with definition lines and import/use/include lines removed, each annotated with the enclosing function ('in Server.handle') so you see the callers. Ranked source, then tests, then docs; the header lists the distinct callers. Uses tree-sitter for Rust, Python, JS/TS, Go, Java, C/C++, Ruby (regex fallback elsewhere). Text-based, not type-aware: same-named symbols are not told apart.",
+            "inputSchema": {"type": "object", "properties": refs_props, "required": ["symbol"]}
+        }),
+        serde_json::json!({
+            "name": "outline",
+            "description": "List the symbols of a file without bodies: kind, signature, line range and nesting (methods under their class/impl). Much cheaper than read_file for getting the shape of a file; then read_file a line range. A directory path outlines every supported file under it (top-level symbols only unless max_depth is set). Markdown files list their headings.",
+            "inputSchema": {"type": "object", "properties": outline_props, "required": ["path"]}
+        }),
+        serde_json::json!({
+            "name": "repo_map",
+            "description": "Aider-style map of the repository: the most important symbols (by PageRank over the cross-file definition/reference graph) with their signatures, grouped by file, within a token budget (default ~1500). Use it first in an unfamiliar codebase. Pass focus (files/directories you are working on) to rank what they use and what uses them; focus_symbols to boost identifiers from the task.",
+            "inputSchema": {"type": "object", "properties": map_props}
         }),
         serde_json::json!({
             "name": "find_files",
@@ -318,15 +384,15 @@ pub fn tools_list() -> Vec<Value> {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct Filters {
-    file_type: Option<String>,
-    path_pattern: Option<String>,
-    globs: Vec<String>,
-    notes: Vec<String>,
+pub(crate) struct Filters {
+    pub(crate) file_type: Option<String>,
+    pub(crate) path_pattern: Option<String>,
+    pub(crate) globs: Vec<String>,
+    pub(crate) notes: Vec<String>,
 }
 
 impl Filters {
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.file_type.is_some() || self.path_pattern.is_some() || !self.globs.is_empty()
     }
 }
@@ -363,7 +429,7 @@ fn looks_like_glob(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[')
 }
 
-fn build_filters(
+pub(crate) fn build_filters(
     file_type: Option<String>,
     path_pattern: Option<String>,
     glob: Option<StrOrList>,
@@ -425,7 +491,7 @@ fn parse_mode(output_mode: Option<&str>, mode: Option<&str>) -> Result<OutputMod
     }
 }
 
-fn check_max_results(v: Option<usize>, default: usize) -> Result<usize, String> {
+pub(crate) fn check_max_results(v: Option<usize>, default: usize) -> Result<usize, String> {
     match v {
         None => Ok(default),
         Some(0) => Err("max_results must be at least 1".to_string()),
@@ -437,6 +503,63 @@ fn is_identifier(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// `Type::method` / `obj.method` / `Class#method` -> `method`; must be an identifier.
+pub(crate) fn normalize_symbol(raw: &str, notes: &mut Vec<String>) -> Result<String, String> {
+    let raw = raw.trim();
+    let symbol = raw
+        .rsplit("::")
+        .next()
+        .unwrap_or(raw)
+        .rsplit(['.', '#'])
+        .next()
+        .unwrap_or(raw)
+        .to_string();
+    if symbol.is_empty() {
+        return Err("symbol must not be empty".to_string());
+    }
+    if symbol != raw {
+        notes.push(format!("symbol '{}' read as '{}'", raw, symbol));
+    }
+    if !is_identifier(&symbol) {
+        return Err(format!(
+            "symbol '{}' is not an identifier; use search (optionally regex:true) for arbitrary text",
+            symbol
+        ));
+    }
+    Ok(symbol)
+}
+
+/// Resolve a project-relative path safely: it must exist, stay inside the
+/// root and not be inside `.git/`. Returns (canonical path, display path
+/// relative to the root with `/` separators; empty for the root itself).
+pub(crate) fn resolve_project_path(
+    xg: &Xgrep,
+    path: &str,
+) -> Result<(std::path::PathBuf, String), String> {
+    let full_path = xg.root().join(path);
+    let canonical = full_path.canonicalize().map_err(|e| {
+        format!(
+            "Cannot read file '{}': {}. Use find_files to locate files by name.",
+            path, e
+        )
+    })?;
+    let root_canonical = xg
+        .root()
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve root: {}", e))?;
+    let Ok(rel) = canonical.strip_prefix(&root_canonical) else {
+        return Err("Error: path traversal detected, file is outside project root".to_string());
+    };
+    if rel.components().any(|c| c.as_os_str() == ".git") {
+        return Err(format!(
+            "Refusing to read '{}': files inside .git/ are not project sources.",
+            path
+        ));
+    }
+    let display = rel.to_string_lossy().replace('\\', "/");
+    Ok((canonical, display))
 }
 
 fn count_files(results: &[SearchResult]) -> usize {
@@ -466,6 +589,8 @@ struct Prepared {
     context: usize,
     max_tokens: usize,
     include_seen: bool,
+    /// `expand: "block"`: return enclosing definitions instead of lines.
+    expand_block: bool,
 }
 
 impl Prepared {
@@ -528,6 +653,19 @@ fn prepare(p: SearchParams) -> Result<Prepared, String> {
     };
     let filters = build_filters(p.file_type, p.path_pattern, p.glob, p.exclude)?;
     let mode = parse_mode(p.output_mode.as_deref(), p.mode.as_deref())?;
+    let expand_block = match p.expand.as_deref() {
+        None | Some("none") | Some("line") => false,
+        Some("block") => true,
+        Some(other) => {
+            return Err(format!(
+                "Unknown expand '{}'. Valid: block (enclosing function/class/impl), none",
+                other
+            ))
+        }
+    };
+    if expand_block && mode != OutputMode::Content {
+        return Err("expand:'block' only applies to output_mode 'content'".to_string());
+    }
     Ok(Prepared {
         pattern,
         regex: p.regex,
@@ -544,6 +682,7 @@ fn prepare(p: SearchParams) -> Result<Prepared, String> {
         context: p.context_lines.unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT),
         max_tokens: p.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(50),
         include_seen: p.include_seen,
+        expand_block,
     })
 }
 
@@ -566,7 +705,7 @@ fn rank_search(results: Vec<SearchResult>, prep: &Prepared) -> Vec<SearchResult>
     rank::order(scored)
 }
 
-fn plural(n: usize, word: &str) -> String {
+pub(crate) fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         format!("{} {}", n, word)
     } else if word.ends_with('h') {
@@ -778,6 +917,9 @@ fn render_search(
     let files = count_files(&results);
     let ranked = rank_search(results, prep);
     let (ranked, dedup) = rank::dedupe_identical(xg.root(), ranked);
+    if prep.expand_block {
+        return render_search_blocks(xg, session, prep, head, &ranked, &dedup, total, files);
+    }
     let page = render_page(
         xg,
         session,
@@ -811,6 +953,55 @@ fn render_search(
         "file"
     };
     head.push_str(&page_line(&page, unit));
+    head.push_str("\n\n");
+    head.push_str(&page.body);
+    (head, false)
+}
+
+/// `search` with `expand:"block"`: one unit per enclosing definition.
+#[allow(clippy::too_many_arguments)]
+fn render_search_blocks(
+    xg: &Xgrep,
+    session: &mut Session,
+    prep: &Prepared,
+    mut head: String,
+    ranked: &[SearchResult],
+    dedup: &rank::Dedup,
+    total: usize,
+    files: usize,
+) -> (String, bool) {
+    let (blocks, syntax_files) = crate::syntax::tools::expand_blocks(xg, ranked);
+    let rc = RenderCfg {
+        root: xg.root(),
+        before: 0,
+        after: 0,
+        max_results: prep.max_results,
+        offset: prep.offset,
+        max_tokens: prep.max_tokens,
+        include_seen: prep.include_seen,
+        highlight: None,
+        duplicates: &dedup.duplicates,
+    };
+    let page = mcp_render::render_blocks(&blocks, &rc, session);
+    head.push_str(&format!(
+        "Found {} in {} for `{}` ({}), grouped into {}: the smallest enclosing function/class/impl{}; ±{} lines where no definition encloses the match. Ranked: definitions and source files first.\n",
+        plural(total, "match"),
+        plural(files, "file"),
+        prep.pattern,
+        prep.case_desc,
+        plural(blocks.len(), "block"),
+        if syntax_files == 0 && !cfg!(feature = "syntax") {
+            " (syntax support not built in: Markdown sections only)"
+        } else {
+            ""
+        },
+        3
+    ));
+    if let Some(d) = dedup_line(dedup) {
+        head.push_str(&d);
+        head.push('\n');
+    }
+    head.push_str(&page_line(&page, "block"));
     head.push_str("\n\n");
     head.push_str(&page.body);
     (head, false)
@@ -935,30 +1126,10 @@ pub fn handle_find_definitions(
         Err(e) => return (e, true),
     };
     let mut notes = Vec::new();
-    let raw = p.symbol.trim();
-    let symbol = raw
-        .rsplit("::")
-        .next()
-        .unwrap_or(raw)
-        .rsplit(['.', '#'])
-        .next()
-        .unwrap_or(raw)
-        .to_string();
-    if symbol.is_empty() {
-        return ("symbol must not be empty".to_string(), true);
-    }
-    if symbol != raw {
-        notes.push(format!("symbol '{}' read as '{}'", raw, symbol));
-    }
-    if !is_identifier(&symbol) {
-        return (
-            format!(
-                "symbol '{}' is not an identifier; use search (optionally regex:true) for arbitrary text",
-                symbol
-            ),
-            true,
-        );
-    }
+    let symbol = match normalize_symbol(&p.symbol, &mut notes) {
+        Ok(s) => s,
+        Err(e) => return (e, true),
+    };
     let filters = match build_filters(p.file_type, p.path_pattern, p.glob, p.exclude) {
         Ok(f) => f,
         Err(e) => return (e, true),
@@ -986,14 +1157,13 @@ pub fn handle_find_definitions(
         Ok(r) => r,
         Err(e) => return (format!("Search error: {}", e), true),
     };
-    let compiled = backend.compile(&symbol, false);
+    let (classified, used) = crate::syntax::tools::classify_definitions(xg, &symbol, candidates);
+    let backend_name = used.describe();
     let q = QueryTerm::new(&symbol, false);
     let mut scored = Vec::new();
-    for r in candidates {
-        if let Some(d) = compiled.classify(&r.file, &r.line) {
-            let score = d.score + rank::path_score(&r.file) + q.filename_bonus(&r.file);
-            scored.push(Scored { result: r, score });
-        }
+    for (r, d) in classified {
+        let score = d.score + rank::path_score(&r.file) + q.filename_bonus(&r.file);
+        scored.push(Scored { result: r, score });
     }
 
     let mut head = String::new();
@@ -1003,8 +1173,7 @@ pub fn handle_find_definitions(
     if scored.is_empty() {
         head.push_str(&format!(
             "No definitions of `{}` found ({} backend; comments, docs and local variables are skipped).\n",
-            symbol,
-            backend.name()
+            symbol, backend_name
         ));
         // Did-you-mean: same symbol with different case.
         let mut ci_opts = opts.clone();
@@ -1061,7 +1230,7 @@ pub fn handle_find_definitions(
         plural(total, "definition"),
         symbol,
         plural(files, "file"),
-        backend.name()
+        backend_name
     ));
     if let Some(d) = dedup_line(&dedup) {
         head.push_str(&d);
@@ -1192,6 +1361,22 @@ pub fn handle_find_files(xg: &Xgrep, params: &Value) -> (String, bool) {
 // ---------------------------------------------------------------------------
 // index tools
 // ---------------------------------------------------------------------------
+
+/// Dispatch the tools added after the original set (`outline`,
+/// `find_references`, `repo_map`). Returns None for unknown names.
+pub fn handle_extra(
+    name: &str,
+    xg: &Xgrep,
+    _session: &mut Session,
+    params: &Value,
+) -> Option<(String, bool)> {
+    Some(match name {
+        "outline" => crate::syntax::tools::handle_outline(xg, params),
+        "find_references" => crate::syntax::tools::handle_find_references(xg, params),
+        "repo_map" => crate::syntax::tools::handle_repo_map(xg, params),
+        _ => return None,
+    })
+}
 
 /// Handler for the `build_index` tool.
 pub fn handle_build_index(xg: &Xgrep) -> (String, bool) {
@@ -1511,7 +1696,7 @@ mod tests {
     #[test]
     fn test_tools_list() {
         let tools = tools_list();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 10);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for n in [
             "search",
@@ -1521,8 +1706,55 @@ mod tests {
             "build_index",
             "read_file",
             "session_reset",
+            "outline",
+            "find_references",
+            "repo_map",
         ] {
             assert!(names.contains(&n), "missing {}", n);
+        }
+    }
+
+    #[test]
+    fn test_syntax_tools_with_and_without_feature() {
+        let (_dir, xg) = setup_test_repo();
+        let mut s = Session::new();
+        let (o, err) = handle_extra(
+            "outline",
+            &xg,
+            &mut s,
+            &serde_json::json!({"path": "hello.rs"}),
+        )
+        .unwrap();
+        if cfg!(feature = "syntax") {
+            assert!(!err, "{}", o);
+            assert!(o.contains("L1-3 fn hello()"), "{}", o);
+            assert!(o.contains("L5-7 struct Foo"), "{}", o);
+        } else {
+            assert!(err, "{}", o);
+            assert!(o.contains("without the `syntax` feature"), "{}", o);
+        }
+        // find_references works either way (regex fallback for definitions).
+        let (r, err) = handle_extra(
+            "find_references",
+            &xg,
+            &mut s,
+            &serde_json::json!({"symbol": "Foo"}),
+        )
+        .unwrap();
+        assert!(!err, "{}", r);
+        assert!(r.contains("No references"), "{}", r);
+        let (m, err) = handle_extra("repo_map", &xg, &mut s, &serde_json::json!({})).unwrap();
+        assert_eq!(err, !cfg!(feature = "syntax"), "{}", m);
+        assert!(handle_extra("nope", &xg, &mut s, &serde_json::json!({})).is_none());
+        // expand:block falls back to context windows without syntax support.
+        let (b, err) = search(
+            &xg,
+            serde_json::json!({"pattern": "println", "expand": "block"}),
+        );
+        assert!(!err, "{}", b);
+        assert!(b.contains("grouped into 1 block"), "{}", b);
+        if cfg!(feature = "syntax") {
+            assert!(b.contains("## hello.rs:1-3 fn hello (1 match)"), "{}", b);
         }
     }
 
