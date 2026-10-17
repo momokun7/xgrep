@@ -1084,7 +1084,12 @@ fn current_exe_is_xg() -> bool {
         .is_some_and(|stem| stem == "xg" || stem == "xgrep")
 }
 
+/// Resolve where the index for `root` lives.
+///
+/// The root is canonicalized first so that relative paths, `..`
+/// components, and symlinked paths to the same directory share one index.
 fn resolve_index_path(root: &Path) -> Result<PathBuf> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let local = root.join(".xgrep").join("index");
     if local.exists() {
         return Ok(local);
@@ -1931,5 +1936,25 @@ mod tests {
             other => panic!("expected stale, got {other:?}"),
         }
         xg.wait_background_rebuild();
+    }
+
+    /// Regression (P2): relative, `..`, and symlinked spellings of the same
+    /// root share one index.
+    #[test]
+    fn test_resolve_index_path_canonicalizes_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let canonical = resolve_index_path(&root).unwrap();
+        assert_eq!(
+            resolve_index_path(&root.join("sub").join("..")).unwrap(),
+            canonical
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            assert_eq!(resolve_index_path(&link).unwrap(), canonical);
+        }
     }
 }
