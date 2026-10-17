@@ -253,6 +253,54 @@ jobs:
           xg -c "fn run_cli" rust/src
           python -c "import xg; print(xg.Xgrep, xg.SearchResult, xg.IndexStatus)"
 
+  python-wheel:
+    name: Python wheel (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: |
+            python
+            rust
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install maturin
+        run: pip install --require-hashes -r python/requirements-build.txt
+      # Same packaging as the release build-python job, on the platforms the
+      # Linux "Python bindings" job cannot cover (xg.exe, Scripts/ layout).
+      - name: Build xg CLI
+        working-directory: rust
+        run: cargo build --bin xg
+      - name: Build wheel
+        run: |
+          exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          mkdir -p python/wheel-data/scripts
+          cp "rust/target/debug/xg$exe" python/wheel-data/scripts/
+          cd python
+          maturin build --features extension-module -i python
+      - name: Install wheel and run xg
+        env:
+          XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
+        run: |
+          python -m venv .wheel-venv
+          bin=".wheel-venv/bin"; [ "$RUNNER_OS" = "Windows" ] && bin=".wheel-venv/Scripts"
+          "$bin/python" -m pip install python/target/wheels/*.whl
+          "$bin/xg" --version
+          "$bin/xg" -c "fn run_cli" rust/src
+          "$bin/python" -c "import xg; print(xg.Xgrep, xg.SearchResult, xg.IndexStatus)"
+
   cross-aarch64:
     name: Cross build (aarch64-linux)
     runs-on: ubuntu-latest
