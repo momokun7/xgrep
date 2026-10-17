@@ -2060,7 +2060,8 @@ mod tests {
     fn lines_of(results: &[SearchResult]) -> Vec<(String, usize)> {
         results
             .iter()
-            .map(|r| (r.file.to_string(), r.line_number))
+            // Paths use the platform separator; compare with `/`.
+            .map(|r| (r.file.replace('\\', "/"), r.line_number))
             .collect()
     }
 

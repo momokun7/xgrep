@@ -496,13 +496,23 @@ fn cli_outline_and_expand_block() {
 #[test]
 fn tags_cache_is_written_next_to_index() {
     let dir = fixture();
-    let (_, err) = call(dir.path(), "repo_map", serde_json::json!({}));
-    assert!(!err);
-    let cache = dir.path().join(".test-cache");
-    let found = walk(&cache)
+    let out = call_tools(
+        dir.path(),
+        &[
+            ("repo_map", serde_json::json!({})),
+            ("index_status", serde_json::json!({})),
+        ],
+    );
+    assert!(!out[0].1);
+    // The index location is platform-specific (XDG_CACHE_HOME is ignored on
+    // macOS), so ask the server where it is.
+    let status: serde_json::Value = serde_json::from_str(&out[1].0).unwrap();
+    let index = std::path::PathBuf::from(status["index_path"].as_str().unwrap());
+    let dir_of_index = index.parent().unwrap();
+    let found = walk(dir_of_index)
         .into_iter()
         .any(|p| p.to_string_lossy().ends_with(".tags"));
-    assert!(found, "no .tags sidecar under {}", cache.display());
+    assert!(found, "no .tags sidecar under {}", dir_of_index.display());
 }
 
 fn walk(p: &std::path::Path) -> Vec<std::path::PathBuf> {
