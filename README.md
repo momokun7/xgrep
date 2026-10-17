@@ -108,7 +108,7 @@ xg status                     # Show index status
 xg init                       # Explicitly rebuild index
 ```
 
-Without a PATH, xg searches standard input when it is a pipe or a file, like ripgrep; otherwise (a terminal, `/dev/null`, `NUL`) it searches the current directory. Matches are shown as `<stdin>:LINE:TEXT`.
+Without a PATH, xg searches standard input when it is a pipe or a file with data; otherwise (a terminal, `/dev/null`, `NUL`, or empty input as CI runners often attach) it searches the current directory. `-` always reads standard input. Matches are shown as `<stdin>:LINE:TEXT`.
 
 Search is **smart-case** by default: an all-lowercase pattern matches case-insensitively, while any uppercase letter makes the search case-sensitive. Use `-i` or `-s` to override (priority: `-i` > `-s` > smart-case).
 

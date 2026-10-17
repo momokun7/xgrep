@@ -449,20 +449,34 @@ fn run() -> Result<()> {
             });
 
             // Search standard input for `xg PATTERN -`, or for `xg PATTERN`
-            // when standard input is a pipe or file (`cat log | xg error`).
+            // when standard input is a pipe or file with data (`cat log | xg
+            // error`). Empty input (CI runners and scripts often attach an
+            // empty pipe) keeps the directory search.
             let explicit_stdin = cli.paths.iter().any(|p| p.as_os_str() == "-");
             if explicit_stdin && cli.paths.len() > 1 {
                 anyhow::bail!("'-' (standard input) cannot be combined with other PATHs");
             }
-            let stdin_mode = !cli.find
-                && cli.in_diff.is_none()
-                && !cli.log
-                && (explicit_stdin || (cli.paths.is_empty() && stdin_is_readable()));
-            if stdin_mode && (cli.changed || cli.since.is_some() || cli.fresh || expand_block) {
+            let file_only = cli.changed || cli.since.is_some() || cli.fresh || expand_block;
+            if explicit_stdin && file_only {
                 anyhow::bail!(
                     "--changed, --since, --fresh and --expand block search files, not standard input"
                 );
             }
+            let auto_stdin = cli.paths.is_empty()
+                && !file_only
+                && !cli.find
+                && cli.in_diff.is_none()
+                && !cli.log
+                && stdin_is_readable();
+            // Read up front: context output needs the text again.
+            let stdin_content = if explicit_stdin || auto_stdin {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
+                (explicit_stdin || !buf.is_empty()).then_some(buf)
+            } else {
+                None
+            };
+            let stdin_mode = stdin_content.is_some();
 
             let use_absolute = !stdin_mode
                 && (cli.absolute_paths
@@ -719,14 +733,6 @@ fn run() -> Result<()> {
                 common_base(&dirs)
             };
             let multi = resolved.len() > 1;
-            // Read up front: context output needs the text again.
-            let stdin_content = if stdin_mode {
-                let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
-                Some(buf)
-            } else {
-                None
-            };
             let stdin_text = stdin_content
                 .as_deref()
                 .map(|b| String::from_utf8_lossy(b).into_owned());

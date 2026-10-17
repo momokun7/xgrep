@@ -36,7 +36,10 @@ fn piped_stdin_is_searched_when_no_path_is_given() {
 
     let out = run_with_stdin(dir.path(), &["apricot"], INPUT);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "<stdin>:3:apricot jam\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "<stdin>:3:apricot jam\n"
+    );
 
     let out = run_with_stdin(dir.path(), &["-c", "ap"], INPUT);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "<stdin>:2\n");
@@ -55,11 +58,31 @@ fn piped_stdin_is_searched_when_no_path_is_given() {
 fn dash_reads_stdin_and_cannot_be_mixed_with_paths() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_with_stdin(dir.path(), &["jam", "-"], INPUT);
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "<stdin>:3:apricot jam\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "<stdin>:3:apricot jam\n"
+    );
 
     let out = run_with_stdin(dir.path(), &["jam", "-", "."], INPUT);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("standard input"));
+}
+
+#[test]
+fn empty_piped_stdin_searches_the_directory() {
+    // CI runners and scripts often leave an empty pipe on standard input.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "needle_qzx\n").unwrap();
+    let out = run_with_stdin(dir.path(), &["-l", "needle_qzx"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.txt\n", "{out:?}");
+
+    // `-` still means standard input, even when it is empty.
+    let out = run_with_stdin(dir.path(), &["needle_qzx", "-"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+
+    // File-only flags search files instead of piped input.
+    let out = run_with_stdin(dir.path(), &["-l", "--fresh", "needle_qzx"], "needle_qzx\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.txt\n", "{out:?}");
 }
 
 #[test]
