@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.8.0](https://github.com/momokun7/xgrep/compare/v0.7.0...v0.8.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **index:** index format v4 with folded trigrams, posting masks and a build-only sidecar
+* --json output is no longer a single JSON array.
+
+### Features
+
+* **cli:** accept multiple PATH arguments ([ef5f1ff](https://github.com/momokun7/xgrep/commit/ef5f1ff35f5807348fa081d4e1cfed009c39e746))
+* emit --json as JSON Lines with a summary object ([85d9f3a](https://github.com/momokun7/xgrep/commit/85d9f3a4a09839bb053ee99b7f61cedb65ebbcc1))
+* enforce llm token budgets per line and add --max-tokens/--max-columns ([ba0e5fd](https://github.com/momokun7/xgrep/commit/ba0e5fd184f7deff708358186dc8199bcb47f7e5))
+* **history:** search git diffs (--in-diff) and commit messages (--log) ([83493e0](https://github.com/momokun7/xgrep/commit/83493e08547d823046e4be511c4c85c1dda28f3c))
+* **index:** index format v4 with folded trigrams, posting masks and a build-only sidecar ([cac0e23](https://github.com/momokun7/xgrep/commit/cac0e23ab7289fa1ee492823d8023669c77c1e1d))
+* **mcp:** add ranking, definition heuristics, session and paging modules ([1eb3135](https://github.com/momokun7/xgrep/commit/1eb31356a42d1385fbd1945487bb8f7b82cb470f))
+* **mcp:** ignore unknown arguments with a note instead of failing ([aa98181](https://github.com/momokun7/xgrep/commit/aa98181fc411d6198c0815cfff9ee0ed4766c196))
+* **mcp:** ranked, paginated tools with validation, find_files and multi-query ([1685465](https://github.com/momokun7/xgrep/commit/16854655ffbc51b769eee3cf89751b09b6986ba4))
+* report files skipped for exceeding the max file size ([34df71c](https://github.com/momokun7/xgrep/commit/34df71c5198352a72c1d40a34b93e5647aececeb))
+* **search:** stream results in path order, add -l/-c fast paths, AND/NOT queries and match columns ([76d3019](https://github.com/momokun7/xgrep/commit/76d3019658a79ea216c98745636ba32a99a7c536))
+* **serve:** watch the tree and skip the freshness probe in long-lived processes ([fe897e0](https://github.com/momokun7/xgrep/commit/fe897e05123ec45ae75c3bf40838b635933687f9))
+* **syntax:** tree-sitter outline, definitions, references, block expansion and repo map ([905d0d3](https://github.com/momokun7/xgrep/commit/905d0d36716d1b81dfa85d3d09dae476cfd3843b))
+
+
+### Bug Fixes
+
+* canonicalize the root before hashing the cache index path ([238334d](https://github.com/momokun7/xgrep/commit/238334dc01c28340a618bb292e24623707158c3e))
+* **ci:** make watcher tests portable and update audited dependencies ([dc81e35](https://github.com/momokun7/xgrep/commit/dc81e35c44a9f1d391ce04946f1abc114918e8a3))
+* **cli:** aggregate --in-diff -c counts per path, not per run ([14a0227](https://github.com/momokun7/xgrep/commit/14a0227e1405f389ae963b2c700942a593e7112e))
+* **cli:** apply --exclude before --max-count ([c585973](https://github.com/momokun7/xgrep/commit/c5859732364c20439a5160b07886cdadb5fc1f50))
+* eliminate false negatives in regex trigram extraction ([5043bfc](https://github.com/momokun7/xgrep/commit/5043bfc074d8af5eb8a4f9100d6385309a90bdd7))
+* **freshness:** detect new files in directories without indexed files ([925ce99](https://github.com/momokun7/xgrep/commit/925ce99153c46f3ec1c6bf617b456613bef0f73c))
+* **freshness:** share the builder's internal-file predicate with the probe and watcher ([9f0b21e](https://github.com/momokun7/xgrep/commit/9f0b21e0c80bc17b7d439b788b10dcc619623f90))
+* **git:** read NUL-separated git output so non-ASCII paths work ([bc92c12](https://github.com/momokun7/xgrep/commit/bc92c122cd2d9c4ed47ac25bbb6d600dadf9fd74))
+* harden index and file access paths ([4664a55](https://github.com/momokun7/xgrep/commit/4664a557f7fb82fd1c52e700701ebe1601d9cff1))
+* harden index and file access paths ([3b1c979](https://github.com/momokun7/xgrep/commit/3b1c9796a8f012086a12a24f281ab6a6ec033531))
+* **index:** catch same-second edits and harden/speed up index builds ([3c26d63](https://github.com/momokun7/xgrep/commit/3c26d6387466e1125e34b1804097e0d182213e08))
+* keep default searches fresh and rebuild the index in-process ([2bdf4c1](https://github.com/momokun7/xgrep/commit/2bdf4c132aa456261b7c8fed3e8afc29d59332e3))
+* make -w work for patterns with non-word edges ([9831c0b](https://github.com/momokun7/xgrep/commit/9831c0bfe97489799b514ae39c6128277382a087))
+* match regex ^/$ per line and run regex on raw bytes ([8510f3c](https://github.com/momokun7/xgrep/commit/8510f3c629814ca6cc6728fbe96db6b6383f35c7))
+* **mcp:** mark only emitted lines as shown when a block is hard-cut ([45a6d00](https://github.com/momokun7/xgrep/commit/45a6d00a862be227e7245dc1eb7228a310fe5370))
+* never fail context/llm output on non-UTF-8 or unreadable files ([f413c12](https://github.com/momokun7/xgrep/commit/f413c126d74110493e40d45f3db1213f7d41fa3d))
+* **search:** warn about a full scan only for single-byte literals ([f831c4d](https://github.com/momokun7/xgrep/commit/f831c4dc81fe6aa2fc55de1d52eedc619ebdf338))
+* **syntax:** re-verify racily clean tag cache entries by content hash ([efd4865](https://github.com/momokun7/xgrep/commit/efd4865366b07f7e5483be72bdcf354c969d57d5))
+* use `/`-separated relative paths on every platform ([3b04998](https://github.com/momokun7/xgrep/commit/3b049982764870c627dcd27c2a7a2c8a75a2cfdb))
+* use ASCII-only pattern folding for smart-case search ([25f7ca4](https://github.com/momokun7/xgrep/commit/25f7ca443a034458c017cf838a2b8102d8194200))
+* **watch:** don't trust the watcher's change set without a fence ([6cff448](https://github.com/momokun7/xgrep/commit/6cff44872add4bfea64a2ca39484509b400361de))
+* **watch:** stop fencing after setup failure, probe after ignore-rule changes, sync only on post-setup builds ([6c8fb16](https://github.com/momokun7/xgrep/commit/6c8fb16b8f7642026100be80813b0ad4c9a232fc))
+
+
+### Performance Improvements
+
+* **index:** replace git-status freshness probe with a parallel stat scan ([89565c1](https://github.com/momokun7/xgrep/commit/89565c1f976eede3bebdd29bfeb1328fe53791e7))
+* make context output linear in the number of matches ([04bc435](https://github.com/momokun7/xgrep/commit/04bc435c60a31628023eb3a71871f1809d0ddb39))
+* push path filters and max_count down into the scan ([64d6bec](https://github.com/momokun7/xgrep/commit/64d6bec2d26a22cb6cc5b804c2123fc9cdc4504f))
+* search whole buffer and map lines incrementally in matchers ([01faf09](https://github.com/momokun7/xgrep/commit/01faf097550be1b5732d0e73fea271b4cca68b79))
+* **syntax:** fast repo_map on large repos and journaled tags cache ([2d0f491](https://github.com/momokun7/xgrep/commit/2d0f49126dde785b8b19f67e1161a461ab7dfdb8))
+* **trigram:** dedup trigrams with a reusable bitset instead of HashSet ([b924ba1](https://github.com/momokun7/xgrep/commit/b924ba1c557975a217071e2f90e25678067c996d))
+* **trigram:** reuse per-thread scratch for trigram extraction ([4dae4ba](https://github.com/momokun7/xgrep/commit/4dae4ba792c47fdb5362b1502d5f91d2cd01b169))
+
 ## [0.7.0](https://github.com/momokun7/xgrep/compare/v0.6.0...v0.7.0) (2026-06-19)
 
 
