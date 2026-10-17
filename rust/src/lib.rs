@@ -26,6 +26,7 @@
 
 pub(crate) mod candidates;
 pub mod cli;
+pub(crate) mod defs;
 pub mod error;
 pub(crate) mod filetype;
 pub(crate) mod git;
@@ -33,9 +34,12 @@ pub(crate) mod globfilter;
 pub mod hints;
 pub(crate) mod index;
 pub(crate) mod mcp;
+pub(crate) mod mcp_render;
 pub(crate) mod mcp_tools;
 pub mod output;
+pub(crate) mod rank;
 pub mod search;
+pub(crate) mod session;
 pub(crate) mod trigram;
 pub(crate) mod trigram_query;
 
