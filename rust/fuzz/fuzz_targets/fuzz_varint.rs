@@ -3,11 +3,11 @@ use libfuzzer_sys::fuzz_target;
 use xgrep_search::fuzz_exports::{decode_varint, encode_varint};
 
 fuzz_target!(|data: &[u8]| {
-    // 任意バイト列のデコード: パニックしないことを検証
+    // Decode arbitrary bytes: must not panic.
     let (value, bytes_read) = decode_varint(data);
     assert!(bytes_read <= data.len());
 
-    // 有効なデコード結果のラウンドトリップ検証
+    // A valid decode round-trips through encode.
     if bytes_read > 0 && bytes_read <= 5 {
         let mut encoded = Vec::new();
         encode_varint(&mut encoded, value);

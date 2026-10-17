@@ -29,7 +29,7 @@ fn test_open_local() {
     let results = xg.search("hello", &SearchOptions::default()).unwrap();
     assert_eq!(results.len(), 1);
 
-    // .xgrep/index にインデックスが作られていること
+    // The index is created at .xgrep/index.
     assert!(root.join(".xgrep").join("index").exists());
 }
 
@@ -40,7 +40,7 @@ fn test_search_auto_builds_index() {
     fs::write(root.join("a.rs"), "fn hello() {}").unwrap();
 
     let xg = Xgrep::open(root).unwrap();
-    // build_index()を呼ばずにsearch → 自動ビルドされる
+    // Searching without build_index() builds the index automatically.
     let results = xg.search("hello", &SearchOptions::default()).unwrap();
     assert_eq!(results.len(), 1);
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# xgrep vs ripgrep 体感比較デモ
-# 出力もそのまま表示するので速度差が目で見てわかる
+# xgrep vs ripgrep side-by-side demo
+# Output is shown as is, so the speed difference is visible
 
 XGREP="$HOME/Developer/oss/xgrep/rust/target/release/xgrep"
 DIR="$HOME/Developer/oss/xgrep/bench/linux-src"
@@ -8,8 +8,8 @@ DIR="$HOME/Developer/oss/xgrep/bench/linux-src"
 cd "$DIR"
 
 echo "=========================================="
-echo "  xgrep vs ripgrep 体感比較"
-echo "  データセット: Linux kernel (92k files)"
+echo "  xgrep vs ripgrep side by side"
+echo "  Dataset: Linux kernel (92k files)"
 echo "=========================================="
 echo ""
 
