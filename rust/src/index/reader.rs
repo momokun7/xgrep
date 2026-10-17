@@ -7,9 +7,10 @@ use libc;
 use memmap2::Mmap;
 
 use crate::index::format::*;
+use crate::trigram::{fold, fold_trigram};
 
 pub fn read_header(data: &[u8]) -> Header {
-    let per_file_section_offset = if data.len() >= 32 {
+    let sidecar_id = if data.len() >= 32 {
         u64::from_le_bytes(data[24..32].try_into().unwrap())
     } else {
         0
@@ -20,7 +21,7 @@ pub fn read_header(data: &[u8]) -> Header {
         trigram_count: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
         file_count: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
         posting_total_bytes: u64::from_le_bytes(data[16..24].try_into().unwrap()),
-        per_file_section_offset,
+        sidecar_id,
     }
 }
 
@@ -42,11 +43,80 @@ fn read_file_entry(data: &[u8]) -> FileEntry {
     }
 }
 
-#[allow(dead_code)]
-pub struct PerFileEntry {
-    pub mtime: u64,
-    pub content_hash: u64,
-    pub trigrams: Vec<u32>, // sorted unique
+/// Format version of the index file at `path`, read from its header without
+/// mapping the file. `None` if the file is missing or not an xgrep index.
+pub fn index_version(path: &Path) -> Option<u32> {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    File::open(path).ok()?.read_exact(&mut buf).ok()?;
+    if &buf[0..4] != MAGIC.as_slice() {
+        return None;
+    }
+    Some(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]))
+}
+
+/// True if an index file exists at `path` but cannot be used as is (older
+/// format version or not an xgrep index) and therefore must be rebuilt.
+pub fn needs_rebuild(path: &Path) -> bool {
+    path.exists() && index_version(path) != Some(VERSION)
+}
+
+/// A decoded posting list: file IDs plus the raw `[loc, next]` mask bytes.
+pub(crate) struct Posting<'a> {
+    pub ids: Vec<u32>,
+    masks: &'a [u8],
+}
+
+impl Posting<'_> {
+    /// `loc` mask of entry `i`. Missing (corrupt) masks read as "all bits",
+    /// which can only add candidates, never drop them.
+    #[inline]
+    pub fn loc(&self, i: usize) -> u8 {
+        self.masks.get(2 * i).copied().unwrap_or(0xFF)
+    }
+
+    /// `next` mask of entry `i` (see [`Posting::loc`] for missing data).
+    #[inline]
+    pub fn next(&self, i: usize) -> u8 {
+        self.masks.get(2 * i + 1).copied().unwrap_or(0xFF)
+    }
+
+    /// Packed masks (`loc | next << 8`) of entry `i`.
+    #[inline]
+    pub fn packed(&self, i: usize) -> u16 {
+        pack_masks(self.loc(i), self.next(i))
+    }
+}
+
+/// Ask the kernel to prefetch the first `hot_len` bytes of the mapping (the
+/// trigram table and the posting lists, which every indexed search touches).
+/// The file table / path pool are left to normal demand paging.
+///
+/// Measured on a warm page cache (13.8K files, 48 MB index), WILLNEED on
+/// table + postings, on the whole file, MADV_RANDOM and no advice were all
+/// within noise (≈2 ms per search process), so the prefetch is kept for the
+/// cold-cache case where it overlaps the table/posting reads.
+fn advise(mmap: &Mmap, hot_len: usize) {
+    #[cfg(unix)]
+    {
+        let len = hot_len.min(mmap.len());
+        if len == 0 {
+            return;
+        }
+        // SAFETY: the range lies within the live mapping; madvise only gives
+        // the kernel a hint and does not modify memory contents.
+        let _ret =
+            unsafe { libc::madvise(mmap.as_ptr() as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+        #[cfg(debug_assertions)]
+        if _ret != 0 {
+            eprintln!(
+                "xgrep: madvise warning: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (mmap, hot_len);
 }
 
 pub struct IndexReader {
@@ -62,41 +132,21 @@ impl IndexReader {
         let file = File::open(path)?;
         // SAFETY: `file` is a valid, open file descriptor. The mapped memory may become
         // invalid if the file is modified externally; we mitigate this with advisory
-        // locking during index builds.
+        // locking during index builds (and builds replace the file by rename).
         let mmap = unsafe { Mmap::map(&file)? };
-
-        #[cfg(unix)]
-        {
-            // SAFETY: `mmap.as_ptr()` and `mmap.len()` are valid (mmap created above).
-            // MADV_WILLNEED is an advisory hint that does not modify memory contents.
-            let _ret = unsafe {
-                libc::madvise(
-                    mmap.as_ptr() as *mut libc::c_void,
-                    mmap.len(),
-                    libc::MADV_WILLNEED,
-                )
-            };
-            #[cfg(debug_assertions)]
-            if _ret != 0 {
-                eprintln!(
-                    "xgrep: madvise warning: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
 
         if mmap.len() < Header::SIZE {
             return Err(XgrepError::IndexError("index file too small".to_string()));
         }
 
         let header = read_header(&mmap[..Header::SIZE]);
-        if &header.magic != b"XGRP" {
+        if header.magic != MAGIC {
             return Err(XgrepError::IndexError("invalid index magic".to_string()));
         }
-        if header.version != VERSION && header.version != VERSION_V2 {
+        if header.version != VERSION {
             return Err(XgrepError::IndexError(format!(
-                "unsupported index version: {}",
-                header.version
+                "unsupported index version: {} (expected {}; rebuild with `xg init`)",
+                header.version, VERSION
             )));
         }
 
@@ -117,7 +167,8 @@ impl IndexReader {
             )));
         }
 
-        let posting_lists_total_bytes = header.posting_total_bytes as usize;
+        let posting_lists_total_bytes = usize::try_from(header.posting_total_bytes)
+            .map_err(|_| XgrepError::IndexError("header overflow".to_string()))?;
         let file_table_start = posting_lists_start
             .checked_add(posting_lists_total_bytes)
             .ok_or_else(|| {
@@ -141,6 +192,10 @@ impl IndexReader {
             )));
         }
 
+        // Prefetch the trigram table and the posting lists (what every
+        // indexed search touches); file table / paths are read on demand.
+        advise(&mmap, file_table_start);
+
         Ok(Self {
             mmap,
             cached_header: header,
@@ -159,50 +214,88 @@ impl IndexReader {
         self.cached_header.file_count
     }
 
-    pub fn lookup_trigram(&self, target: [u8; 3]) -> Vec<u32> {
-        let count = self.cached_header.trigram_count as usize;
-        if count == 0 {
-            return vec![];
-        }
-
-        let trigram_table_start = Header::SIZE;
-        let mut lo = 0usize;
-        let mut hi = count;
-
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let offset = trigram_table_start + mid * TrigramEntry::SIZE;
-            if offset + TrigramEntry::SIZE > self.mmap.len() {
-                return vec![];
-            }
-            let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
-
-            match entry.trigram.cmp(&target) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => {
-                    let pl_start = self.posting_lists_start + entry.posting_offset as usize;
-                    let pl_end = pl_start + entry.posting_len as usize;
-                    if pl_end > self.mmap.len() {
-                        return vec![];
-                    }
-                    let data = &self.mmap[pl_start..pl_end];
-                    return Self::decode_posting_list(data);
-                }
-            }
-        }
-        vec![]
+    /// Id tying this index to its sidecar (see `index::cache`).
+    pub(crate) fn sidecar_id(&self) -> u64 {
+        self.cached_header.sidecar_id
     }
 
+    fn trigram_count(&self) -> usize {
+        self.cached_header.trigram_count as usize
+    }
+
+    /// Trigram table entry `i` (`i < trigram_count`, checked at open).
+    #[inline]
+    fn entry_at(&self, i: usize) -> TrigramEntry {
+        let offset = Header::SIZE + i * TrigramEntry::SIZE;
+        read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE])
+    }
+
+    /// Index of the first table entry whose trigram is `>= target`.
+    fn lower_bound(&self, target: [u8; 3]) -> usize {
+        let (mut lo, mut hi) = (0usize, self.trigram_count());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.entry_at(mid).trigram < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Posting bytes of a table entry (`None` if out of bounds = corrupt).
+    fn entry_postings(&self, entry: &TrigramEntry) -> Option<&[u8]> {
+        let start = self
+            .posting_lists_start
+            .checked_add(usize::try_from(entry.posting_offset).ok()?)?;
+        let end = start.checked_add(entry.posting_len as usize)?;
+        if end > self.file_table_start {
+            return None;
+        }
+        Some(&self.mmap[start..end])
+    }
+
+    /// Raw posting bytes of an exact (already folded) trigram.
+    ///
+    /// The length of the returned slice is the planning cost estimate: it is
+    /// known from the trigram table without decoding anything.
+    pub(crate) fn posting_raw(&self, folded: [u8; 3]) -> Option<&[u8]> {
+        let i = self.lower_bound(folded);
+        if i >= self.trigram_count() {
+            return None;
+        }
+        let entry = self.entry_at(i);
+        if entry.trigram != folded {
+            return None;
+        }
+        self.entry_postings(&entry)
+    }
+
+    /// File IDs containing trigram `target`, compared case-insensitively
+    /// (ASCII): the index stores folded trigrams, so this is the superset of
+    /// files containing `target` byte-for-byte.
+    pub fn lookup_trigram(&self, target: [u8; 3]) -> Vec<u32> {
+        self.posting_raw(fold_trigram(target))
+            .map(Self::decode_posting_list)
+            .unwrap_or_default()
+    }
+
+    /// Decode the file IDs of a posting list (masks are not decoded).
     pub fn decode_posting_list(data: &[u8]) -> Vec<u32> {
+        Self::decode_ids(data).0
+    }
+
+    /// Decode IDs; returns them plus the byte offset just after the last ID.
+    fn decode_ids(data: &[u8]) -> (Vec<u32>, usize) {
         if data.is_empty() {
-            return vec![];
+            return (vec![], 0);
         }
         let (count, mut pos) = decode_varint(data);
         let count = count as usize;
         // Sanity check: count exceeding data length indicates corrupt data
         if count > data.len() {
-            return vec![];
+            return (vec![], data.len());
         }
         let mut result = Vec::with_capacity(count);
         let mut prev: u32 = 0;
@@ -218,117 +311,51 @@ impl IndexReader {
             prev = prev.saturating_add(delta);
             result.push(prev);
         }
-        result
+        (result, pos)
     }
 
-    /// Return the union of posting lists for all trigrams matching a 2-byte prefix.
-    /// Uses binary search on the sorted trigram table to find the range.
+    /// Decode a posting list with its masks.
+    pub(crate) fn decode_posting(data: &[u8]) -> Posting<'_> {
+        let (ids, pos) = Self::decode_ids(data);
+        let end = pos.saturating_add(ids.len() * 2).min(data.len());
+        Posting {
+            masks: &data[pos.min(end)..end],
+            ids,
+        }
+    }
+
+    /// Union of the posting lists of all trigrams starting with `prefix`
+    /// (folded), i.e. every file containing the 2-byte string `prefix` in any
+    /// letter case. Because each file is indexed with a trailing sentinel
+    /// byte, even an occurrence at the very end of a file produces such a
+    /// trigram, so a single contiguous range of the sorted table suffices.
     pub fn lookup_trigram_prefix(&self, prefix: [u8; 2]) -> Vec<u32> {
-        let count = self.cached_header.trigram_count as usize;
-        if count == 0 {
-            return vec![];
-        }
-
-        let trigram_table_start = Header::SIZE;
-
-        // lower bound: prefix[0], prefix[1], 0x00
-        let lo_target = [prefix[0], prefix[1], 0u8];
-        let lo_idx = {
-            let mut lo = 0usize;
-            let mut hi = count;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let offset = trigram_table_start + mid * TrigramEntry::SIZE;
-                let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
-                if entry.trigram < lo_target {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            lo
-        };
-
-        // upper bound: prefix[0], prefix[1], 0xFF (exclusive upper bound is next entry after 0xFF)
-        let hi_target = [prefix[0], prefix[1], 0xFFu8];
-        let hi_idx = {
-            let mut lo = lo_idx;
-            let mut hi = count;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let offset = trigram_table_start + mid * TrigramEntry::SIZE;
-                let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
-                if entry.trigram <= hi_target {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            lo
-        };
-
-        if lo_idx >= hi_idx {
-            return vec![];
-        }
-
-        let mut result: Vec<u32> = Vec::new();
-        for i in lo_idx..hi_idx {
-            let offset = trigram_table_start + i * TrigramEntry::SIZE;
-            let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
-            // Sanity check: only process entries matching the prefix
-            if entry.trigram[0] != prefix[0] || entry.trigram[1] != prefix[1] {
-                continue;
-            }
-            let pl_start = self.posting_lists_start + entry.posting_offset as usize;
-            let pl_byte_len = entry.posting_len as usize;
-            let pl_end = pl_start + pl_byte_len;
-            if pl_end > self.mmap.len() {
-                continue; // skip corrupted entry
-            }
-            let data = &self.mmap[pl_start..pl_end];
-            result.extend(Self::decode_posting_list(data));
-        }
-        result.sort_unstable();
-        result.dedup();
-        result
-    }
-
-    /// Return the union of posting lists for all trigrams `t` where
-    /// `t[1] == suffix[0] && t[2] == suffix[1]`.
-    ///
-    /// Used for 2-byte patterns: an occurrence of "ab" in a file of >= 3 bytes
-    /// is guaranteed to produce either trigram "ab?" (byte after) or "?ab"
-    /// (byte before). Because the trigram table is sorted by the full 3-byte
-    /// value, suffix-matching entries are not contiguous, so a linear scan over
-    /// the dictionary is used. This is acceptable because 2-byte queries are a
-    /// rare path. The returned vector is sorted and deduplicated.
-    pub(crate) fn lookup_trigram_suffix(&self, suffix: [u8; 2]) -> Vec<u32> {
-        let count = self.cached_header.trigram_count as usize;
-        if count == 0 {
-            return vec![];
-        }
-
-        let trigram_table_start = Header::SIZE;
-        let mut result: Vec<u32> = Vec::new();
-        for i in 0..count {
-            let offset = trigram_table_start + i * TrigramEntry::SIZE;
-            if offset + TrigramEntry::SIZE > self.mmap.len() {
+        let p = [fold(prefix[0]), fold(prefix[1])];
+        let lo = self.lower_bound([p[0], p[1], 0]);
+        let n = self.file_count() as usize;
+        let mut bits = vec![0u64; n.div_ceil(64)];
+        for i in lo..self.trigram_count() {
+            let entry = self.entry_at(i);
+            if entry.trigram[..2] != p {
                 break;
             }
-            let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
-            if entry.trigram[1] != suffix[0] || entry.trigram[2] != suffix[1] {
-                continue;
-            }
-            let pl_start = self.posting_lists_start + entry.posting_offset as usize;
-            let pl_end = pl_start + entry.posting_len as usize;
-            if pl_end > self.mmap.len() {
+            let Some(data) = self.entry_postings(&entry) else {
                 continue; // skip corrupted entry
+            };
+            for id in Self::decode_posting_list(data) {
+                if let Some(w) = bits.get_mut(id as usize / 64) {
+                    *w |= 1u64 << (id % 64);
+                }
             }
-            let data = &self.mmap[pl_start..pl_end];
-            result.extend(Self::decode_posting_list(data));
         }
-        result.sort_unstable();
-        result.dedup();
+        let mut result = Vec::new();
+        for (w, &word) in bits.iter().enumerate() {
+            let mut x = word;
+            while x != 0 {
+                result.push((w as u32) * 64 + x.trailing_zeros());
+                x &= x - 1;
+            }
+        }
         result
     }
 
@@ -351,92 +378,23 @@ impl IndexReader {
     }
 
     #[allow(dead_code)]
-    pub fn read_per_file_section(&self) -> Option<Vec<PerFileEntry>> {
-        let offset = self.cached_header.per_file_section_offset as usize;
-        if offset == 0 {
-            return None;
-        }
-        let data = &self.mmap[offset..];
-        let mut pos = 0;
-        if pos + 4 > data.len() {
-            return None;
-        }
-        let file_count = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
-        pos += 4;
-        let mut entries = Vec::with_capacity(file_count);
-        for _ in 0..file_count {
-            if pos + 20 > data.len() {
-                return None;
-            }
-            let mtime = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
-            pos += 8;
-            let content_hash = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
-            pos += 8;
-            let trigram_count = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
-            pos += 4;
-            if pos + trigram_count * 4 > data.len() {
-                return None;
-            }
-            let mut trigrams = Vec::with_capacity(trigram_count);
-            for _ in 0..trigram_count {
-                let t = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
-                pos += 4;
-                trigrams.push(t);
-            }
-            entries.push(PerFileEntry {
-                mtime,
-                content_hash,
-                trigrams,
-            });
-        }
-        Some(entries)
-    }
-
-    #[allow(dead_code)]
     pub(crate) fn all_trigrams(&self) -> Vec<[u8; 3]> {
-        let count = self.cached_header.trigram_count as usize;
-        let mut result = Vec::with_capacity(count);
-        for i in 0..count {
-            let offset = Header::SIZE + i * TrigramEntry::SIZE;
-            if offset + TrigramEntry::SIZE > self.mmap.len() {
-                break;
-            }
-            let entry = read_trigram_entry(&self.mmap[offset..offset + TrigramEntry::SIZE]);
-            result.push(entry.trigram);
-        }
-        result
-    }
-
-    /// Returns the raw bytes of the per-file section (mmap slice, no allocation).
-    /// Used for bulk-copy optimization: unchanged files' per-file entries can
-    /// be written directly without decode/re-encode.
-    pub(crate) fn per_file_section_raw(&self) -> &[u8] {
-        let offset = self.cached_header.per_file_section_offset as usize;
-        if offset == 0 || offset >= self.mmap.len() {
-            &[]
-        } else {
-            &self.mmap[offset..]
-        }
+        (0..self.trigram_count())
+            .map(|i| self.entry_at(i).trigram)
+            .collect()
     }
 
     /// Returns all trigrams with their raw posting bytes in sorted order.
     /// Used for byte-copy optimization: unaffected posting lists can be
     /// copied directly without decode/re-encode.
     pub(crate) fn all_trigram_entries_raw(&self) -> Vec<([u8; 3], &[u8])> {
-        let count = self.cached_header.trigram_count as usize;
-        let mut result = Vec::with_capacity(count);
-        for i in 0..count {
-            let tbl_offset = Header::SIZE + i * TrigramEntry::SIZE;
-            if tbl_offset + TrigramEntry::SIZE > self.mmap.len() {
+        let mut result = Vec::with_capacity(self.trigram_count());
+        for i in 0..self.trigram_count() {
+            let entry = self.entry_at(i);
+            let Some(raw) = self.entry_postings(&entry) else {
                 break;
-            }
-            let entry = read_trigram_entry(&self.mmap[tbl_offset..tbl_offset + TrigramEntry::SIZE]);
-            let pl_start = self.posting_lists_start + entry.posting_offset as usize;
-            let pl_end = pl_start + entry.posting_len as usize;
-            if pl_end > self.mmap.len() {
-                break;
-            }
-            result.push((entry.trigram, &self.mmap[pl_start..pl_end]));
+            };
+            result.push((entry.trigram, raw));
         }
         result
     }
@@ -562,7 +520,7 @@ mod tests {
         data[8..12].copy_from_slice(&9999u32.to_le_bytes()); // trigram_count = 9999 (huge)
         data[12..16].copy_from_slice(&0u32.to_le_bytes()); // file_count = 0
         data[16..24].copy_from_slice(&0u64.to_le_bytes()); // posting_total_bytes = 0
-        data[24..32].copy_from_slice(&0u64.to_le_bytes()); // per_file_section_offset = 0
+        data[24..32].copy_from_slice(&0u64.to_le_bytes()); // sidecar_id = 0
         fs::write(&path, &data).unwrap();
         let result = IndexReader::open(&path);
         assert!(result.is_err());
@@ -610,18 +568,74 @@ mod tests {
     }
 
     #[test]
-    fn test_read_per_file_section() {
+    fn test_old_versions_rejected_and_need_rebuild() {
+        let (dir, index_path) = build_test_index();
+        assert!(!needs_rebuild(&index_path));
+        assert_eq!(index_version(&index_path), Some(VERSION));
+        assert!(!needs_rebuild(&dir.path().join("missing.xgrep")));
+        for old in [2u32, 3] {
+            let mut data = fs::read(&index_path).unwrap();
+            data[4..8].copy_from_slice(&old.to_le_bytes());
+            let p = dir.path().join(format!("v{old}.xgrep"));
+            fs::write(&p, &data).unwrap();
+            assert!(IndexReader::open(&p).is_err());
+            assert!(needs_rebuild(&p));
+            assert_eq!(index_version(&p), Some(old));
+        }
+    }
+
+    #[test]
+    fn test_lookup_is_case_folded() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        fs::write(root.join("hello.txt"), "hello world").unwrap();
+        fs::write(root.join("a.txt"), "HashMap").unwrap();
+        fs::write(root.join("b.txt"), "hashmap").unwrap();
+        fs::write(root.join("c.txt"), "unrelated").unwrap();
         let index_path = root.join("index.xgrep");
         builder::build_index(root, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
-        let per_file = reader.read_per_file_section();
-        assert!(per_file.is_some());
-        let entries = per_file.unwrap();
-        assert_eq!(entries.len(), 1);
-        // "hello world" has trigrams: "hel", "ell", "llo", "lo ", "o w", " wo", "wor", "orl", "rld"
-        assert!(!entries[0].trigrams.is_empty());
+        for t in [*b"Has", *b"has", *b"HAS"] {
+            assert_eq!(reader.lookup_trigram(t).len(), 2, "{:?}", t);
+        }
+        // Only folded trigrams are stored.
+        assert!(reader
+            .all_trigrams()
+            .iter()
+            .all(|t| t.iter().all(|b| !b.is_ascii_uppercase())));
+    }
+
+    #[test]
+    fn test_prefix_lookup_finds_pair_at_end_of_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("end.txt"), "xyzAB").unwrap(); // "ab" only at EOF
+        fs::write(root.join("two.txt"), "ab").unwrap(); // 2-byte file
+        fs::write(root.join("mid.txt"), "zabz").unwrap();
+        fs::write(root.join("none.txt"), "a b").unwrap();
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let mut got: Vec<&str> = reader
+            .lookup_trigram_prefix(*b"ab")
+            .into_iter()
+            .map(|id| reader.file_path(id))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["end.txt", "mid.txt", "two.txt"]);
+    }
+
+    #[test]
+    fn test_decode_posting_masks() {
+        let mut buf = Vec::new();
+        encode_posting(&mut buf, &[3, 7, 100], &[0x0102, 0x0304, 0xFF00]);
+        let p = IndexReader::decode_posting(&buf);
+        assert_eq!(p.ids, vec![3, 7, 100]);
+        assert_eq!((p.loc(0), p.next(0)), (0x02, 0x01));
+        assert_eq!((p.loc(1), p.next(1)), (0x04, 0x03));
+        assert_eq!(p.packed(2), 0xFF00);
+        // Truncated masks read as "all bits" (never drops a file).
+        let p = IndexReader::decode_posting(&buf[..buf.len() - 2]);
+        assert_eq!((p.loc(2), p.next(2)), (0xFF, 0xFF));
+        assert_eq!(IndexReader::decode_posting_list(&buf), vec![3, 7, 100]);
     }
 }

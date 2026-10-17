@@ -1,26 +1,51 @@
-//! Trigram cache for incremental index builds.
+//! Index sidecar: per-file trigram lists used only by diff updates.
+//!
+//! Since index format v4 this file replaces both the old trigram cache
+//! (`index.cache` v2) and the per-file section that v3 kept at the end of the
+//! memory-mapped main index (the same information was stored twice, and the
+//! per-file section was 75 % of the mapped index). Searches never read it.
+//!
+//! A diff update needs, for a changed or deleted file, the trigrams whose
+//! posting lists mention it. Entries are stored in the main index's file ID
+//! order, and the header carries the `sidecar_id` of the main index it was
+//! written with; a diff update only trusts a sidecar whose id and entry count
+//! match the main index, and otherwise falls back to a full rebuild.
+//!
+//! Masks are deliberately *not* stored here: they live only in the posting
+//! lists, and a diff update never needs the old masks of a file it edits.
+//! (Consequently a full rebuild re-reads every file; it no longer reuses
+//! cached trigrams, which would require duplicating the masks.)
+//!
+//! ```text
+//! Header (20 bytes)
+//!   magic: "XGCH", version: u32 = 3, sidecar_id: u64, count: u32
+//! Entry (repeated `count` times, file ID order)
+//!   gram_count: varint, body_len: varint
+//!   body: the file's folded trigrams, sorted, as delta-encoded varints
+//! ```
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use memmap2::Mmap;
 
-/// Magic bytes identifying the xgrep cache format.
+use crate::error::{Result, XgrepError};
+use crate::index::format::{decode_varint, encode_varint};
+use crate::trigram::Gram;
+
+/// Magic bytes identifying the xgrep sidecar/cache format.
 const CACHE_MAGIC: &[u8; 4] = b"XGCH";
 
-/// Current cache format version.
+/// Current sidecar format version.
 ///
-/// v2: nanosecond mtime + size + ctime + inode per entry, plus the build start
-/// time in the header (used for racy-clean detection). v1 caches (second-resolution
-/// mtime only) are ignored.
-const CACHE_VERSION: u32 = 2;
+/// v3: folded trigram lists in file-ID order with a sidecar id (index v4).
+/// v2: path-keyed trigram cache with nanosecond stat (index v3); v1: second
+/// resolution mtime. Older versions are ignored (a full rebuild follows).
+const CACHE_VERSION: u32 = 3;
 
-/// Header: magic(4) + version(4) + build_start_ns(8) + count(4).
+/// Header: magic(4) + version(4) + sidecar_id(8) + count(4).
 const HEADER_LEN: usize = 20;
-/// Fixed part of an entry after the path: 5 × u64 + trigram_count u32.
-const ENTRY_FIXED_LEN: usize = 8 * 5 + 4;
 
 /// File metadata used to decide whether a file may have changed.
 ///
@@ -85,255 +110,309 @@ impl FileStat {
     }
 }
 
-/// Cached trigram information for a file.
-pub(crate) struct CachedFile {
-    pub stat: FileStat,
-    pub content_hash: u64,
-    /// Sorted, deduplicated trigrams.
-    pub trigrams: Vec<[u8; 3]>,
-}
-
-/// Cache mapping file paths to trigram information.
-pub struct TrigramCache {
-    pub(crate) entries: HashMap<String, CachedFile>,
-    /// Start time (ns since epoch) of the build that produced this cache.
-    /// Entries that are racy relative to it are not trusted.
-    pub(crate) build_start_ns: u64,
-}
-
-impl Default for TrigramCache {
-    fn default() -> Self {
-        Self::new()
+/// Parse the entry starting at `pos`: (gram_count, body range, end offset).
+fn parse_entry(data: &[u8], pos: usize) -> Option<(usize, std::ops::Range<usize>)> {
+    let (count, n1) = decode_varint(data.get(pos..)?);
+    let (body_len, n2) = decode_varint(data.get(pos + n1..)?);
+    if n1 == 0 || n2 == 0 {
+        return None;
     }
+    let start = pos + n1 + n2;
+    let end = start.checked_add(body_len as usize)?;
+    if end > data.len() {
+        return None;
+    }
+    Some((count as usize, start..end))
 }
 
-fn rd_u64(data: &[u8], pos: usize) -> u64 {
-    u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap())
+/// Decode a body of `count` delta-encoded, strictly increasing trigrams.
+fn decode_body(body: &[u8], count: usize) -> Option<Vec<u32>> {
+    if count > body.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    let mut prev = 0u32;
+    for i in 0..count {
+        if pos >= body.len() {
+            return None;
+        }
+        let (d, n) = decode_varint(&body[pos..]);
+        pos += n;
+        if i > 0 && d == 0 {
+            return None;
+        }
+        prev = prev.checked_add(d)?;
+        if prev >= 1 << 24 {
+            return None;
+        }
+        out.push(prev);
+    }
+    (pos == body.len()).then_some(out)
 }
 
-impl TrigramCache {
-    /// Create an empty cache.
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            build_start_ns: 0,
-        }
-    }
+/// Streaming sidecar writer (temp file + fsync + atomic rename).
+pub(crate) struct SidecarWriter {
+    w: Option<BufWriter<fs::File>>,
+    temp_path: PathBuf,
+    path: PathBuf,
+    remaining: usize,
+}
 
-    /// Load cache from file. Returns an empty cache if the file does not exist,
-    /// is corrupted, or was written by another cache format version.
-    pub fn load(path: &Path) -> Self {
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(_) => return Self::new(),
-        };
-        if data.len() < HEADER_LEN || &data[0..4] != CACHE_MAGIC {
-            return Self::new();
-        }
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != CACHE_VERSION {
-            return Self::new();
-        }
-        let build_start_ns = rd_u64(&data, 8);
-        let count = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-        let mut pos = HEADER_LEN;
-
-        let mut entries = HashMap::with_capacity(count.min(1 << 20));
-        for _ in 0..count {
-            if pos + 2 > data.len() {
-                break;
-            }
-            let path_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-            if pos + path_len + ENTRY_FIXED_LEN > data.len() {
-                break;
-            }
-            let path_str = match std::str::from_utf8(&data[pos..pos + path_len]) {
-                Ok(s) => s.to_string(),
-                Err(_) => break,
-            };
-            pos += path_len;
-            let stat = FileStat {
-                mtime_ns: rd_u64(&data, pos),
-                size: rd_u64(&data, pos + 8),
-                ctime_ns: rd_u64(&data, pos + 16),
-                ino: rd_u64(&data, pos + 24),
-            };
-            let content_hash = rd_u64(&data, pos + 32);
-            let trigram_count =
-                u32::from_le_bytes(data[pos + 40..pos + 44].try_into().unwrap()) as usize;
-            pos += ENTRY_FIXED_LEN;
-            let Some(end) = trigram_count
-                .checked_mul(3)
-                .and_then(|n| n.checked_add(pos))
-                .filter(|&e| e <= data.len())
-            else {
-                break;
-            };
-            let mut trigrams: Vec<[u8; 3]> = data[pos..end]
-                .chunks_exact(3)
-                .map(|c| [c[0], c[1], c[2]])
-                .collect();
-            pos = end;
-            // The builder relies on sorted, unique trigram lists.
-            if !trigrams.is_sorted_by(|a, b| a < b) {
-                trigrams.sort_unstable();
-                trigrams.dedup();
-            }
-            entries.insert(
-                path_str,
-                CachedFile {
-                    stat,
-                    content_hash,
-                    trigrams,
-                },
-            );
-        }
-        Self {
-            entries,
-            build_start_ns,
-        }
-    }
-
-    /// Save the cache to a file (atomically via a temp file + rename).
-    ///
-    /// Streams entries through a buffered writer instead of materializing the
-    /// whole file in memory first.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let valid: Vec<(&String, &CachedFile)> = self
-            .entries
-            .iter()
-            .filter(|(p, cf)| {
-                p.len() <= u16::MAX as usize && cf.trigrams.len() <= u32::MAX as usize
-            })
-            .collect();
-        if valid.len() > u32::MAX as usize {
-            return Ok(());
-        }
-
-        let parent = path.parent().unwrap_or(std::path::Path::new("."));
+impl SidecarWriter {
+    pub fn create(path: &Path, sidecar_id: u64, count: usize) -> Result<Self> {
+        let count_u32 = u32::try_from(count)
+            .map_err(|_| XgrepError::IndexError("too many files for the sidecar".into()))?;
+        let parent = path.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
         let temp_path = parent.join(format!(".xgrep_cache_tmp_{}", std::process::id()));
-        let result = (|| -> Result<()> {
-            let mut w = BufWriter::with_capacity(256 * 1024, fs::File::create(&temp_path)?);
-            w.write_all(CACHE_MAGIC)?;
-            w.write_all(&CACHE_VERSION.to_le_bytes())?;
-            w.write_all(&self.build_start_ns.to_le_bytes())?;
-            w.write_all(&(valid.len() as u32).to_le_bytes())?;
-            for (path_str, cf) in &valid {
-                let path_bytes = path_str.as_bytes();
-                w.write_all(&(path_bytes.len() as u16).to_le_bytes())?;
-                w.write_all(path_bytes)?;
-                w.write_all(&cf.stat.mtime_ns.to_le_bytes())?;
-                w.write_all(&cf.stat.size.to_le_bytes())?;
-                w.write_all(&cf.stat.ctime_ns.to_le_bytes())?;
-                w.write_all(&cf.stat.ino.to_le_bytes())?;
-                w.write_all(&cf.content_hash.to_le_bytes())?;
-                w.write_all(&(cf.trigrams.len() as u32).to_le_bytes())?;
-                for t in &cf.trigrams {
-                    w.write_all(t)?;
-                }
-            }
-            w.flush()?;
-            Ok(())
-        })();
-        if let Err(e) = result {
-            let _ = fs::remove_file(&temp_path);
-            return Err(e);
+        let mut out = Self {
+            w: Some(BufWriter::with_capacity(
+                256 * 1024,
+                fs::File::create(&temp_path)?,
+            )),
+            temp_path,
+            path: path.to_path_buf(),
+            remaining: count,
+        };
+        let w = out.w.as_mut().expect("just created");
+        w.write_all(CACHE_MAGIC)?;
+        w.write_all(&CACHE_VERSION.to_le_bytes())?;
+        w.write_all(&sidecar_id.to_le_bytes())?;
+        w.write_all(&count_u32.to_le_bytes())?;
+        Ok(out)
+    }
+
+    fn writer(&mut self) -> Result<&mut BufWriter<fs::File>> {
+        if self.remaining == 0 {
+            return Err(XgrepError::IndexError(
+                "internal error: too many sidecar entries".into(),
+            ));
         }
-        fs::rename(&temp_path, path)?;
+        self.remaining -= 1;
+        Ok(self.w.as_mut().expect("writer present until finish"))
+    }
+
+    /// Encode the entry of one file (`grams` sorted by trigram). Lets callers
+    /// encode entries in parallel and append them with [`Self::write_raw`].
+    pub fn encode_entry(grams: &[Gram]) -> Result<Vec<u8>> {
+        let mut body = Vec::with_capacity(grams.len() * 2);
+        let mut prev = 0u32;
+        for g in grams {
+            let k = g.key();
+            encode_varint(&mut body, k - prev);
+            prev = k;
+        }
+        let count = u32::try_from(grams.len())
+            .map_err(|_| XgrepError::IndexError("sidecar entry too large".into()))?;
+        let body_len = u32::try_from(body.len())
+            .map_err(|_| XgrepError::IndexError("sidecar entry too large".into()))?;
+        let mut out = Vec::with_capacity(body.len() + 10);
+        encode_varint(&mut out, count);
+        encode_varint(&mut out, body_len);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Append the entry of one file. `grams` must be sorted by trigram.
+    pub fn write_entry(&mut self, grams: &[Gram]) -> Result<()> {
+        let entry = Self::encode_entry(grams)?;
+        self.write_raw(&entry)
+    }
+
+    /// Append an entry copied verbatim from another sidecar.
+    pub fn write_raw(&mut self, raw: &[u8]) -> Result<()> {
+        self.writer()?.write_all(raw)?;
+        Ok(())
+    }
+
+    /// Flush, fsync and move the file into place.
+    pub fn finish(mut self) -> Result<()> {
+        if self.remaining != 0 {
+            return Err(XgrepError::IndexError(
+                "internal error: sidecar entry count mismatch".into(),
+            ));
+        }
+        let w = self.w.take().expect("writer present until finish");
+        let file = w.into_inner().map_err(|e| XgrepError::Io(e.into_error()))?;
+        file.sync_all()?;
+        drop(file);
+        if let Err(e) = fs::rename(&self.temp_path, &self.path) {
+            let _ = fs::remove_file(&self.temp_path);
+            return Err(e.into());
+        }
         Ok(())
     }
 }
 
-/// Return the cache file path for a given index path.
+impl Drop for SidecarWriter {
+    fn drop(&mut self) {
+        if self.w.take().is_some() {
+            // Not finished (error path): remove the temp file.
+            let _ = fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+/// Zero-copy view of a sidecar for diff updates (entries by file ID).
+pub(crate) struct SidecarView {
+    mmap: Mmap,
+    /// Start offset of each entry, plus a final end offset.
+    offsets: Vec<usize>,
+    pub sidecar_id: u64,
+}
+
+impl SidecarView {
+    /// Map and index a sidecar; `None` if missing, of another version or corrupt.
+    pub fn open(path: &Path) -> Option<Self> {
+        let file = fs::File::open(path).ok()?;
+        // SAFETY: the sidecar is only ever replaced via rename (never
+        // modified in place), and builds are serialized by the index lock.
+        let mmap = unsafe { Mmap::map(&file).ok()? };
+        if mmap.len() < HEADER_LEN || &mmap[0..4] != CACHE_MAGIC {
+            return None;
+        }
+        if u32::from_le_bytes(mmap[4..8].try_into().ok()?) != CACHE_VERSION {
+            return None;
+        }
+        let sidecar_id = u64::from_le_bytes(mmap[8..16].try_into().ok()?);
+        let count = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
+        let mut offsets = Vec::with_capacity(count.min(1 << 24) + 1);
+        let mut pos = HEADER_LEN;
+        for _ in 0..count {
+            offsets.push(pos);
+            pos = parse_entry(&mmap, pos)?.1.end;
+        }
+        offsets.push(pos);
+        Some(Self {
+            mmap,
+            offsets,
+            sidecar_id,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    /// Raw bytes of entry `i` (for verbatim copying).
+    pub fn raw(&self, i: usize) -> &[u8] {
+        &self.mmap[self.offsets[i]..self.offsets[i + 1]]
+    }
+
+    /// Sorted folded trigrams (as u32) of entry `i`; `None` if corrupt.
+    pub fn trigrams(&self, i: usize) -> Option<Vec<u32>> {
+        let (count, body) = parse_entry(&self.mmap, self.offsets[i])?;
+        decode_body(&self.mmap[body], count)
+    }
+}
+
+/// Return the sidecar (`index.cache`) path for a given index path.
 pub fn cache_path_for(index_path: &Path) -> PathBuf {
     index_path.with_extension("cache")
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    fn keys(grams: &[Gram]) -> Vec<u32> {
+        grams.iter().map(|g| g.key()).collect()
+    }
+
     #[test]
-    fn test_old_format_returns_empty() {
+    fn test_old_format_is_rejected() {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(&0u32.to_le_bytes()).unwrap();
         f.flush().unwrap();
-        let cache = TrigramCache::load(f.path());
-        assert!(cache.entries.is_empty());
+        assert!(SidecarView::open(f.path()).is_none());
     }
 
     #[test]
-    fn test_wrong_version_returns_empty() {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(b"XGCH").unwrap();
-        f.write_all(&99u32.to_le_bytes()).unwrap();
-        f.write_all(&0u64.to_le_bytes()).unwrap();
-        f.write_all(&0u32.to_le_bytes()).unwrap();
-        f.flush().unwrap();
-        let cache = TrigramCache::load(f.path());
-        assert!(cache.entries.is_empty());
+    fn test_wrong_version_is_rejected() {
+        for version in [1u32, 2, 99] {
+            // v2 layout (index v3 era): magic, version, build_start, count, entries.
+            let mut f = NamedTempFile::new().unwrap();
+            f.write_all(b"XGCH").unwrap();
+            f.write_all(&version.to_le_bytes()).unwrap();
+            f.write_all(&0u64.to_le_bytes()).unwrap();
+            f.write_all(&0u32.to_le_bytes()).unwrap();
+            f.write_all(&[0u8; 16]).unwrap();
+            f.flush().unwrap();
+            assert!(SidecarView::open(f.path()).is_none(), "v{version}");
+        }
     }
 
     #[test]
-    fn test_v1_cache_is_ignored() {
-        // v1 layout: magic, version=1, count, then {path_len, path, mtime, hash, n, trigrams}
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(b"XGCH").unwrap();
-        f.write_all(&1u32.to_le_bytes()).unwrap();
-        f.write_all(&1u32.to_le_bytes()).unwrap();
-        f.write_all(&1u16.to_le_bytes()).unwrap();
-        f.write_all(b"a").unwrap();
-        f.write_all(&[0u8; 20]).unwrap();
-        f.flush().unwrap();
-        let cache = TrigramCache::load(f.path());
-        assert!(cache.entries.is_empty());
+    fn test_missing_file() {
+        assert!(SidecarView::open(Path::new("/nonexistent/path/test.cache")).is_none());
     }
 
     #[test]
-    fn test_save_load_roundtrip() {
+    fn test_roundtrip_and_raw_copy() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.cache");
-        let mut cache = TrigramCache::new();
-        cache.build_start_ns = 42;
-        let stat = FileStat {
-            mtime_ns: 1_234_567_890_123_456_789,
-            size: 77,
-            ctime_ns: 5,
-            ino: 9,
-        };
-        cache.entries.insert(
-            "src/main.rs".to_string(),
-            CachedFile {
-                stat,
-                content_hash: 0xdeadbeef,
-                trigrams: vec![*b"fn ", *b"mai"],
-            },
-        );
-        cache.save(&path).unwrap();
-        let loaded = TrigramCache::load(&path);
-        assert_eq!(loaded.build_start_ns, 42);
-        assert_eq!(loaded.entries.len(), 1);
-        let e = loaded.entries.get("src/main.rs").unwrap();
-        assert_eq!(e.stat, stat);
-        assert_eq!(e.content_hash, 0xdeadbeef);
-        assert_eq!(e.trigrams, vec![*b"fn ", *b"mai"]);
-    }
+        let a = dir.path().join("a.cache");
+        let b = dir.path().join("b.cache");
+        let g1 = crate::trigram::extract_grams(b"hello world");
+        let g2 = crate::trigram::extract_grams(b"fn main() {}");
+        let mut w = SidecarWriter::create(&a, 42, 3).unwrap();
+        w.write_entry(&g1).unwrap();
+        w.write_entry(&[]).unwrap();
+        w.write_entry(&g2).unwrap();
+        w.finish().unwrap();
 
-    #[test]
-    fn test_magic_bytes_written() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.cache");
-        TrigramCache::new().save(&path).unwrap();
-        let data = fs::read(&path).unwrap();
+        let data = fs::read(&a).unwrap();
         assert_eq!(&data[0..4], b"XGCH");
         assert_eq!(
             u32::from_le_bytes(data[4..8].try_into().unwrap()),
             CACHE_VERSION
         );
-        assert_eq!(u32::from_le_bytes(data[16..20].try_into().unwrap()), 0);
+
+        let v = SidecarView::open(&a).unwrap();
+        assert_eq!(v.sidecar_id, 42);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.trigrams(0).unwrap(), keys(&g1));
+        assert_eq!(v.trigrams(1).unwrap(), Vec::<u32>::new());
+        assert_eq!(v.trigrams(2).unwrap(), keys(&g2));
+
+        // Raw copy round-trips.
+        let mut w = SidecarWriter::create(&b, 43, 2).unwrap();
+        w.write_raw(v.raw(2)).unwrap();
+        w.write_raw(v.raw(0)).unwrap();
+        w.finish().unwrap();
+        let v2 = SidecarView::open(&b).unwrap();
+        assert_eq!(v2.sidecar_id, 43);
+        assert_eq!(v2.trigrams(0).unwrap(), keys(&g2));
+        assert_eq!(v2.trigrams(1).unwrap(), keys(&g1));
+    }
+
+    #[test]
+    fn test_truncated_sidecar_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.cache");
+        let mut w = SidecarWriter::create(&a, 1, 1).unwrap();
+        w.write_entry(&crate::trigram::extract_grams(b"some text here"))
+            .unwrap();
+        w.finish().unwrap();
+        let data = fs::read(&a).unwrap();
+        fs::write(&a, &data[..data.len() - 1]).unwrap();
+        assert!(SidecarView::open(&a).is_none());
+    }
+
+    #[test]
+    fn test_writer_count_mismatch_is_error_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.cache");
+        let w = SidecarWriter::create(&p, 0, 1).unwrap();
+        assert!(w.finish().is_err());
+        assert!(!p.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let mut w = SidecarWriter::create(&p, 0, 0).unwrap();
+        assert!(w.write_entry(&[]).is_err());
+        drop(w);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

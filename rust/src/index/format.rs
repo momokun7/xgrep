@@ -1,79 +1,101 @@
-//! # xgrep Index Binary Format (Version 3)
+//! # xgrep Index Binary Format (Version 4)
 //!
-//! ## Design Note: Existence-Only Trigrams
+//! An index consists of two files:
 //!
-//! The current format stores **existence-only** trigrams: each posting list records
-//! which files contain a given trigram, but not the byte offsets where it appears.
-//! This keeps the index small (~8% of source size) at the cost of higher false
-//! positive rates during candidate resolution -- every candidate file must be read
-//! and verified with a full content match.
+//! * the **main index** (`index`), memory-mapped by every search. It holds only
+//!   what a search needs: the trigram table, the posting lists and the file
+//!   table / path string pool.
+//! * the **sidecar** (`index.cache`, see `index::cache`), read only by diff
+//!   updates. It stores each file's sorted folded trigram list (in file ID
+//!   order), so an update can find the posting lists a changed or deleted
+//!   file appears in. (Up to v3 this information lived in a "per-file
+//!   section" at the end of the main index *and* in a separate trigram cache:
+//!   stored twice, and 75 % of the mmap'd index.)
 //!
-//! **Positional trigrams** (as used by zoekt) store per-file byte offsets alongside
-//! file IDs, enabling distance verification at the index level. This dramatically
-//! reduces false positives (estimated 90-99% reduction for medium-length queries)
-//! but increases index size to ~20-35% of source.
+//! The main index header carries a `sidecar_id` (a hash of the indexed file
+//! list) that is also written into the sidecar; a diff update only trusts a
+//! sidecar with the same id and entry count, otherwise it rebuilds fully.
 //!
-//! Positional trigrams are planned for a future version. See
-//! `docs/positional-trigrams-design.md` for the full design document.
+//! ## Trigrams
+//!
+//! Trigrams are **ASCII case-folded** (see `trigram::fold`): case-sensitive
+//! searches look up the folded trigrams of the pattern and verify candidates
+//! by matching, and case-insensitive searches need no case-variant expansion.
+//! Each file is indexed as if a NUL sentinel byte followed its last byte, so
+//! every occurrence of a 2-byte string `ab` yields a trigram with prefix `ab`
+//! (2-byte searches are a prefix range of the sorted trigram table).
+//!
+//! ## Masks (per trigram and file)
+//!
+//! Every posting carries two bytes (after Cursor's local regex index):
+//!
+//! * `loc`: bit `p % 8` set for every start offset `p` of the trigram.
+//! * `next`: 8-bit bloom filter of the folded bytes following the trigram
+//!   (bit `trigram::next_bit(b)`).
+//!
+//! For a literal, a file can only match at start offset `s` if for every
+//! query trigram at query offset `o`, bit `(s + o) % 8` is set in that
+//! trigram's `loc` mask and the following query byte is in its `next` mask.
+//! Both checks only ever reject files that cannot contain the literal (masks
+//! are a superset of the true positions/followers), so they never cause
+//! false negatives.
 //!
 //! ```text
 //! ┌──────────────────────────────────────────┐
 //! │ Header (32 bytes)                        │
 //! │   magic: [u8; 4]        = "XGRP"        │
-//! │   version: u32           = 3             │
+//! │   version: u32           = 4             │
 //! │   trigram_count: u32                     │
 //! │   file_count: u32                        │
 //! │   posting_total_bytes: u64               │
-//! │   per_file_section_offset: u64           │
+//! │   sidecar_id: u64                        │
 //! ├──────────────────────────────────────────┤
 //! │ Trigram Table (16 bytes × trigram_count) │
-//! │   trigram: [u8; 3]                       │
+//! │   trigram: [u8; 3]   (folded, sorted)    │
 //! │   _padding: u8                           │
 //! │   posting_offset: u64                    │
-//! │   posting_len: u32                       │
+//! │   posting_len: u32   (bytes)             │
 //! ├──────────────────────────────────────────┤
 //! │ Posting Lists (variable length)          │
-//! │   Per trigram:                            │
+//! │   Per trigram:                           │
 //! │     count: varint                        │
-//! │     file_ids: varint[] (delta-encoded)   │
+//! │     file_ids: varint[count] (delta)      │
+//! │     masks: [loc: u8, next: u8][count]    │
 //! ├──────────────────────────────────────────┤
 //! │ File Table (28 bytes × file_count)       │
 //! │   path_offset: u32                       │
-//! │   mtime: u64                             │
+//! │   mtime: u64  (ns)                       │
 //! │   size: u64                              │
 //! │   content_hash: u64                      │
 //! ├──────────────────────────────────────────┤
 //! │ String Pool (variable length)            │
 //! │   Null-terminated file paths             │
-//! ├──────────────────────────────────────────┤
-//! │ Per-File Section (variable length)       │
-//! │   file_count: u32                        │
-//! │   Per file:                              │
-//! │     mtime: u64                           │
-//! │     content_hash: u64                    │
-//! │     trigram_count: u32                   │
-//! │     trigrams: [u32; trigram_count]       │
 //! └──────────────────────────────────────────┘
 //! ```
 //!
-//! All integers are little-endian. Trigram table is sorted by trigram bytes
-//! for binary search. Posting lists use LEB128 varint encoding with delta
-//! compression (file IDs stored as differences from previous).
+//! All integers are little-endian. The trigram table is sorted by trigram
+//! bytes for binary search; `posting_len` (known without decoding) is used as
+//! the cost estimate for query planning. Posting lists use LEB128 varint
+//! encoding with delta compression (file IDs stored as differences from the
+//! previous one); the masks follow the IDs so ID-only decoding can stop early.
+//!
+//! Older indexes (v2/v3) are rejected by the reader and rebuilt from scratch.
 
 pub const MAGIC: [u8; 4] = *b"XGRP";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
+/// Oldest index version that is recognised (and migrated by a rebuild).
 pub const VERSION_V2: u32 = 2;
 
 /// Header: 32 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
-    pub magic: [u8; 4],               // 4
-    pub version: u32,                 // 4
-    pub trigram_count: u32,           // 4
-    pub file_count: u32,              // 4
-    pub posting_total_bytes: u64,     // 8
-    pub per_file_section_offset: u64, // 8
+    pub magic: [u8; 4],           // 4
+    pub version: u32,             // 4
+    pub trigram_count: u32,       // 4
+    pub file_count: u32,          // 4
+    pub posting_total_bytes: u64, // 8
+    pub sidecar_id: u64,          // 8
 }
 
 /// Trigram Table entry: 16 bytes
@@ -117,7 +139,7 @@ impl Header {
         bytes[8..12].copy_from_slice(&self.trigram_count.to_le_bytes());
         bytes[12..16].copy_from_slice(&self.file_count.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.posting_total_bytes.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.per_file_section_offset.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.sidecar_id.to_le_bytes());
         bytes
     }
 }
@@ -203,6 +225,28 @@ pub fn decode_varint(data: &[u8]) -> (u32, usize) {
         shift += 7;
     }
     (result, data.len())
+}
+
+/// Pack a posting's masks into the u16 form used in memory (`loc | next << 8`).
+#[inline]
+pub fn pack_masks(loc: u8, next: u8) -> u16 {
+    loc as u16 | (next as u16) << 8
+}
+
+/// Encode one posting list: `count`, delta-encoded IDs, then `[loc, next]`
+/// per entry. `ids` must be sorted ascending; `masks[i]` belongs to `ids[i]`.
+pub fn encode_posting(buf: &mut Vec<u8>, ids: &[u32], masks: &[u16]) {
+    debug_assert_eq!(ids.len(), masks.len());
+    encode_varint(buf, ids.len() as u32);
+    let mut prev = 0u32;
+    for &fid in ids {
+        encode_varint(buf, fid - prev);
+        prev = fid;
+    }
+    buf.reserve(masks.len() * 2);
+    for &m in masks {
+        buf.extend_from_slice(&m.to_le_bytes());
+    }
 }
 
 #[cfg(test)]

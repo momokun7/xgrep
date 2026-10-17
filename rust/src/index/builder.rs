@@ -10,9 +10,9 @@ use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
 use xxhash_rust::xxh64::Xxh64;
 
-use crate::index::cache::{CachedFile, FileStat, TrigramCache};
+use crate::index::cache::{FileStat, SidecarView, SidecarWriter};
 use crate::index::format::*;
-use crate::trigram;
+use crate::trigram::{self, Gram};
 
 /// Size of the 24-bit trigram space; flat arrays indexed by trigram use this length.
 const TRIGRAM_SPACE: usize = 1 << 24;
@@ -49,7 +49,10 @@ const BINARY_PEEK_BYTES: usize = 8192;
 ///
 /// Deletions and additions behave similarly. The break-even point is ~20-25 %;
 /// 15 % leaves margin for corpora where an early deletion forces an ID remap
-/// of most posting lists.
+/// of most posting lists. (Measured with index v3. With v4 a full build no
+/// longer reuses cached trigrams; on a 13.8K-file / 361 MB corpus diff
+/// updates of 1/5/10 % of the files took 0.12/0.13/0.16 s vs 0.24 s for a
+/// full build, so the threshold stays conservative.)
 const DIFF_FALLBACK_PERCENT: usize = 15;
 
 macro_rules! debug_log {
@@ -295,6 +298,7 @@ fn is_xgrep_internal(name: &str) -> bool {
         || name.ends_with(".xgrep.fp")    // fingerprint file
         || name.ends_with(".xgrep.fp.tmp")
         || name.ends_with(".xgrep.bincache")
+        || name.ends_with(".xgrep.cache") // default sidecar (index.xgrep.cache)
         || name.ends_with(".xgrep.lock")  // build lock file
         || name.starts_with(".xgrep_tmp_") // atomic write tmp files
         || name.starts_with(".xgrep_cache_tmp_")
@@ -535,16 +539,51 @@ impl FingerprintState {
     }
 }
 
+/// Sidecar path: the given cache path, or `<index>.cache` appended to the
+/// index file name (e.g. `index.xgrep.cache`, skipped by the corpus walk).
+fn sidecar_path(index_path: &Path, cache_path: Option<&Path>) -> PathBuf {
+    match cache_path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let mut s = index_path.as_os_str().to_os_string();
+            s.push(".cache");
+            PathBuf::from(s)
+        }
+    }
+}
+
+/// Id tying a main index to the sidecar written with it: a hash of the file
+/// list (paths, stat data, content hashes). Deterministic, so rebuilding an
+/// unchanged corpus yields a byte-identical index; a sidecar and an index
+/// with equal ids describe the same file contents.
+fn sidecar_id_for(files: &[FileInfo]) -> u64 {
+    let mut h = Xxh64::new(0x5eed);
+    h.update(&(files.len() as u64).to_le_bytes());
+    for fi in files {
+        h.update(fi.relative_path.as_bytes());
+        h.update(&[0u8]);
+        h.update(&fi.stat.mtime_ns.to_le_bytes());
+        h.update(&fi.stat.size.to_le_bytes());
+        h.update(&fi.content_hash.to_le_bytes());
+    }
+    h.digest().max(1)
+}
+
 /// Build or update the search index.
 ///
 /// Returns `true` if the index was (re)built, `false` if nothing relevant
 /// changed and no rebuild was needed.
+///
+/// `cache_path` is where the index sidecar (per-file trigram data used by
+/// builds only, see `index::cache`) lives; `None` uses `<index>.cache`.
 ///
 /// Change detection compares nanosecond mtime + size per file (plus ctime and
 /// inode in the corpus fingerprint on unix). Files whose mtime falls in the
 /// same second as (or after) the previous build's start are "racily clean":
 /// their stat data cannot prove they are unchanged, so they are re-verified by
 /// content hash (the same approach git uses for its index).
+///
+/// An index in an older format version is always rebuilt from scratch.
 pub fn build_index_with_cache(
     root: &Path,
     index_path: &Path,
@@ -561,6 +600,7 @@ fn build_index_with_limit(
     max: Option<u64>,
 ) -> Result<bool> {
     let lock_path = index_path.with_extension("lock");
+    let sidecar = sidecar_path(index_path, cache_path);
 
     // Taken before the walk: any modification made after the walk stat'ed a
     // file has mtime >= build_start and is therefore racy or mismatching.
@@ -572,7 +612,9 @@ fn build_index_with_limit(
         build_start_ns,
     };
 
-    let stored = if index_path.exists() {
+    // Only an index in the current format can be kept or diff-updated.
+    let current = crate::index::reader::index_version(index_path) == Some(VERSION);
+    let stored = if current {
         read_fingerprint(&fp.path)
     } else {
         None
@@ -588,7 +630,7 @@ fn build_index_with_limit(
 
     let _lock_guard = acquire_lock(index_path)?;
 
-    if index_path.exists() {
+    if current {
         // Previous build start; without it (legacy fingerprint file) fall back to
         // the index file's mtime, which is never earlier than the build start.
         let prev_start_ns = stored
@@ -599,12 +641,14 @@ fn build_index_with_limit(
                     .map(|m| FileStat::from_metadata(&m).mtime_ns)
             })
             .unwrap_or(0);
-        if let Some(v) = try_build_index_diff(root, index_path, &walk, prev_start_ns, max, &fp)? {
+        if let Some(v) =
+            try_build_index_diff(root, index_path, &sidecar, &walk, prev_start_ns, max, &fp)?
+        {
             return Ok(v);
         }
     }
 
-    full_build(root, index_path, cache_path, walk, max, build_start_ns)?;
+    full_build(root, index_path, &sidecar, walk, max)?;
     fp.write();
     Ok(true)
 }
@@ -615,68 +659,41 @@ struct FileInfo {
     content_hash: u64,
 }
 
-/// Full (from scratch) build. Reuses unchanged files' trigrams from the cache.
+/// Full (from scratch) build: reads and indexes every file.
+///
+/// (Up to index v3 unchanged files' trigrams were reused from a trigram
+/// cache. The v4 sidecar no longer stores masks, which live only in the
+/// posting lists, so a full build re-reads everything; most updates take the
+/// diff path instead.)
 fn full_build(
     root: &Path,
     index_path: &Path,
-    cache_path: Option<&Path>,
+    sidecar: &Path,
     walk: Vec<WalkEntry>,
     max: Option<u64>,
-    build_start_ns: u64,
 ) -> Result<()> {
-    // Move (not clone) cache hits out of the cache; a hit requires identical
-    // stat data and must not be racy relative to the build that produced it.
-    let mut slots: Vec<Option<CachedFile>> = Vec::with_capacity(walk.len());
-    {
-        let mut cache = cache_path.map(TrigramCache::load).unwrap_or_default();
-        let cache_start = cache.build_start_ns;
-        for e in &walk {
-            let hit = match cache.entries.remove(e.rel.as_str()) {
-                Some(c)
-                    if c.stat == e.stat
-                        && !c.stat.is_racy(cache_start)
-                        && !exceeds_max(e.stat.size, max) =>
-                {
-                    Some(c)
-                }
-                _ => None,
-            };
-            slots.push(hit);
-        }
-    }
-
     struct Indexed {
         content_hash: u64,
-        trigrams: Vec<[u8; 3]>,
-        from_cache: bool,
+        grams: Vec<Gram>,
     }
 
+    let t0 = std::time::Instant::now();
     let results: Vec<ReadOutcome<Indexed>> = walk
         .par_iter()
-        .zip(slots.into_par_iter())
-        .map(|(e, slot)| {
-            if let Some(c) = slot {
-                return ReadOutcome::Text(Indexed {
-                    content_hash: c.content_hash,
-                    trigrams: c.trigrams,
-                    from_cache: true,
-                });
-            }
+        .map(|e| {
             if exceeds_max(e.stat.size, max) {
                 debug_log!("skipping {} ({} bytes > max filesize)", e.rel, e.stat.size);
                 return ReadOutcome::TooLarge;
             }
             with_text_file(&root.join(&e.rel), e.stat.size, max, |content| Indexed {
                 content_hash: xxhash_rust::xxh64::xxh64(content, 0),
-                trigrams: trigram::extract_trigrams(content),
-                from_cache: false,
+                grams: trigram::extract_grams(content),
             })
         })
         .collect();
 
     let mut files: Vec<FileInfo> = Vec::with_capacity(results.len());
-    let mut file_trigrams: Vec<Vec<[u8; 3]>> = Vec::with_capacity(results.len());
-    let (mut cache_hits, mut cache_misses) = (0usize, 0usize);
+    let mut file_grams: Vec<Vec<Gram>> = Vec::with_capacity(results.len());
     // Known binaries, so later diff updates need not re-read them.
     let mut binaries: HashMap<String, (u64, u64)> = HashMap::new();
     for (e, r) in walk.into_iter().zip(results) {
@@ -688,47 +705,41 @@ fn full_build(
             }
             ReadOutcome::TooLarge | ReadOutcome::Unreadable => continue,
         };
-        if r.from_cache {
-            cache_hits += 1;
-        } else {
-            cache_misses += 1;
-        }
         files.push(FileInfo {
             relative_path: e.rel,
             stat: e.stat,
             content_hash: r.content_hash,
         });
-        file_trigrams.push(r.trigrams);
+        file_grams.push(r.grams);
     }
 
-    write_full_index(index_path, &files, &file_trigrams)?;
-    save_binary_cache(&binary_cache_path(index_path), &binaries);
-
-    if let Some(cp) = cache_path {
-        let entries = files
-            .iter()
-            .zip(file_trigrams)
-            .map(|(fi, trigrams)| {
-                (
-                    fi.relative_path.clone(),
-                    CachedFile {
-                        stat: fi.stat,
-                        content_hash: fi.content_hash,
-                        trigrams,
-                    },
-                )
-            })
-            .collect();
-        TrigramCache {
-            entries,
-            build_start_ns,
+    // Sidecar first: if the main index write then fails, the id mismatch
+    // makes the next build ignore the sidecar (full rebuild).
+    let t1 = std::time::Instant::now();
+    let sidecar_id = sidecar_id_for(&files);
+    {
+        // Encode in parallel, a bounded chunk at a time (keeps peak memory low).
+        let mut w = SidecarWriter::create(sidecar, sidecar_id, files.len())?;
+        for chunk in file_grams.chunks(4096) {
+            let encoded: Vec<Result<Vec<u8>>> = chunk
+                .par_iter()
+                .map(|g| SidecarWriter::encode_entry(g))
+                .collect();
+            for e in encoded {
+                w.write_raw(&e?)?;
+            }
         }
-        .save(cp)?;
+        w.finish()?;
     }
-
-    if cache_hits > 0 {
-        eprintln!("[cache: {} hits, {} misses]", cache_hits, cache_misses);
-    }
+    let t2 = std::time::Instant::now();
+    write_full_index(index_path, &files, &file_grams, sidecar_id)?;
+    debug_log!(
+        "full build: read+extract {:?}, sidecar {:?}, index {:?}",
+        t1 - t0,
+        t2 - t1,
+        t2.elapsed()
+    );
+    save_binary_cache(&binary_cache_path(index_path), &binaries);
     Ok(())
 }
 
@@ -760,22 +771,21 @@ fn sync_dir(dir: &Path) {
     let _ = dir;
 }
 
-/// Write a complete v3 index to a temp file and atomically move it into place.
+/// Write a complete v4 main index to a temp file and atomically move it into place.
 ///
 /// Layout: header, trigram table (placeholder, filled at the end), postings
 /// (written by `write_postings`, which must push one sorted `TrigramEntry` per
-/// trigram), file table, string pool, per-file section (`write_per_file`).
+/// trigram), file table, string pool.
 /// The temp file is fsync'ed before the rename and removed on error.
-fn write_index_atomic<P, F>(
+fn write_index_atomic<P>(
     index_path: &Path,
     trigram_count: usize,
     files: &[FileInfo],
+    sidecar_id: u64,
     write_postings: P,
-    write_per_file: F,
 ) -> Result<()>
 where
     P: FnOnce(&mut BufWriter<fs::File>, &mut Vec<TrigramEntry>) -> Result<u64>,
-    F: FnOnce(&mut BufWriter<fs::File>) -> Result<()>,
 {
     let trigram_count_u32 =
         u32::try_from(trigram_count).map_err(|_| index_too_large("unique trigram count"))?;
@@ -793,7 +803,7 @@ where
             trigram_count: trigram_count_u32,
             file_count: file_count_u32,
             posting_total_bytes: 0,
-            per_file_section_offset: 0,
+            sidecar_id,
         };
         w.write_all(&header.to_bytes())?;
         write_zeros(&mut w, trigram_count * TrigramEntry::SIZE)?;
@@ -828,8 +838,6 @@ where
         w.write_all(&string_pool)?;
         drop(string_pool);
 
-        header.per_file_section_offset = w.stream_position()?;
-        write_per_file(&mut w)?;
         w.flush()?;
         let mut file = w.into_inner().map_err(|e| XgrepError::Io(e.into_error()))?;
 
@@ -854,19 +862,6 @@ where
     }
     fs::rename(&temp_path, index_path)?;
     sync_dir(parent);
-    Ok(())
-}
-
-/// Write one per-file section entry: `[mtime][content_hash][count][u32 trigrams...]`.
-fn write_pf_entry<W: Write>(w: &mut W, fi: &FileInfo, sorted_u32: &[u32]) -> Result<()> {
-    let n =
-        u32::try_from(sorted_u32.len()).map_err(|_| index_too_large("per-file trigram count"))?;
-    w.write_all(&fi.stat.mtime_ns.to_le_bytes())?;
-    w.write_all(&fi.content_hash.to_le_bytes())?;
-    w.write_all(&n.to_le_bytes())?;
-    for &t in sorted_u32 {
-        w.write_all(&t.to_le_bytes())?;
-    }
     Ok(())
 }
 
@@ -900,13 +895,13 @@ struct DenseTrigrams {
 }
 
 impl DenseTrigrams {
-    fn build(file_trigrams: &[Vec<[u8; 3]>]) -> Self {
+    fn build(file_grams: &[Vec<Gram>]) -> Self {
         let mut bits = vec![0u64; TRIGRAM_SPACE / 64];
         {
             let atomic = as_atomic_u64(&mut bits);
-            file_trigrams.par_iter().for_each(|ts| {
-                for &t in ts {
-                    let t = trigram_to_u32(t);
+            file_grams.par_iter().for_each(|gs| {
+                for g in gs {
+                    let t = g.key();
                     atomic[(t >> 6) as usize].fetch_or(1u64 << (t & 63), Ordering::Relaxed);
                 }
             });
@@ -951,7 +946,7 @@ fn build_range(
     dlo: usize,
     counts: &mut [u32],
     dt: &DenseTrigrams,
-    file_trigrams: &[Vec<[u8; 3]>],
+    file_grams: &[Vec<Gram>],
 ) -> Result<RangeOut> {
     let mut out = RangeOut {
         bytes: Vec::new(),
@@ -972,32 +967,29 @@ fn build_range(
             .checked_add(v)
             .ok_or_else(|| index_too_large("trigram occurrences in one range"))?;
     }
-    let mut buf: Vec<u32> = vec![0; acc as usize];
-    for (fid, ts) in file_trigrams.iter().enumerate() {
-        let start = ts.partition_point(|&t| trigram_to_u32(t) < t_lo);
-        for &t in &ts[start..] {
-            let t = trigram_to_u32(t);
+    let mut ids: Vec<u32> = vec![0; acc as usize];
+    let mut masks: Vec<u16> = vec![0; acc as usize];
+    for (fid, gs) in file_grams.iter().enumerate() {
+        let start = gs.partition_point(|g| g.key() < t_lo);
+        for g in &gs[start..] {
+            let t = g.key();
             if t > t_hi {
                 break;
             }
             let slot = &mut counts[dt.dense(t) - dlo];
-            buf[*slot as usize] = fid as u32;
+            ids[*slot as usize] = fid as u32;
+            masks[*slot as usize] = pack_masks(g.loc, g.next);
             *slot += 1;
         }
     }
 
     // After the scatter, counts[i] is the end of the i-th trigram's list.
-    out.bytes.reserve(acc as usize * 2);
+    out.bytes.reserve(acc as usize * 3);
     let mut prev_end: u32 = 0;
     for (i, &end) in counts.iter().enumerate() {
-        let ids = &buf[prev_end as usize..end as usize];
+        let (a, b) = (prev_end as usize, end as usize);
         let before = out.bytes.len();
-        encode_varint(&mut out.bytes, ids.len() as u32);
-        let mut prev = 0u32;
-        for &fid in ids {
-            encode_varint(&mut out.bytes, fid - prev);
-            prev = fid;
-        }
+        encode_posting(&mut out.bytes, &ids[a..b], &masks[a..b]);
         let len = u32::try_from(out.bytes.len() - before)
             .map_err(|_| index_too_large("posting list size"))?;
         out.lens.push((dt.list[dlo + i], len));
@@ -1006,9 +998,9 @@ fn build_range(
     Ok(out)
 }
 
-/// Core full-index write (v3 format with per-file section).
+/// Core full main-index write.
 ///
-/// `file_trigrams[i]` must be sorted and deduplicated. All per-trigram state
+/// `file_grams[i]` must be sorted by trigram (unique). All per-trigram state
 /// lives in flat arrays indexed by dense trigram number (no hashing);
 /// counting is parallel (atomic increments), and posting lists are built per
 /// trigram range in parallel, a bounded number of ranges at a time, so no
@@ -1016,27 +1008,28 @@ fn build_range(
 fn write_full_index(
     index_path: &Path,
     files: &[FileInfo],
-    file_trigrams: &[Vec<[u8; 3]>],
+    file_grams: &[Vec<Gram>],
+    sidecar_id: u64,
 ) -> Result<()> {
     if files.len() > u32::MAX as usize {
         return Err(index_too_large("file count"));
     }
 
     // 1. Distinct trigrams and per-trigram file counts.
-    let dt = DenseTrigrams::build(file_trigrams);
+    let dt = DenseTrigrams::build(file_grams);
     let unique = dt.list.len();
     let mut counts: Vec<u32> = vec![0; unique];
     {
         let atomic = as_atomic_u32(&mut counts);
-        file_trigrams.par_iter().for_each(|ts| {
-            for &t in ts {
-                atomic[dt.dense(trigram_to_u32(t))].fetch_add(1, Ordering::Relaxed);
+        file_grams.par_iter().for_each(|gs| {
+            for g in gs {
+                atomic[dt.dense(g.key())].fetch_add(1, Ordering::Relaxed);
             }
         });
     }
 
     // 2. Range boundaries balanced by occurrence count.
-    let total_pairs: usize = file_trigrams.iter().map(|t| t.len()).sum();
+    let total_pairs: usize = file_grams.iter().map(|t| t.len()).sum();
     let threads = rayon::current_num_threads().max(1);
     let target = (total_pairs / (threads * 8)).clamp(1 << 16, 1 << 24);
     let mut bounds: Vec<usize> = vec![0];
@@ -1066,95 +1059,29 @@ fn write_full_index(
     // Ranges in flight at once (bounds peak memory of the scatter buffers).
     let batch = (threads * 2).max(1);
 
-    write_index_atomic(
-        index_path,
-        unique,
-        files,
-        |w, entries| {
-            let mut offset: u64 = 0;
-            for chunk in ranges.chunks_mut(batch) {
-                let outs: Vec<Result<RangeOut>> = chunk
-                    .par_iter_mut()
-                    .map(|(dlo, slice)| build_range(*dlo, slice, &dt, file_trigrams))
-                    .collect();
-                for out in outs {
-                    let out = out?;
-                    w.write_all(&out.bytes)?;
-                    for (t, len) in out.lens {
-                        entries.push(TrigramEntry {
-                            trigram: u32_to_trigram(t),
-                            _padding: 0,
-                            posting_offset: offset,
-                            posting_len: len,
-                        });
-                        offset += len as u64;
-                    }
+    write_index_atomic(index_path, unique, files, sidecar_id, |w, entries| {
+        let mut offset: u64 = 0;
+        for chunk in ranges.chunks_mut(batch) {
+            let outs: Vec<Result<RangeOut>> = chunk
+                .par_iter_mut()
+                .map(|(dlo, slice)| build_range(*dlo, slice, &dt, file_grams))
+                .collect();
+            for out in outs {
+                let out = out?;
+                w.write_all(&out.bytes)?;
+                for (t, len) in out.lens {
+                    entries.push(TrigramEntry {
+                        trigram: u32_to_trigram(t),
+                        _padding: 0,
+                        posting_offset: offset,
+                        posting_len: len,
+                    });
+                    offset += len as u64;
                 }
             }
-            Ok(offset)
-        },
-        |w| {
-            w.write_all(&(files.len() as u32).to_le_bytes())?;
-            let mut tmp: Vec<u32> = Vec::new();
-            for (fi, ts) in files.iter().zip(file_trigrams) {
-                tmp.clear();
-                tmp.extend(ts.iter().map(|&t| trigram_to_u32(t)));
-                write_pf_entry(w, fi, &tmp)?;
-            }
-            Ok(())
-        },
-    )
-}
-/// Compute byte offsets for each per-file entry in the raw per-file section.
-/// Returns `offsets` of length `file_count + 1`; entry `i` occupies
-/// `pf_raw[offsets[i]..offsets[i+1]]`.
-fn compute_pf_offsets(pf_raw: &[u8]) -> Option<Vec<usize>> {
-    if pf_raw.len() < 4 {
-        return None;
-    }
-    let file_count = u32::from_le_bytes(pf_raw[..4].try_into().ok()?) as usize;
-    let mut offsets = Vec::with_capacity(file_count + 1);
-    let mut pos = 4usize;
-    for _ in 0..file_count {
-        offsets.push(pos);
-        if pos + 20 > pf_raw.len() {
-            return None;
         }
-        // entry: [mtime:8][content_hash:8][trigram_count:4][trigrams:4*tc]
-        let tc = u32::from_le_bytes(pf_raw[pos + 16..pos + 20].try_into().ok()?) as usize;
-        pos += 20 + tc * 4;
-        if pos > pf_raw.len() {
-            return None;
-        }
-    }
-    offsets.push(pos); // sentinel
-    Some(offsets)
-}
-
-/// Read sorted u32 trigrams from one per-file entry starting at `start`.
-fn read_pf_trigrams(pf_raw: &[u8], start: usize) -> Vec<u32> {
-    if start + 20 > pf_raw.len() {
-        return vec![];
-    }
-    let tc =
-        u32::from_le_bytes(pf_raw[start + 16..start + 20].try_into().unwrap_or([0; 4])) as usize;
-    let trigs_start = start + 20;
-    let trigs_end = trigs_start + tc * 4;
-    if trigs_end > pf_raw.len() {
-        return vec![];
-    }
-    pf_raw[trigs_start..trigs_end]
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
-}
-
-/// Per-file section entry for the new index.
-enum PerFileSection<'a> {
-    /// Unchanged file: copy raw bytes (mtime + content_hash + trigrams) from old mmap.
-    Raw(&'a [u8]),
-    /// Changed or new file: write mtime/content_hash from FileInfo + these sorted trigrams.
-    New(Vec<u32>),
+        Ok(offset)
+    })
 }
 
 /// Set of trigrams backed by a 2^24-bit bitset plus an insertion list.
@@ -1186,40 +1113,55 @@ fn too_many_changes(changes: usize, old_file_count: usize) -> bool {
     changes * 100 > old_file_count.max(1) * DIFF_FALLBACK_PERCENT
 }
 
-/// Apply sorted `(trigram, file_id, is_add)` edits for one trigram to a sorted
-/// posting list. When a file has several edits, the last one (an addition,
-/// since `false < true`) wins.
-fn apply_posting_ops(ids: &[u32], ops: &[(u32, u32, bool)]) -> Vec<u32> {
+/// One posting edit: (trigram, new file id, is_add, packed masks).
+type PostingOp = (u32, u32, bool, u16);
+
+/// Apply sorted posting edits for one trigram to a sorted posting list
+/// (`ids[i]` has masks `masks[i]`). When a file has several edits, the last
+/// one (an addition, since `false < true`) wins.
+fn apply_posting_ops(ids: &[u32], masks: &[u16], ops: &[PostingOp]) -> (Vec<u32>, Vec<u16>) {
     let mut out = Vec::with_capacity(ids.len() + ops.len());
+    let mut out_m = Vec::with_capacity(ids.len() + ops.len());
     let (mut i, mut j) = (0usize, 0usize);
     while j < ops.len() {
         let fid = ops[j].1;
-        let mut add = false;
+        let mut add = None;
         while j < ops.len() && ops[j].1 == fid {
-            add = ops[j].2;
+            add = ops[j].2.then_some(ops[j].3);
             j += 1;
         }
         while i < ids.len() && ids[i] < fid {
             out.push(ids[i]);
+            out_m.push(masks[i]);
             i += 1;
         }
         if i < ids.len() && ids[i] == fid {
             i += 1;
         }
-        if add {
+        if let Some(m) = add {
             out.push(fid);
+            out_m.push(m);
         }
     }
     out.extend_from_slice(&ids[i..]);
-    out
+    out_m.extend_from_slice(&masks[i..]);
+    (out, out_m)
 }
 
 /// A changed or new file that was read and indexed during a diff update.
 struct DiffIndexed {
     stat: FileStat,
     content_hash: u64,
-    /// Sorted, deduplicated.
-    trigrams: Vec<u32>,
+    /// Sorted by trigram.
+    grams: Vec<Gram>,
+}
+
+/// Source of one sidecar entry of the updated index.
+enum SideSrc<'a> {
+    /// Unchanged file: entry copied verbatim from the old sidecar.
+    Raw(&'a [u8]),
+    /// Changed or new file.
+    New(&'a DiffIndexed),
 }
 
 /// Try to perform a diff-based index update.
@@ -1227,6 +1169,7 @@ struct DiffIndexed {
 fn try_build_index_diff(
     root: &Path,
     index_path: &Path,
+    sidecar: &Path,
     walk: &[WalkEntry],
     prev_start_ns: u64,
     max: Option<u64>,
@@ -1238,19 +1181,13 @@ fn try_build_index_diff(
         Ok(r) => r,
         Err(_) => return Ok(None),
     };
-
-    // per_file section raw bytes (no allocation, no parse)
-    let pf_raw = reader.per_file_section_raw();
-    if pf_raw.is_empty() {
-        return Ok(None);
-    }
-    let pf_offsets = match compute_pf_offsets(pf_raw) {
-        Some(o) => o,
-        None => return Ok(None),
-    };
-
     let old_file_count = reader.file_count() as usize;
-    if pf_offsets.len() != old_file_count + 1 {
+
+    // The sidecar must belong to exactly this index.
+    let Some(side) = SidecarView::open(sidecar) else {
+        return Ok(None);
+    };
+    if side.sidecar_id != reader.sidecar_id() || side.len() != old_file_count {
         return Ok(None);
     }
 
@@ -1365,7 +1302,7 @@ fn try_build_index_diff(
             let outcome = with_text_file(&root.join(&e.rel), e.stat.size, max, |content| {
                 (
                     xxhash_rust::xxh64::xxh64(content, 0),
-                    trigram::extract_trigrams_u32(content),
+                    trigram::extract_grams(content),
                 )
             });
             match (task, outcome) {
@@ -1376,7 +1313,7 @@ fn try_build_index_diff(
                         old_hash,
                         ..
                     },
-                    ReadOutcome::Text((hash, trigrams)),
+                    ReadOutcome::Text((hash, grams)),
                 ) => {
                     if *racy_only && hash == *old_hash {
                         Outcome::Unchanged
@@ -1386,18 +1323,18 @@ fn try_build_index_diff(
                             DiffIndexed {
                                 stat: e.stat,
                                 content_hash: hash,
-                                trigrams,
+                                grams,
                             },
                         )
                     }
                 }
                 (Task::Existing { fid, .. }, _) => Outcome::Remove(*fid),
-                (Task::New(_), ReadOutcome::Text((hash, trigrams))) => Outcome::New(
+                (Task::New(_), ReadOutcome::Text((hash, grams))) => Outcome::New(
                     e,
                     DiffIndexed {
                         stat: e.stat,
                         content_hash: hash,
-                        trigrams,
+                        grams,
                     },
                 ),
                 (Task::New(_), ReadOutcome::Binary) => Outcome::NewBinary(e),
@@ -1459,51 +1396,62 @@ fn try_build_index_diff(
         return Err(index_too_large("file count"));
     }
 
+    // Old trigrams of the files whose postings must be edited (changed files
+    // and every file from the first deleted one on, whose IDs shift).
+    let min_deleted = is_deleted.iter().position(|&d| d).unwrap_or(old_file_count);
+    let needs_old: Vec<usize> = (0..old_file_count)
+        .filter(|&fid| fid >= min_deleted || changed[fid].is_some())
+        .collect();
+    let old_trigrams: Vec<Option<Vec<u32>>> = needs_old
+        .par_iter()
+        .map(|&fid| side.trigrams(fid))
+        .collect();
+    if old_trigrams.iter().any(|t| t.is_none()) {
+        return Ok(None); // corrupt sidecar entry
+    }
+
     // affected: trigrams whose posting lists must be re-encoded. Posting lists
     // of all other trigrams are raw-copied from the old index.
     let mut affected = TrigramSet::new();
-    for (fid, slot) in changed.iter().enumerate() {
-        if let Some(d) = slot {
-            for t in read_pf_trigrams(pf_raw, pf_offsets[fid]) {
-                affected.insert(t);
-            }
-            for &t in &d.trigrams {
-                affected.insert(t);
-            }
-        }
-    }
-    for (_, d) in &new_files {
-        for &t in &d.trigrams {
+    for ts in old_trigrams.iter().flatten() {
+        for &t in ts {
             affected.insert(t);
         }
     }
-    // Deleted files, and every file after the first deleted one (its ID shifts).
-    if let Some(min_deleted) = is_deleted.iter().position(|&d| d) {
-        for &start in &pf_offsets[min_deleted..old_file_count] {
-            for t in read_pf_trigrams(pf_raw, start) {
-                affected.insert(t);
-            }
+    for d in changed.iter().flatten() {
+        for g in &d.grams {
+            affected.insert(g.key());
+        }
+    }
+    for (_, d) in &new_files {
+        for g in &d.grams {
+            affected.insert(g.key());
         }
     }
 
-    // Posting edits as (trigram, new file id, is_add), applied per trigram in a
-    // single merge pass instead of O(n) mid-list inserts/removes per file.
-    // For the same file a removal sorts before an addition, so "removed then
-    // re-added" (trigram kept by an edit) ends up present.
-    let mut ops: Vec<(u32, u32, bool)> = Vec::new();
-    for (old_fid, slot) in changed.iter().enumerate() {
-        let Some(d) = slot else { continue };
+    // Posting edits as (trigram, new file id, is_add, masks), applied per
+    // trigram in a single merge pass instead of O(n) mid-list inserts/removes
+    // per file. For the same file a removal sorts before an addition, so
+    // "removed then re-added" (trigram kept by an edit) ends up present.
+    let mut ops: Vec<PostingOp> = Vec::new();
+    for (&old_fid, ts) in needs_old.iter().zip(&old_trigrams) {
+        let Some(d) = &changed[old_fid] else { continue };
         let new_fid = old_to_new[old_fid];
+        ops.extend(ts.iter().flatten().map(|&t| (t, new_fid, false, 0)));
         ops.extend(
-            read_pf_trigrams(pf_raw, pf_offsets[old_fid])
-                .into_iter()
-                .map(|t| (t, new_fid, false)),
+            d.grams
+                .iter()
+                .map(|g| (g.key(), new_fid, true, pack_masks(g.loc, g.next))),
         );
-        ops.extend(d.trigrams.iter().map(|&t| (t, new_fid, true)));
     }
+    drop(old_trigrams);
     for (i, (_, d)) in new_files.iter().enumerate() {
         let id = base_new_id + i as u32;
-        ops.extend(d.trigrams.iter().map(|&t| (t, id, true)));
+        ops.extend(
+            d.grams
+                .iter()
+                .map(|g| (g.key(), id, true, pack_masks(g.loc, g.next))),
+        );
     }
     ops.par_sort_unstable();
 
@@ -1511,43 +1459,57 @@ fn try_build_index_diff(
     let has_deletions = n_deleted > 0;
     let mut affected_list = std::mem::take(&mut affected.list);
     affected_list.par_sort_unstable();
-    let affected_postings: Vec<(u32, Vec<u32>)> = affected_list
+    let affected_postings: Vec<(u32, Vec<u32>, Vec<u16>)> = affected_list
         .par_iter()
         .filter_map(|&t| {
-            let mut ids = reader.lookup_trigram(u32_to_trigram(t));
-            if has_deletions {
-                ids.retain(|&id| !is_deleted.get(id as usize).copied().unwrap_or(true));
-                for id in ids.iter_mut() {
-                    *id = old_to_new[*id as usize];
+            let (mut ids, mut masks) = match reader.posting_raw(u32_to_trigram(t)) {
+                Some(raw) => {
+                    let p = IndexReader::decode_posting(raw);
+                    let masks: Vec<u16> = (0..p.ids.len()).map(|i| p.packed(i)).collect();
+                    (p.ids, masks)
                 }
+                None => (Vec::new(), Vec::new()),
+            };
+            if has_deletions {
+                let mut k = 0;
+                for i in 0..ids.len() {
+                    let id = ids[i] as usize;
+                    if !is_deleted.get(id).copied().unwrap_or(true) {
+                        ids[k] = old_to_new[id];
+                        masks[k] = masks[i];
+                        k += 1;
+                    }
+                }
+                ids.truncate(k);
+                masks.truncate(k);
             }
             let lo = ops.partition_point(|o| o.0 < t);
             let hi = ops.partition_point(|o| o.0 <= t);
             if lo < hi {
-                ids = apply_posting_ops(&ids, &ops[lo..hi]);
+                (ids, masks) = apply_posting_ops(&ids, &masks, &ops[lo..hi]);
             }
-            (!ids.is_empty()).then_some((t, ids))
+            (!ids.is_empty()).then_some((t, ids, masks))
         })
         .collect();
     drop(ops);
 
-    // New file list + per-file section.
+    // New file list + sidecar entries.
     let mut files: Vec<FileInfo> = Vec::with_capacity(base_new_id as usize + new_files.len());
-    let mut pf_section: Vec<PerFileSection<'_>> = Vec::with_capacity(files.capacity());
-    for (old_id, slot) in changed.iter_mut().enumerate() {
+    let mut side_src: Vec<SideSrc<'_>> = Vec::with_capacity(files.capacity());
+    for (old_id, slot) in changed.iter().enumerate() {
         if is_deleted[old_id] {
             continue;
         }
         let path = reader.file_path(old_id as u32).to_string();
-        if let Some(d) = slot.take() {
+        if let Some(d) = slot {
             files.push(FileInfo {
                 relative_path: path,
                 stat: d.stat,
                 content_hash: d.content_hash,
             });
-            pf_section.push(PerFileSection::New(d.trigrams));
+            side_src.push(SideSrc::New(d));
         } else {
-            // Unchanged file: copy its per-file entry verbatim.
+            // Unchanged file: copy its sidecar entry verbatim.
             let fe = reader.file_entry(old_id as u32);
             let (mtime_ns, size, content_hash) = match fe {
                 Some(fe) => (fe.mtime, fe.size, fe.content_hash),
@@ -1562,33 +1524,44 @@ fn try_build_index_diff(
                 },
                 content_hash,
             });
-            pf_section.push(PerFileSection::Raw(
-                &pf_raw[pf_offsets[old_id]..pf_offsets[old_id + 1]],
-            ));
+            side_src.push(SideSrc::Raw(side.raw(old_id)));
         }
     }
-    for (e, d) in new_files {
+    for (e, d) in &new_files {
         files.push(FileInfo {
             relative_path: e.rel.clone(),
             stat: d.stat,
             content_hash: d.content_hash,
         });
-        pf_section.push(PerFileSection::New(d.trigrams));
+        side_src.push(SideSrc::New(d));
     }
 
-    write_smart_diff_index_v3(
+    // Sidecar first (see full_build for the ordering rationale). The old
+    // sidecar stays mapped; it is replaced by rename, never overwritten.
+    let sidecar_id = sidecar_id_for(&files);
+    {
+        let mut w = SidecarWriter::create(sidecar, sidecar_id, files.len())?;
+        for src in &side_src {
+            match src {
+                SideSrc::Raw(raw) => w.write_raw(raw)?,
+                SideSrc::New(d) => w.write_entry(&d.grams)?,
+            }
+        }
+        w.finish()?;
+    }
+    drop(side_src);
+
+    write_smart_diff_index(
         index_path,
         &reader,
         &files,
-        &pf_section,
         &affected_postings,
         &affected,
+        sidecar_id,
     )?;
-    drop(pf_section);
+    drop(side);
     drop(reader);
 
-    // The trigram cache is not touched here: the full-build path validates
-    // cache entries by stat data, so stale entries are simply re-read.
     fp.write();
     Ok(Some(true))
 }
@@ -1597,20 +1570,19 @@ fn try_build_index_diff(
 ///
 /// 1. Only re-encode affected posting lists.
 /// 2. Raw-copy unaffected posting lists from the old mmap.
-/// 3. Raw-copy unchanged files' per-file section entries.
 ///
 /// Precondition: all trigrams requiring ID remap must be included in `affected`.
-fn write_smart_diff_index_v3<'a>(
+fn write_smart_diff_index(
     index_path: &Path,
-    old_reader: &'a crate::index::reader::IndexReader,
+    old_reader: &crate::index::reader::IndexReader,
     files: &[FileInfo],
-    pf_section: &[PerFileSection<'a>],
-    affected_postings: &[(u32, Vec<u32>)],
+    affected_postings: &[(u32, Vec<u32>, Vec<u16>)],
     affected: &TrigramSet,
+    sidecar_id: u64,
 ) -> Result<()> {
     enum Src<'b> {
         Raw(&'b [u8]),
-        New(&'b [u32]),
+        New(&'b [u32], &'b [u16]),
     }
     // Final trigram list: (old - affected) ∪ non-empty affected, sorted.
     let mut final_list: Vec<(u32, Src<'_>)> = old_reader
@@ -1623,7 +1595,7 @@ fn write_smart_diff_index_v3<'a>(
     final_list.extend(
         affected_postings
             .iter()
-            .map(|(t, ids)| (*t, Src::New(ids.as_slice()))),
+            .map(|(t, ids, masks)| (*t, Src::New(ids.as_slice(), masks.as_slice()))),
     );
     final_list.sort_unstable_by_key(|(t, _)| *t);
 
@@ -1631,19 +1603,15 @@ fn write_smart_diff_index_v3<'a>(
         index_path,
         final_list.len(),
         files,
+        sidecar_id,
         |w, entries| {
             let mut posting_buf: Vec<u8> = Vec::with_capacity(4096);
             let mut offset: u64 = 0;
             for (t, src) in &final_list {
                 let raw: &[u8] = match src {
-                    Src::New(ids) => {
+                    Src::New(ids, masks) => {
                         posting_buf.clear();
-                        encode_varint(&mut posting_buf, ids.len() as u32);
-                        let mut prev = 0u32;
-                        for &fid in *ids {
-                            encode_varint(&mut posting_buf, fid - prev);
-                            prev = fid;
-                        }
+                        encode_posting(&mut posting_buf, ids, masks);
                         &posting_buf
                     }
                     Src::Raw(r) => r,
@@ -1661,16 +1629,6 @@ fn write_smart_diff_index_v3<'a>(
             }
             Ok(offset)
         },
-        |w| {
-            w.write_all(&(files.len() as u32).to_le_bytes())?;
-            for (fi, section) in files.iter().zip(pf_section) {
-                match section {
-                    PerFileSection::Raw(raw) => w.write_all(raw)?,
-                    PerFileSection::New(trigrams) => write_pf_entry(w, fi, trigrams)?,
-                }
-            }
-            Ok(())
-        },
     )
 }
 
@@ -1681,22 +1639,26 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// trigram → [(path, packed masks)] for the whole index.
     fn collect_trigram_to_paths(
         reader: &crate::index::reader::IndexReader,
-    ) -> std::collections::HashMap<[u8; 3], Vec<String>> {
+    ) -> std::collections::HashMap<[u8; 3], Vec<(String, u16)>> {
+        use crate::index::reader::IndexReader;
         let mut result = std::collections::HashMap::new();
         for t in reader.all_trigrams() {
-            let file_ids = reader.lookup_trigram(t);
-            let paths: Vec<String> = file_ids
+            let p = IndexReader::decode_posting(reader.posting_raw(t).unwrap());
+            let paths: Vec<(String, u16)> = p
+                .ids
                 .iter()
-                .map(|&fid| reader.file_path(fid).to_string())
+                .enumerate()
+                .map(|(i, &fid)| (reader.file_path(fid).to_string(), p.packed(i)))
                 .collect();
             result.insert(t, paths);
         }
         result
     }
 
-    fn assert_diff_eq_full(dir: &Path, index_path: &Path) {
+    pub(super) fn assert_diff_eq_full(dir: &Path, index_path: &Path) {
         use crate::index::reader::IndexReader;
 
         // Read the diff-update result.
@@ -1838,8 +1800,8 @@ mod tests {
         let data = fs::read(&index_path).unwrap();
         let header = crate::index::reader::read_header(&data[..Header::SIZE]);
         assert_eq!(header.file_count, 1);
-        // File has no trigrams (< 3 bytes)
-        assert_eq!(header.trigram_count, 0);
+        // Only the end-of-file sentinel trigram "ab\0" (see trigram::SENTINEL).
+        assert_eq!(header.trigram_count, 1);
     }
 
     #[test]
@@ -1886,64 +1848,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trigram_cache_save_load_roundtrip() {
-        let dir = tempdir().unwrap();
-        let cache_path = dir.path().join("test.cache");
-
-        let mut cache = TrigramCache::new();
-        let stat = |mtime_ns| FileStat {
-            mtime_ns,
-            size: 11,
-            ..Default::default()
-        };
-        cache.entries.insert(
-            "hello.txt".to_string(),
-            CachedFile {
-                stat: stat(12345),
-                content_hash: 99999,
-                trigrams: vec![*b"ell", *b"hel", *b"llo"],
-            },
-        );
-        cache.entries.insert(
-            "foo.rs".to_string(),
-            CachedFile {
-                stat: stat(67890),
-                content_hash: 11111,
-                trigrams: vec![*b" ma", *b"fn ", *b"n m"],
-            },
-        );
-        cache.save(&cache_path).unwrap();
-
-        let loaded = TrigramCache::load(&cache_path);
-        assert_eq!(loaded.entries.len(), 2);
-
-        let hello = loaded.entries.get("hello.txt").unwrap();
-        assert_eq!(hello.stat, stat(12345));
-        assert_eq!(hello.content_hash, 99999);
-        assert_eq!(hello.trigrams, vec![*b"ell", *b"hel", *b"llo"]);
-
-        let foo = loaded.entries.get("foo.rs").unwrap();
-        assert_eq!(foo.stat, stat(67890));
-        assert_eq!(foo.content_hash, 11111);
-        assert_eq!(foo.trigrams, vec![*b" ma", *b"fn ", *b"n m"]);
-    }
-
-    #[test]
-    fn test_trigram_cache_load_missing_file() {
-        let cache = TrigramCache::load(Path::new("/nonexistent/path/test.cache"));
-        assert!(cache.entries.is_empty());
-    }
-
-    #[test]
-    fn test_trigram_cache_load_corrupt_data() {
-        let dir = tempdir().unwrap();
-        let cache_path = dir.path().join("bad.cache");
-        fs::write(&cache_path, b"xx").unwrap(); // Less than 4 bytes
-        let cache = TrigramCache::load(&cache_path);
-        assert!(cache.entries.is_empty());
-    }
-
-    #[test]
     fn test_build_with_cache_creates_cache_file() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -1956,10 +1860,16 @@ mod tests {
         assert!(index_path.exists());
         assert!(cache_path.exists());
 
-        // Verify cache contains entries
-        let cache = TrigramCache::load(&cache_path);
-        assert_eq!(cache.entries.len(), 1);
-        assert!(cache.entries.contains_key("hello.txt"));
+        // The sidecar belongs to the index and has one entry per file.
+        let side = SidecarView::open(&cache_path).unwrap();
+        let reader = crate::index::reader::IndexReader::open(&index_path).unwrap();
+        assert_eq!(side.len(), 1);
+        assert_eq!(side.sidecar_id, reader.sidecar_id());
+        let expect: Vec<u32> = trigram::extract_grams(b"hello world")
+            .iter()
+            .map(|g| g.key())
+            .collect();
+        assert_eq!(side.trigrams(0).unwrap(), expect);
     }
 
     #[test]
@@ -2113,10 +2023,10 @@ mod tests {
         let reader2 = IndexReader::open(&index_path).unwrap();
         assert_eq!(reader2.file_count(), 1);
 
-        // Verify it was also removed from cache
-        let cache = TrigramCache::load(&cache_path);
-        assert_eq!(cache.entries.len(), 1);
-        assert!(!cache.entries.contains_key("b.txt"));
+        // Verify it was also removed from the sidecar
+        let side = SidecarView::open(&cache_path).unwrap();
+        assert_eq!(side.len(), 1);
+        assert_eq!(side.sidecar_id, reader2.sidecar_id());
     }
 
     // ----------------------------------------------------------------
@@ -2778,13 +2688,60 @@ mod tests {
 
     #[test]
     fn test_range_offset_overflow_is_an_error() {
-        let file_trigrams = vec![vec![*b"abc", *b"abd"]];
+        let g = |tri| Gram {
+            tri,
+            loc: 1,
+            next: 0,
+        };
+        let file_trigrams = vec![vec![g(*b"abc"), g(*b"abd")]];
         let dt = DenseTrigrams::build(&file_trigrams);
         let mut counts = vec![u32::MAX, 1];
         let err = build_range(0, &mut counts, &dt, &file_trigrams)
             .err()
             .expect("overflow must be reported");
         assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn test_old_version_index_is_rebuilt_even_if_fingerprint_matches() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "Hello World").unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+        // Pretend the index was written by format v3 (same fingerprint).
+        let mut data = fs::read(&index_path).unwrap();
+        data[4..8].copy_from_slice(&3u32.to_le_bytes());
+        fs::write(&index_path, &data).unwrap();
+        assert!(crate::index::reader::IndexReader::open(&index_path).is_err());
+        assert!(build_index(root, &index_path).unwrap());
+        assert_eq!(
+            crate::index::reader::index_version(&index_path),
+            Some(VERSION)
+        );
+        assert_eq!(paths_with_trigram(&index_path, *b"hel"), vec!["a.txt"]);
+    }
+
+    #[test]
+    fn test_mismatched_sidecar_falls_back_to_full_build() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..40 {
+            fs::write(root.join(format!("f{i:02}.txt")), format!("file {i}")).unwrap();
+        }
+        let index_path = root.join("index.xgrep");
+        build_index(root, &index_path).unwrap();
+        // Corrupt the sidecar: the next update must not trust it.
+        let side = sidecar_path(&index_path, None);
+        fs::write(&side, b"XGCH garbage").unwrap();
+        fs::write(root.join("f05.txt"), "changed qzx").unwrap();
+        assert!(build_index(root, &index_path).unwrap());
+        assert_eq!(paths_with_trigram(&index_path, *b"qzx"), vec!["f05.txt"]);
+        let v = crate::index::cache::SidecarView::open(&side).unwrap();
+        let reader = crate::index::reader::IndexReader::open(&index_path).unwrap();
+        assert_eq!(v.sidecar_id, reader.sidecar_id());
+        drop(reader);
+        assert_diff_eq_full(root, &index_path);
     }
 
     #[test]
@@ -2795,12 +2752,61 @@ mod tests {
             &index_path,
             1,
             &[],
+            7,
             |_, _| Ok(0), // pushes no entries: internal mismatch error
-            |_| Ok(()),
         );
         assert!(res.is_err());
         assert!(!index_path.exists());
         let leftovers: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "temp file must be cleaned up");
+    }
+}
+
+#[cfg(test)]
+mod diff_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn content() -> impl Strategy<Value = String> {
+        "[abAB c\n_x]{0,60}"
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// A diff update (edits, deletions, additions; few enough to stay
+        /// under the fallback threshold) yields exactly the postings and
+        /// masks of a full rebuild.
+        #[test]
+        fn prop_diff_update_eq_full_rebuild(
+            initial in prop::collection::vec(content(), 40),
+            edits in prop::collection::vec((0usize..3, 0usize..48, content()), 1..6),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            for (i, c) in initial.iter().enumerate() {
+                fs::write(root.join(format!("f{i:02}.txt")), c).unwrap();
+            }
+            let index_path = root.join("index.xgrep");
+            build_index(root, &index_path).unwrap();
+            for (kind, n, c) in &edits {
+                let p = root.join(format!("f{n:02}.txt"));
+                match kind {
+                    0 => fs::write(&p, c).unwrap(),
+                    1 => {
+                        let _ = fs::remove_file(&p);
+                    }
+                    _ => fs::write(root.join(format!("new{n:02}.txt")), c).unwrap(),
+                }
+            }
+            build_index(root, &index_path).unwrap();
+            // Sidecar and index stay paired.
+            let reader = crate::index::reader::IndexReader::open(&index_path).unwrap();
+            let side = crate::index::cache::SidecarView::open(&sidecar_path(&index_path, None)).unwrap();
+            prop_assert_eq!(side.sidecar_id, reader.sidecar_id());
+            prop_assert_eq!(side.len(), reader.file_count() as usize);
+            drop(reader);
+            tests::assert_diff_eq_full(root, &index_path);
+        }
     }
 }
