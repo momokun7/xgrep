@@ -7,6 +7,7 @@ on:
     branches: [main]
   schedule:
     - cron: "0 3 * * 1" # Every Monday at 03:00 UTC
+  workflow_dispatch: # run on demand, e.g. after index-format changes
 
 permissions:
   contents: read
@@ -43,7 +44,7 @@ jobs:
 
   fuzz-run:
     name: Fuzz run (${{ matrix.target }})
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
