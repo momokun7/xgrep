@@ -20,6 +20,11 @@ Examples of unacceptable behavior:
 - Public or private harassment
 - Publishing others' private information without explicit permission
 
+## Scope
+
+This Code of Conduct applies within all community spaces, and also applies when
+an individual is officially representing the community in public spaces.
+
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
