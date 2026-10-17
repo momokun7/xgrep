@@ -1,8 +1,55 @@
 # Positional Trigrams Design Document
 
-**Status:** Draft
+**Status:** Superseded by index format v4 (position *masks* instead of full positions; see below)
 **Issue:** #29
-**Target:** Index Format v3
+**Target:** Index Format v3 (not implemented as designed)
+
+## Status: what index format v4 implements instead
+
+Full positional posting lists (below) were never built. Index format v4
+(`rust/src/index/format.rs`) takes the lighter approach of Cursor's local
+regex index: each (trigram, file) posting carries two 8-bit masks.
+
+- `loc`: bit `p % 8` set for every start offset `p` of the trigram in the file
+  (a 3-bit "position modulo 8", the block-level idea of mitigation 2 below
+  taken to the extreme).
+- `next`: an 8-bit bloom filter of the byte following the trigram, which lets
+  a trigram index answer "quadgram" checks.
+
+For a literal, a file stays a candidate only if some start offset `s` (mod 8)
+is consistent with every query trigram's `loc` mask (rotated by its offset in
+the literal) and every following query byte is in the preceding trigram's
+`next` mask. Masks are supersets of the true positions/followers, so this
+never drops a real match (property-tested against brute force). Other v4
+changes made at the same time:
+
+- Trigrams are ASCII case-folded: case-sensitive searches use folded
+  candidates and verify by matching; case-insensitive searches need no
+  8-way case-variant expansion.
+- The per-file trigram lists (only needed by diff updates) moved out of the
+  mmap'd index into the `index.cache` sidecar, which replaces the old
+  trigram cache, so the information is no longer stored twice.
+- Files end with a virtual NUL sentinel, so 2-byte queries are a single
+  prefix range of the trigram table (no scan of the whole table).
+- Literal query planning: trigrams are ordered by posting byte length, any
+  missing trigram short-circuits before decoding, at most the 12 rarest are
+  decoded, and intersection stops as soon as it is empty.
+
+Measured on 13.8K files / 361 MB of crates.io sources (v3 → v4):
+
+| | v3 | v4 |
+|---|---:|---:|
+| main (mmap'd) index | 86.5 MB | 48.1 MB |
+| index + cache/sidecar on disk | 136.4 MB | 69.2 MB |
+| candidates → matching files, `unsafe impl` (`-s`) | 901 → 285 | 306 → 285 |
+| `fn main` | 1357 → 855 | 1072 → 855 |
+| `serialize` | 972 → 445 | 573 → 445 |
+| `impl Drop for` | 182 → 166 | 167 → 166 |
+| `unwrap_or_else(\|\| panic` | 70 → 11 | 18 → 11 |
+
+Over twelve literal queries the masks cut false-positive candidates by 77 %
+(`loc` alone: 45 %, `next` alone: 68 %). Full positions remain an option if a
+future format needs exact distance checks.
 
 ## Background
 
