@@ -65,8 +65,8 @@ impl Xgrep {
     /// Open a directory for searching. Index location is auto-resolved.
     #[napi(factory)]
     pub fn open(root: String) -> Result<Xgrep> {
-        let inner = xgrep_search::Xgrep::open(&root)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let inner =
+            xgrep_search::Xgrep::open(&root).map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(Xgrep { inner })
     }
 
