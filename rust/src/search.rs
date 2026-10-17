@@ -21,7 +21,7 @@ thread_local! {
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     let mut lowered = haystack.as_bytes().to_vec();
     lowered.make_ascii_lowercase();
-    let needle_lower = needle.to_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
     memmem::Finder::new(needle_lower.as_bytes())
         .find(&lowered)
         .is_some()
@@ -289,8 +289,9 @@ pub(crate) fn search(
     let perf = std::env::var_os("XGREP_PERF_TIMING").is_some();
     let t0 = perf.then(std::time::Instant::now);
 
+    // ASCII-only, matching the content folding in CaseInsensitiveMatcher.
     let search_pattern = if case_insensitive {
-        pattern.to_lowercase()
+        pattern.to_ascii_lowercase()
     } else {
         pattern.to_string()
     };
@@ -355,7 +356,7 @@ pub(crate) fn search_files(
 
     let results = if case_insensitive {
         let matcher = CaseInsensitiveMatcher {
-            pattern_lower: pattern.to_lowercase().into_bytes(),
+            pattern_lower: pattern.to_ascii_lowercase().into_bytes(),
         };
         scan_direct(root, files, &matcher, quiet)
     } else {

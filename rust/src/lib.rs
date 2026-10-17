@@ -53,7 +53,7 @@ pub use filetype::extensions_for_type;
 pub use filetype::list_all_types;
 pub use search::SearchResult;
 
-/// Returns true if the pattern contains an uppercase ASCII letter.
+/// Returns true if the pattern contains an uppercase letter.
 ///
 /// Used to implement smart-case: a pattern with no uppercase letters is
 /// searched case-insensitively unless the caller forces sensitivity.
@@ -61,9 +61,10 @@ pub use search::SearchResult;
 /// are not treated as uppercase literals. `\\D` (escaped backslash followed
 /// by `D`) does count.
 ///
-/// Non-ASCII letters never count as uppercase, matching the engine's
-/// ASCII-only case folding. In regex mode a trailing backslash is treated as
-/// an incomplete escape and contributes no uppercase.
+/// Non-ASCII uppercase letters (e.g. `Ä`) count too, so such patterns stay
+/// case-sensitive: literal search only folds ASCII, and the regex engine
+/// would otherwise fold them with Unicode rules. In regex mode a trailing
+/// backslash is treated as an incomplete escape and contributes no uppercase.
 ///
 /// # Examples
 ///
@@ -71,21 +72,20 @@ pub use search::SearchResult;
 /// use xgrep_search::pattern_has_uppercase;
 /// assert!(!pattern_has_uppercase("hello", false));
 /// assert!(pattern_has_uppercase("Hello", false));
+/// assert!(pattern_has_uppercase("Äbc", false));
 /// assert!(!pattern_has_uppercase(r"\W+foo", true));
 /// ```
 pub fn pattern_has_uppercase(pattern: &str, regex: bool) -> bool {
-    let bytes = pattern.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if regex && bytes[i] == b'\\' {
-            // Skip the escape sequence (backslash + next byte)
-            i += 2;
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if regex && c == '\\' {
+            // Skip the escape sequence (backslash + next char)
+            chars.next();
             continue;
         }
-        if bytes[i].is_ascii_uppercase() {
+        if c.is_uppercase() {
             return true;
         }
-        i += 1;
     }
     false
 }
