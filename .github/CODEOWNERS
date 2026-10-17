@@ -1,0 +1,9 @@
+# High-risk paths (see REVIEW.md, "Risk tiers"). These always need the maintainer.
+/.github/                       @momokun7
+/release-please-config.json     @momokun7
+/rust/Cargo.toml                @momokun7
+/rust/src/index/                @momokun7
+/rust/src/watch.rs              @momokun7
+/rust/src/mcp_tools.rs          @momokun7
+/npm/                           @momokun7
+/python/                        @momokun7
