@@ -453,6 +453,189 @@ pub fn render_list(items: &[SearchResult], mode: OutputMode, cfg: &RenderCfg) ->
     page
 }
 
+/// Blocks up to this many lines are shown whole; longer ones are elided to
+/// the signature, windows around the matches and the closing line.
+pub const BLOCK_FULL_LINES: usize = 80;
+/// Lines shown around each match inside an elided block.
+const BLOCK_WINDOW: usize = 2;
+/// Line length cap inside blocks.
+const BLOCK_LINE_CHARS: usize = 300;
+
+/// Render one block (or its collapsed pointer). Returns text and shown ranges.
+fn render_block(
+    b: &crate::syntax::tools::Block,
+    lines: &[String],
+    duplicates: Option<&Vec<String>>,
+) -> (String, Vec<(usize, usize)>) {
+    let last = lines.len().max(1);
+    let start = b.start.clamp(1, last);
+    let end = b.end.clamp(start, last.max(start));
+    let mut ranges: Vec<(usize, usize)> = if end - start < BLOCK_FULL_LINES {
+        vec![(start, end)]
+    } else {
+        let mut r = vec![(start, b.head_end.clamp(start, (start + 5).min(end)))];
+        for &m in &b.matches {
+            r.push((
+                m.saturating_sub(BLOCK_WINDOW).max(start),
+                (m + BLOCK_WINDOW).min(end),
+            ));
+        }
+        r.push((end, end));
+        r.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in r {
+            match merged.last_mut() {
+                Some(l) if s <= l.1 + 1 => l.1 = l.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        merged
+    };
+    ranges.retain(|(s, e)| s <= e);
+    let body_lines: Vec<String> = {
+        let width = end.to_string().len();
+        let mut v = Vec::new();
+        let mut prev: Option<usize> = None;
+        for &(s, e) in &ranges {
+            if let Some(p) = prev {
+                if s > p + 1 {
+                    v.push(format!("{:>width$}  ⋮ ({} lines)", "", s - p - 1));
+                }
+            }
+            for n in s..=e {
+                let text = lines.get(n - 1).map(|l| l.as_str()).unwrap_or("");
+                let marker = if b.matches.binary_search(&n).is_ok() {
+                    '>'
+                } else {
+                    ' '
+                };
+                v.push(format!(
+                    "{:>width$}{} {}",
+                    n,
+                    marker,
+                    truncate_line(text, BLOCK_LINE_CHARS)
+                ));
+            }
+            prev = Some(e);
+        }
+        v
+    };
+    let body = body_lines.join("\n");
+    let fence = fence_for(&body);
+    let n = b.matches.len();
+    let mut out = format!(
+        "## {}:{}-{}{} ({} match{}{})\n\n{}{}\n{}\n{}\n",
+        b.file,
+        start,
+        end,
+        b.label
+            .as_ref()
+            .map(|l| format!(" {}", l))
+            .unwrap_or_default(),
+        n,
+        if n == 1 { "" } else { "es" },
+        if ranges.len() > 1 { ", elided" } else { "" },
+        fence,
+        lang_of(&b.file),
+        body,
+        fence
+    );
+    if let Some(d) = duplicates {
+        out.push_str(&format!("(identical content also in: {})\n", d.join(", ")));
+    }
+    (out, ranges)
+}
+
+/// Render `expand:"block"` results: units are blocks, greedily packed into
+/// `max_tokens`; blocks already shown in this session collapse to a pointer.
+pub fn render_blocks(
+    blocks: &[crate::syntax::tools::Block],
+    cfg: &RenderCfg,
+    session: &mut Session,
+) -> Page {
+    let total = blocks.len();
+    let start = cfg.offset.min(total);
+    let mut page = Page {
+        start,
+        total,
+        ..Default::default()
+    };
+    let mut files: HashMap<Arc<str>, Vec<String>> = HashMap::new();
+    let mut used = 0usize;
+    let mut dup_noted: std::collections::HashSet<Arc<str>> = Default::default();
+    for b in blocks.iter().skip(start).take(cfg.max_results.max(1)) {
+        let collapsed = !cfg.include_seen
+            && session
+                .seen_range(&b.file, b.start)
+                .is_some_and(|(_, e)| e >= b.end);
+        let (mut text, marks) = if collapsed {
+            (
+                format!(
+                    "already shown: {}:L{}-{} ({} match{})\n",
+                    b.file,
+                    b.start,
+                    b.end,
+                    b.matches.len(),
+                    if b.matches.len() == 1 { "" } else { "es" }
+                ),
+                Vec::new(),
+            )
+        } else {
+            let lines = files.entry(b.file.clone()).or_insert_with(|| {
+                let bytes = std::fs::read(cfg.root.join(&*b.file)).unwrap_or_default();
+                String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .map(|l| l.to_string())
+                    .collect()
+            });
+            let dups = if dup_noted.insert(b.file.clone()) {
+                cfg.duplicates.get(&*b.file)
+            } else {
+                None
+            };
+            render_block(b, lines, dups)
+        };
+        if page.shown > 0 {
+            text.insert(0, '\n');
+        }
+        let t = estimate_tokens(&text);
+        if page.shown > 0 && used + t > cfg.max_tokens {
+            break;
+        }
+        if page.shown == 0 && t > cfg.max_tokens {
+            let max_chars = cfg.max_tokens.saturating_mul(4).max(200);
+            if text.len() > max_chars {
+                let mut cut = max_chars;
+                while !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+                text.push_str(&format!(
+                    "\n…[block cut at max_tokens={}; use read_file with start_line/end_line]\n",
+                    cfg.max_tokens
+                ));
+                page.hard_truncated = true;
+            }
+        }
+        used += estimate_tokens(&text);
+        if collapsed {
+            page.collapsed_seen += b.matches.len();
+        }
+        for (s, e) in marks {
+            session.mark(&b.file, s, e);
+        }
+        page.body.push_str(&text);
+        page.shown += 1;
+        if page.hard_truncated {
+            break;
+        }
+    }
+    if start + page.shown < total {
+        page.next_offset = Some(start + page.shown);
+    }
+    page
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,5 +666,68 @@ mod tests {
     fn line_ranges_compress() {
         assert_eq!(line_ranges(&[1, 2, 3, 7, 9, 10], 10), "L1-3,L7,L9-10");
         assert_eq!(line_ranges(&[1, 3, 5], 2), "L1,L3,…(+1 more ranges)");
+    }
+
+    fn block(start: usize, end: usize, matches: Vec<usize>) -> crate::syntax::tools::Block {
+        crate::syntax::tools::Block {
+            file: Arc::from("a.rs"),
+            start,
+            end,
+            head_end: start,
+            label: Some("fn f".into()),
+            matches,
+        }
+    }
+
+    #[test]
+    fn small_block_is_whole_and_marked() {
+        let lines: Vec<String> = (1..=10).map(|i| format!("line {}", i)).collect();
+        let (t, r) = render_block(&block(2, 5, vec![3]), &lines, None);
+        assert!(t.starts_with("## a.rs:2-5 fn f (1 match)"), "{}", t);
+        assert!(t.contains("3> line 3"), "{}", t);
+        assert!(t.contains("2  line 2"), "{}", t);
+        assert_eq!(r, vec![(2, 5)]);
+    }
+
+    #[test]
+    fn long_block_is_elided() {
+        let lines: Vec<String> = (1..=300).map(|i| format!("l{}", i)).collect();
+        let (t, r) = render_block(&block(1, 300, vec![150]), &lines, None);
+        assert!(t.contains("elided"), "{}", t);
+        assert!(t.contains("150> l150"));
+        assert!(t.contains("⋮"));
+        assert!(!t.contains("l100\n"));
+        assert_eq!(r, vec![(1, 1), (148, 152), (300, 300)]);
+    }
+
+    #[test]
+    fn render_blocks_collapses_seen_and_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let content: String = (1..=20).map(|i| format!("x{}\n", i)).collect();
+        std::fs::write(dir.path().join("a.rs"), content).unwrap();
+        let blocks = vec![block(1, 5, vec![2]), block(10, 15, vec![12])];
+        let dups = HashMap::new();
+        let cfg = RenderCfg {
+            root: dir.path(),
+            before: 0,
+            after: 0,
+            max_results: 1,
+            offset: 0,
+            max_tokens: 4000,
+            include_seen: false,
+            highlight: None,
+            duplicates: &dups,
+        };
+        let mut session = Session::new();
+        let p = render_blocks(&blocks, &cfg, &mut session);
+        assert_eq!(p.shown, 1);
+        assert_eq!(p.next_offset, Some(1));
+        let again = render_blocks(&blocks, &cfg, &mut session);
+        assert!(
+            again.body.starts_with("already shown: a.rs:L1-5"),
+            "{}",
+            again.body
+        );
+        assert_eq!(again.collapsed_seen, 1);
     }
 }

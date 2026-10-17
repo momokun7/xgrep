@@ -34,9 +34,36 @@ mimalloc = { version = "0.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 glob = "0.3"
+# Syntax-aware features (outline, tags-based definitions, block expansion,
+# references, repo map). Optional so `--no-default-features` builds stay
+# C-compiler free and small.
+tree-sitter = { version = "0.25", optional = true }
+streaming-iterator = { version = "0.1", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
 
 [features]
-default = []
+default = ["syntax"]
+syntax = [
+    "dep:tree-sitter",
+    "dep:streaming-iterator",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-ruby",
+]
 fuzz = []
 
 [dev-dependencies]

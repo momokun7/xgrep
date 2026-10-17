@@ -64,8 +64,12 @@ pub fn tool_result(text: &str, is_error: bool) -> Value {
 
 /// Instructions sent to the client on `initialize`.
 pub const INSTRUCTIONS: &str = "xgrep is an indexed code search engine. Pick the tool by intent: \
-find_definitions = where a symbol is declared; search = where text occurs (usages, strings; \
-word:true for identifiers; output_mode:'locations' or 'files' to survey cheaply; queries:[...] \
+repo_map = ranked overview of the important symbols (start here in an unfamiliar repo); \
+outline = a file's symbols and line ranges without bodies; \
+find_definitions = where a symbol is declared; find_references = call sites with their callers; \
+search = where text occurs (usages, strings; \
+word:true for identifiers; expand:'block' for whole enclosing functions; \
+output_mode:'locations' or 'files' to survey cheaply; queries:[...] \
 for several searches in one call); find_files = files by name/glob; read_file = a line window \
 of one file. Results are ranked (definitions and source first) and paginated: the header gives \
 the exact total and next_offset. Ranges already returned in this session are collapsed to \
@@ -150,16 +154,19 @@ pub fn handle_message_with(xg: &Xgrep, session: &Mutex<Session>, msg: &Message) 
                 "index_status" => mcp_tools::handle_index_status(xg),
                 "read_file" => mcp_tools::handle_read_file(xg, session, &arguments),
                 "session_reset" => mcp_tools::handle_session_reset(session),
-                _ => {
-                    return Some(error_response(
-                        id,
-                        -32602,
-                        &format!(
-                            "Unknown tool: {}. Available: search, find_definitions, find_files, read_file, index_status, build_index, session_reset",
-                            tool_name
-                        ),
-                    ));
-                }
+                other => match mcp_tools::handle_extra(other, xg, session, &arguments) {
+                    Some(r) => r,
+                    None => {
+                        return Some(error_response(
+                            id,
+                            -32602,
+                            &format!(
+                                "Unknown tool: {}. Available: search, find_definitions, find_references, find_files, outline, repo_map, read_file, index_status, build_index, session_reset",
+                                tool_name
+                            ),
+                        ));
+                    }
+                },
             };
 
             Some(success_response(id, tool_result(&text, is_error)))
