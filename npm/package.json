@@ -29,19 +29,17 @@
     "test": "node __test__/index.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2"
+    "@napi-rs/cli": "^3.10.8"
   },
   "napi": {
-    "name": "xgrep",
-    "triples": {
-      "defaults": true,
-      "additional": [
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu"
-      ]
-    }
+    "binaryName": "xgrep",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
   },
   "files": [
     "index.js",
