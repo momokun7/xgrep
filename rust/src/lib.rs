@@ -645,6 +645,14 @@ impl Xgrep {
 
     /// Compile the main pattern plus `opts.and_patterns` / `opts.not_patterns`.
     fn compile_query(&self, pattern: &str, opts: &SearchOptions) -> Result<search::CompiledQuery> {
+        Self::build_query(pattern, opts, self.config.quiet)
+    }
+
+    fn build_query(
+        pattern: &str,
+        opts: &SearchOptions,
+        quiet: bool,
+    ) -> Result<search::CompiledQuery> {
         let spec = search::QuerySpec {
             main: Self::pattern_spec(pattern, opts),
             and: opts
@@ -659,7 +667,7 @@ impl Xgrep {
                 .collect(),
             case_insensitive: opts.case_insensitive,
         };
-        search::CompiledQuery::new(spec, self.config.quiet)
+        search::CompiledQuery::new(spec, quiet)
     }
 
     /// Execute a search. Auto-build, hybrid search, and git-changed-file search are handled internally.
@@ -1499,6 +1507,20 @@ impl Xgrep {
             })
         }
     }
+}
+
+/// Search `content` (for example standard input) as one file named `name`,
+/// without an index. Path options in `opts` (`globs`, `file_type`,
+/// `changed_only`, `since`) do not apply. Returns `None` if nothing matches.
+pub fn search_bytes(
+    content: &[u8],
+    name: &str,
+    pattern: &str,
+    opts: &SearchOptions,
+    mode: OutputMode,
+) -> Result<Option<FileMatches>> {
+    let q = Xgrep::build_query(pattern, opts, true)?;
+    Ok(q.eval(content, name, mode))
 }
 
 /// Start the MCP server (stdio transport).

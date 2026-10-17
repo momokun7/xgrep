@@ -188,8 +188,73 @@ pub fn run_cli() {
     }
 
     if let Err(e) = run() {
+        // The reader went away (`xg ... | head`): stop quietly, as Unix does
+        // through SIGPIPE above. Windows has no SIGPIPE.
+        if is_broken_pipe(&e) {
+            std::process::exit(0);
+        }
         eprintln!("error: {}", e);
         std::process::exit(2);
+    }
+}
+
+/// True if `e` comes from writing to a pipe whose reader has closed it.
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        let io = c
+            .downcast_ref::<std::io::Error>()
+            .or_else(|| match c.downcast_ref() {
+                Some(crate::error::XgrepError::Io(io)) => Some(io),
+                _ => None,
+            });
+        io.is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// True if standard input is a pipe or a regular file that should be searched
+/// when no PATH is given (`cat file | xg pattern`), as ripgrep decides: not a
+/// terminal, and not a character device such as `/dev/null` or `NUL`, which
+/// is what tools and agents usually leave on standard input.
+fn stdin_is_readable() -> bool {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::FileTypeExt;
+        let Ok(fd) = stdin.as_fd().try_clone_to_owned() else {
+            return false;
+        };
+        std::fs::File::from(fd).metadata().is_ok_and(|m| {
+            let t = m.file_type();
+            t.is_file() || t.is_fifo() || t.is_socket()
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileType(handle: *mut std::ffi::c_void) -> u32;
+        }
+        const FILE_TYPE_DISK: u32 = 1;
+        const FILE_TYPE_PIPE: u32 = 3;
+        let handle = stdin.as_raw_handle();
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: GetFileType only queries the type of a valid handle.
+        matches!(
+            unsafe { GetFileType(handle) },
+            FILE_TYPE_DISK | FILE_TYPE_PIPE
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
     }
 }
 
@@ -319,28 +384,31 @@ fn run() -> Result<()> {
         Some(Commands::Status { path }) => {
             let dir = resolve_dir(path.as_deref())?;
             let xg = Xgrep::open(&dir)?;
+            let mut out = std::io::stdout().lock();
             if xg.index_path().exists() {
                 let info = xg.index_status()?;
-                println!("{}", info);
+                writeln!(out, "{}", info)?;
                 if let Ok(meta) = std::fs::metadata(xg.index_path()) {
                     if let Ok(modified) = meta.modified() {
                         let age = modified.elapsed().unwrap_or_default();
-                        println!("Last built: {}s ago", age.as_secs());
+                        writeln!(out, "Last built: {}s ago", age.as_secs())?;
                     }
                 }
             } else {
-                println!("No index found");
-                println!("Index path: {}", xg.index_path().display());
-                println!("Run 'xg init' to build the index");
+                writeln!(out, "No index found")?;
+                writeln!(out, "Index path: {}", xg.index_path().display())?;
+                writeln!(out, "Run 'xg init' to build the index")?;
             }
         }
         None => {
             if cli.list_types {
                 let types = crate::list_all_types();
+                let mut out = std::io::BufWriter::new(std::io::stdout().lock());
                 for (name, exts) in &types {
                     let ext_str: Vec<String> = exts.iter().map(|e| format!("*.{}", e)).collect();
-                    println!("{:<14}{}", name, ext_str.join(", "));
+                    writeln!(out, "{:<14}{}", name, ext_str.join(", "))?;
                 }
+                out.flush()?;
                 return Ok(());
             }
 
@@ -380,10 +448,27 @@ fn run() -> Result<()> {
                 std::process::exit(2);
             });
 
-            let use_absolute = cli.absolute_paths
-                || std::env::var("XGREP_ABSOLUTE_PATHS")
-                    .map(|v| v == "1" || v == "true")
-                    .unwrap_or(false);
+            // Search standard input for `xg PATTERN -`, or for `xg PATTERN`
+            // when standard input is a pipe or file (`cat log | xg error`).
+            let explicit_stdin = cli.paths.iter().any(|p| p.as_os_str() == "-");
+            if explicit_stdin && cli.paths.len() > 1 {
+                anyhow::bail!("'-' (standard input) cannot be combined with other PATHs");
+            }
+            let stdin_mode = !cli.find
+                && cli.in_diff.is_none()
+                && !cli.log
+                && (explicit_stdin || (cli.paths.is_empty() && stdin_is_readable()));
+            if stdin_mode && (cli.changed || cli.since.is_some() || cli.fresh || expand_block) {
+                anyhow::bail!(
+                    "--changed, --since, --fresh and --expand block search files, not standard input"
+                );
+            }
+
+            let use_absolute = !stdin_mode
+                && (cli.absolute_paths
+                    || std::env::var("XGREP_ABSOLUTE_PATHS")
+                        .map(|v| v == "1" || v == "true")
+                        .unwrap_or(false));
 
             // Regex hint detection (only in literal mode, not --find, not suppressed)
             let show_hints = !cli.regex
@@ -460,8 +545,9 @@ fn run() -> Result<()> {
                 let limit = cli.max_count.unwrap_or(usize::MAX);
                 let files: Vec<String> = files.into_iter().take(limit).collect();
 
+                let mut out = std::io::BufWriter::new(std::io::stdout().lock());
                 if cli.count {
-                    println!("{}", files.len());
+                    writeln!(out, "{}", files.len())?;
                 } else if cli.json_output {
                     let paths: Vec<String> = if use_absolute {
                         files
@@ -471,19 +557,21 @@ fn run() -> Result<()> {
                     } else {
                         files
                     };
-                    println!(
+                    writeln!(
+                        out,
                         "{}",
                         serde_json::to_string_pretty(&paths).unwrap_or_else(|_| "[]".to_string())
-                    );
+                    )?;
                 } else {
                     for f in &files {
                         if use_absolute {
-                            println!("{}", dir.join(f).display());
+                            writeln!(out, "{}", dir.join(f).display())?;
                         } else {
-                            println!("{}", f);
+                            writeln!(out, "{}", f)?;
                         }
                     }
                 }
+                out.flush()?;
                 return Ok(());
             }
 
@@ -605,7 +693,9 @@ fn run() -> Result<()> {
                 return Ok(());
             }
 
-            let targets: Vec<Option<&Path>> = if cli.paths.is_empty() {
+            let targets: Vec<Option<&Path>> = if stdin_mode {
+                Vec::new()
+            } else if cli.paths.is_empty() {
                 vec![None]
             } else {
                 cli.paths.iter().map(|p| Some(p.as_path())).collect()
@@ -623,8 +713,23 @@ fn run() -> Result<()> {
                 .collect();
             // With several PATHs, results are re-rooted at the deepest common
             // ancestor so file names stay unambiguous.
-            let base = common_base(&dirs);
+            let base = if stdin_mode {
+                PathBuf::new()
+            } else {
+                common_base(&dirs)
+            };
             let multi = resolved.len() > 1;
+            // Read up front: context output needs the text again.
+            let stdin_content = if stdin_mode {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
+                Some(buf)
+            } else {
+                None
+            };
+            let stdin_text = stdin_content
+                .as_deref()
+                .map(|b| String::from_utf8_lossy(b).into_owned());
 
             let stdout = std::io::stdout();
             let mut out = std::io::BufWriter::new(stdout.lock());
@@ -653,9 +758,17 @@ fn run() -> Result<()> {
             } else if cli.json_output {
                 Emitter::Json(output::JsonLinesWriter::new(&base, use_absolute))
             } else if cli.format == "llm" {
-                Emitter::Llm(output::LlmWriter::new(&base, &llm_opts))
+                let w = output::LlmWriter::new(&base, &llm_opts);
+                Emitter::Llm(match stdin_text.clone() {
+                    Some(t) => w.with_text(t),
+                    None => w,
+                })
             } else if has_context {
-                Emitter::Context(output::ContextWriter::new(&base, &ctx_opts))
+                let w = output::ContextWriter::new(&base, &ctx_opts);
+                Emitter::Context(match stdin_text.clone() {
+                    Some(t) => w.with_text(t),
+                    None => w,
+                })
             } else {
                 Emitter::Plain(&ctx_opts)
             };
@@ -674,6 +787,16 @@ fn run() -> Result<()> {
             let mut io_err: Option<std::io::Error> = None;
             // --expand block renders after the search, so collect lines.
             let mut collected: Vec<crate::SearchResult> = Vec::new();
+            if let Some(content) = &stdin_content {
+                if let Some(mut fm) =
+                    crate::search_bytes(content, "<stdin>", &pattern, &base_opts, mode)?
+                {
+                    fm.lines.truncate(remaining);
+                    fm.count = fm.count.min(remaining);
+                    total = fm.count;
+                    emitter.write(&mut out, &fm, &base, false)?;
+                }
+            }
             for (target, dir) in resolved.iter().zip(&dirs) {
                 if remaining == 0 {
                     break;

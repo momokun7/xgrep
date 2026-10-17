@@ -286,6 +286,7 @@ pub struct ContextWriter<'a> {
     root: &'a Path,
     opts: &'a TextOptions,
     first_group: bool,
+    text: Option<String>,
 }
 
 impl<'a> ContextWriter<'a> {
@@ -295,7 +296,15 @@ impl<'a> ContextWriter<'a> {
             root,
             opts,
             first_group: true,
+            text: None,
         }
+    }
+
+    /// Take context lines from `text` instead of reading the file (for input
+    /// that cannot be read again, such as standard input).
+    pub fn with_text(mut self, text: String) -> Self {
+        self.text = Some(text);
+        self
     }
 
     /// Write the results of one or more files (grouped and sorted by file).
@@ -317,7 +326,10 @@ impl<'a> ContextWriter<'a> {
         matches: &MatchMap<'_>,
     ) -> io::Result<()> {
         let opts = self.opts;
-        let content = read_display_text(&self.root.join(file)).unwrap_or_default();
+        let content = self
+            .text
+            .clone()
+            .unwrap_or_else(|| read_display_text(&self.root.join(file)).unwrap_or_default());
         let lines: Vec<&str> = content.lines().collect();
         let path = display_path(self.root, file, opts.absolute_paths);
         let ranges = context_ranges(
@@ -534,6 +546,7 @@ pub struct LlmWriter<'a> {
     shown_any_line: bool,
     /// Set once output was cut: files with matches not shown so far.
     files_left: Option<usize>,
+    text: Option<String>,
 }
 
 impl<'a> LlmWriter<'a> {
@@ -552,7 +565,15 @@ impl<'a> LlmWriter<'a> {
             total_matches: 0,
             shown_any_line: false,
             files_left: None,
+            text: None,
         }
+    }
+
+    /// Take context lines from `text` instead of reading the file (for input
+    /// that cannot be read again, such as standard input).
+    pub fn with_text(mut self, text: String) -> Self {
+        self.text = Some(text);
+        self
     }
 
     fn put<W: Write>(&mut self, w: &mut W, text: &str) -> io::Result<()> {
@@ -585,7 +606,10 @@ impl<'a> LlmWriter<'a> {
         }
         let opts = self.opts;
         let limit = self.limit;
-        let content = read_display_text(&self.root.join(file)).unwrap_or_default();
+        let content = self
+            .text
+            .clone()
+            .unwrap_or_else(|| read_display_text(&self.root.join(file)).unwrap_or_default());
         let lines: Vec<&str> = content.lines().collect();
         let path = display_path(self.root, file, opts.absolute_paths);
         let lang = Path::new(file)
