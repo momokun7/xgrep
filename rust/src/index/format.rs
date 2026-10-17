@@ -159,6 +159,7 @@ pub fn u32_to_trigram(v: u32) -> [u8; 3] {
     [(v >> 16) as u8, (v >> 8) as u8, v as u8]
 }
 
+#[cfg(test)]
 /// Convert Vec<[u8;3]> to a sorted unique u32 list
 pub fn trigrams_to_sorted_u32(trigrams: &[[u8; 3]]) -> Vec<u32> {
     let mut v: Vec<u32> = trigrams.iter().map(|&t| trigram_to_u32(t)).collect();
@@ -332,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_trigram_to_u32_roundtrip() {
-        let t = [b'h', b'e', b'l'];
+        let t = *b"hel";
         let v = trigram_to_u32(t);
         assert_eq!(u32_to_trigram(v), t);
     }
