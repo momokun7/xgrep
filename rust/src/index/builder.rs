@@ -96,6 +96,121 @@ fn parse_size(s: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok()?.checked_mul(mult)
 }
 
+/// Files left out of the index because they exceed the max file size,
+/// recorded at build time in a small JSON sidecar (`<index>.oversize`) so
+/// `status` and zero-result hints can mention them. The main index format is
+/// not involved; the sidecar is absent when nothing was skipped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OversizeInfo {
+    /// The limit in effect for the build, in bytes.
+    pub limit: u64,
+    /// Number of walked files larger than `limit`.
+    pub count: usize,
+    /// A few of them (largest first), relative to the root.
+    pub examples: Vec<String>,
+}
+
+/// Maximum number of example paths kept in [`OversizeInfo`].
+const OVERSIZE_EXAMPLES: usize = 5;
+
+impl OversizeInfo {
+    /// `10MB`, `512KB`, `1.5MB`-style rendering of the limit.
+    pub fn limit_display(&self) -> String {
+        human_size(self.limit)
+    }
+
+    /// One-line explanation for zero-result hints: what is missing and how
+    /// to search it anyway (`how` names the way to search single files).
+    pub fn hint(&self, how: &str) -> String {
+        let eg = match self.examples.first() {
+            Some(p) => format!(" (e.g. {})", p),
+            None => String::new(),
+        };
+        format!(
+            "{} over {} {} not indexed{}, so indexed searches cannot find matches in {}; set {}=0 (or a larger size) and rebuild the index, or {}",
+            if self.count == 1 {
+                "1 file".to_string()
+            } else {
+                format!("{} files", self.count)
+            },
+            self.limit_display(),
+            if self.count == 1 { "is" } else { "are" },
+            eg,
+            if self.count == 1 { "it" } else { "them" },
+            MAX_FILESIZE_ENV,
+            how
+        )
+    }
+}
+
+/// Human-readable byte count with binary units (`10MB` = 10 MiB).
+pub fn human_size(n: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
+    for (unit, size) in UNITS {
+        if n >= size {
+            return if n % size == 0 {
+                format!("{}{}", n / size, unit)
+            } else {
+                format!("{:.1}{}", n as f64 / size as f64, unit)
+            };
+        }
+    }
+    format!("{}B", n)
+}
+
+/// Path of the oversize sidecar for an index file.
+pub fn oversize_path(index_path: &Path) -> PathBuf {
+    let mut s = index_path.as_os_str().to_os_string();
+    s.push(".oversize");
+    PathBuf::from(s)
+}
+
+/// Files skipped for size by the last build of `index_path` (`None` when
+/// none were, or the index predates this record).
+pub fn read_oversize(index_path: &Path) -> Option<OversizeInfo> {
+    let data = fs::read(oversize_path(index_path)).ok()?;
+    serde_json::from_slice::<OversizeInfo>(&data)
+        .ok()
+        .filter(|i| i.count > 0)
+}
+
+/// Record the walked files over `max` (cheap: stat data only). Errors are
+/// ignored; the record is informational.
+fn write_oversize(index_path: &Path, walk: &[WalkEntry], max: Option<u64>) {
+    let path = oversize_path(index_path);
+    let Some(limit) = max else {
+        let _ = fs::remove_file(&path);
+        return;
+    };
+    let mut big: Vec<&WalkEntry> = walk.iter().filter(|e| e.stat.size > limit).collect();
+    if big.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    big.sort_by(|a, b| b.stat.size.cmp(&a.stat.size).then(a.rel.cmp(&b.rel)));
+    let info = OversizeInfo {
+        limit,
+        count: big.len(),
+        examples: big
+            .iter()
+            .take(OVERSIZE_EXAMPLES)
+            .map(|e| e.rel.clone())
+            .collect(),
+    };
+    if read_oversize(index_path).as_ref() == Some(&info) {
+        return;
+    }
+    let Ok(json) = serde_json::to_vec(&info) else {
+        return;
+    };
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if fs::write(&tmp, json).is_ok() && fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
 fn exceeds_max(size: u64, max: Option<u64>) -> bool {
     max.is_some_and(|m| size > m)
 }
@@ -300,6 +415,8 @@ pub(crate) fn is_xgrep_internal(name: &str) -> bool {
         || name.ends_with(".xgrep.bincache")
         || name.ends_with(".xgrep.cache") // default sidecar (index.xgrep.cache)
         || name.ends_with(".xgrep.lock")  // build lock file
+        || name.ends_with(".xgrep.oversize") // files skipped for size
+        || name.ends_with(".xgrep.oversize.tmp")
         || name.starts_with(".xgrep_tmp_") // atomic write tmp files
         || name.starts_with(".xgrep_cache_tmp_")
 }
@@ -624,6 +741,13 @@ fn build_index_with_limit(
     // racily clean relative to the previous build.
     if let Some((stored_fp, Some(prev_start))) = stored {
         if stored_fp == fp.fingerprint && !walk.iter().any(|e| e.stat.is_racy(prev_start)) {
+            // An index built before the oversize record existed gets one
+            // (the check is a scan of in-memory stat data).
+            if walk.iter().any(|e| exceeds_max(e.stat.size, max))
+                && read_oversize(index_path).is_none()
+            {
+                write_oversize(index_path, &walk, max);
+            }
             return Ok(false);
         }
     }
@@ -644,10 +768,12 @@ fn build_index_with_limit(
         if let Some(v) =
             try_build_index_diff(root, index_path, &sidecar, &walk, prev_start_ns, max, &fp)?
         {
+            write_oversize(index_path, &walk, max);
             return Ok(v);
         }
     }
 
+    write_oversize(index_path, &walk, max);
     full_build(root, index_path, &sidecar, walk, max)?;
     fp.write();
     Ok(true)
@@ -2529,6 +2655,57 @@ mod tests {
         assert_eq!(
             paths_with_trigram(&index_path, *b"qzx"),
             vec!["big.txt", "small.txt"]
+        );
+    }
+
+    #[test]
+    fn test_oversize_files_are_recorded() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("small.txt"), "small qzx").unwrap();
+        fs::write(root.join("big.txt"), "big qzx ".repeat(200)).unwrap();
+        fs::write(root.join("bigger.log"), "x".repeat(5000)).unwrap();
+        let index_path = root.join("index.xgrep");
+        build_index_with_limit(root, &index_path, None, Some(100)).unwrap();
+        let info = read_oversize(&index_path).unwrap();
+        assert_eq!(info.limit, 100);
+        assert_eq!(info.count, 2);
+        assert_eq!(info.examples, vec!["bigger.log", "big.txt"]); // largest first
+                                                                  // The record is not part of the corpus.
+        assert!(!build_index_with_limit(root, &index_path, None, Some(100)).unwrap());
+
+        // Diff update: one more large file.
+        fs::write(root.join("new.bin.txt"), "y".repeat(300)).unwrap();
+        build_index_with_limit(root, &index_path, None, Some(100)).unwrap();
+        assert_eq!(read_oversize(&index_path).unwrap().count, 3);
+
+        // Unlimited: nothing skipped, the record goes away.
+        build_index_with_limit(root, &index_path, None, None).unwrap();
+        assert_eq!(read_oversize(&index_path), None);
+        assert!(!oversize_path(&index_path).exists());
+
+        // An index built before the record existed gets it on the fast path.
+        build_index_with_limit(root, &index_path, None, Some(100)).unwrap();
+        fs::remove_file(oversize_path(&index_path)).unwrap();
+        assert!(!build_index_with_limit(root, &index_path, None, Some(100)).unwrap());
+        assert_eq!(read_oversize(&index_path).unwrap().count, 3);
+    }
+
+    #[test]
+    fn test_oversize_hint_and_sizes() {
+        assert_eq!(human_size(10 << 20), "10MB");
+        assert_eq!(human_size(512 << 10), "512KB");
+        assert_eq!(human_size(3 << 19), "1.5MB");
+        assert_eq!(human_size(100), "100B");
+        let info = OversizeInfo {
+            limit: 10 << 20,
+            count: 2,
+            examples: vec!["data/dump.sql".into()],
+        };
+        let h = info.hint("search them with `xg PATTERN FILE`");
+        assert_eq!(
+            h,
+            "2 files over 10MB are not indexed (e.g. data/dump.sql), so indexed searches cannot find matches in them; set XGREP_MAX_FILESIZE=0 (or a larger size) and rebuild the index, or search them with `xg PATTERN FILE`"
         );
     }
 

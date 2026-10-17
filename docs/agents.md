@@ -97,12 +97,14 @@ Pick the tool by intent:
 | `repo_map` | Aider-style overview: PageRank over the cross-file definition/reference graph, then the top symbols' signatures grouped by file within a token budget. | `focus` (files/directories to personalize the ranking), `focus_symbols` (identifiers to weight up), `max_tokens` (default 1500), filters as in `search` |
 | `find_files` | File names/paths from the index, like `xg --find`. Substring (case-insensitive) or glob (`*.rs` matches at any depth). Exact file-name matches rank first. | `pattern` (required), `file_type`, `glob`, `exclude`, `max_results` (default 50), `offset` |
 | `read_file` | Read a file with line numbers. Capped at 2000 lines or ~10k tokens; the header shows the total line count and a cut response ends with `next start_line=N`. Lines over 1000 chars are shortened. Files with NUL bytes, paths inside `.git/` and paths outside the project are refused; `start_line` past the end or `end_line < start_line` is an error (`end_line` past the end is clamped). | `path` (required), `start_line`, `end_line`, `max_tokens` |
-| `index_status` | Report index health. Returns JSON: `state` (`"fresh"`, `"stale"`, or `"missing"`), `changed_files` (count, present only when `state` is `"stale"`), `indexed_files`, `index_size_bytes`, `index_path`. | none |
+| `index_status` | Report index health. Returns JSON: `state` (`"fresh"`, `"stale"`, or `"missing"`), `changed_files` (count, present only when `state` is `"stale"`), `indexed_files`, `index_size_bytes`, `index_path`, and `oversize_files` (`count`, `limit_bytes`, `examples`; present only when files over the max file size, `XGREP_MAX_FILESIZE` (default 10MB), were left out of the index). | none |
 | `build_index` | Build or rebuild the search index for the codebase. | none |
 | `session_reset` | Forget which ranges were already returned (see *Session dedup*). | none |
 
-Unknown argument names, unknown `file_type`s and unknown `output_mode`s are
-errors that name the valid choices, instead of being silently ignored.
+Unknown argument names are ignored, and the response starts with a one-line
+`note: ignored unknown argument(s): paht (did you mean path_pattern?)` (a
+`"note"` field for `index_status`). Unknown `file_type`s and unknown
+`output_mode`s are errors that name the valid choices.
 
 The `index_status` JSON lets an agent branch on freshness without parsing prose:
 call `build_index` when `state` is `"missing"`, or proceed directly when `state`

@@ -363,7 +363,7 @@ pub fn tools_list() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "index_status",
-            "description": "Check the status of the search index. Returns a JSON object: state (\"fresh\", \"stale\", or \"missing\"), changed_files (count, present only when state is \"stale\"), indexed_files (count), index_size_bytes, and index_path.",
+            "description": "Check the status of the search index. Returns a JSON object: state (\"fresh\", \"stale\", or \"missing\"), changed_files (count, present only when state is \"stale\"), indexed_files (count), index_size_bytes, index_path, and oversize_files ({count, limit_bytes, examples}, present only when files over the max file size were left out of the index).",
             "inputSchema": {"type": "object", "properties": {}}
         }),
         serde_json::json!({
@@ -377,6 +377,165 @@ pub fn tools_list() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {}}
         }),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Unknown arguments
+// ---------------------------------------------------------------------------
+
+/// Drop arguments that `tool`'s input schema does not declare (also inside
+/// `search` `queries` items) so a typo does not fail the whole call.
+/// Returns the cleaned arguments and, if anything was dropped, a one-line
+/// `note: ignored unknown argument(s): ...` with "did you mean" hints.
+/// Unknown tools and non-object arguments are returned unchanged.
+pub(crate) fn strip_unknown_args(tool: &str, args: &Value) -> (Value, Option<String>) {
+    let Value::Object(map) = args else {
+        return (args.clone(), None);
+    };
+    if map.is_empty() {
+        return (args.clone(), None);
+    }
+    let tools = tools_list();
+    let Some(props) = tools
+        .iter()
+        .find(|t| t["name"] == tool)
+        .and_then(|t| t["inputSchema"]["properties"].as_object())
+    else {
+        return (args.clone(), None);
+    };
+    let known: Vec<&str> = props.keys().map(String::as_str).collect();
+    let item_known: Vec<&str> = known.iter().copied().filter(|k| *k != "queries").collect();
+    let mut ignored: Vec<String> = Vec::new();
+    let mut out = serde_json::Map::new();
+    for (k, v) in map {
+        if !known.contains(&k.as_str()) {
+            ignored.push(describe_unknown(k, k, &known));
+            continue;
+        }
+        let v = match v {
+            Value::Array(items) if k == "queries" => Value::Array(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| match item {
+                        Value::Object(m) => Value::Object(
+                            m.iter()
+                                .filter(|(ik, _)| {
+                                    let ok = item_known.contains(&ik.as_str());
+                                    if !ok {
+                                        let label = format!("queries[{}].{}", i, ik);
+                                        ignored.push(describe_unknown(&label, ik, &item_known));
+                                    }
+                                    ok
+                                })
+                                .map(|(a, b)| (a.clone(), b.clone()))
+                                .collect(),
+                        ),
+                        other => other.clone(),
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        };
+        out.insert(k.clone(), v);
+    }
+    if ignored.is_empty() {
+        return (args.clone(), None);
+    }
+    let note = format!("note: ignored unknown argument(s): {}", ignored.join(", "));
+    (Value::Object(out), Some(note))
+}
+
+/// `label`, plus ` (did you mean x?)` when a known name is close to `name`.
+fn describe_unknown(label: &str, name: &str, known: &[&str]) -> String {
+    match suggest_arg(name, known) {
+        Some(s) => format!("{} (did you mean {}?)", label, s),
+        None => label.to_string(),
+    }
+}
+
+/// Closest known argument name: common aliases, same name ignoring case and
+/// `_`/`-`, a prefix (`context` -> `context_lines`), or a small edit distance.
+fn suggest_arg<'a>(name: &str, known: &[&'a str]) -> Option<&'a str> {
+    let norm = |s: &str| -> String {
+        s.chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let n = norm(name);
+    let pick = |want: &str| known.iter().copied().find(|k| *k == want);
+    let alias = match n.as_str() {
+        "limit" | "max" | "maxcount" | "headlimit" => Some("max_results"),
+        "type" | "lang" | "language" | "filetypes" | "ext" | "extension" => Some("file_type"),
+        "query" | "q" | "regexp" | "text" | "needle" => Some("pattern"),
+        "ignorecase" | "i" | "nocase" => Some("case_insensitive"),
+        "context" | "c" | "contextlines" | "lines" => Some("context_lines"),
+        "path" | "paths" | "dir" | "directory" | "file" | "files" | "filepath" => {
+            pick("path").map(|_| "path").or(Some("path_pattern"))
+        }
+        "globs" | "include" => Some("glob"),
+        "excludes" | "ignore" => Some("exclude"),
+        "start" | "from" | "line" => Some("start_line"),
+        "end" | "to" => Some("end_line"),
+        "name" | "identifier" => Some("symbol"),
+        "page" | "skip" => Some("offset"),
+        _ => None,
+    };
+    if let Some(a) = alias.and_then(pick) {
+        return Some(a);
+    }
+    if let Some(k) = known.iter().copied().find(|k| norm(k) == n) {
+        return Some(k);
+    }
+    if n.len() >= 4 {
+        if let Some(k) = known.iter().copied().find(|k| norm(k).starts_with(&n)) {
+            return Some(k);
+        }
+    }
+    let limit = if n.len() >= 6 { 2 } else { 1 };
+    let close = known
+        .iter()
+        .copied()
+        .map(|k| (osa_distance(&n, &norm(k)), k))
+        .filter(|(d, _)| *d <= limit)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k);
+    if close.is_some() || n.len() < 4 {
+        return close;
+    }
+    // A typo in a prefix: `paht` -> `path_pattern`.
+    known.iter().copied().find(|k| {
+        let kn = norm(k);
+        let head: String = kn.chars().take(n.chars().count()).collect();
+        osa_distance(&n, &head) <= 1
+    })
+}
+
+/// Optimal string alignment distance (Levenshtein + adjacent transposition).
+fn osa_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = v;
+        }
+    }
+    d[a.len()][b.len()]
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +1042,12 @@ fn zero_result_hints(xg: &Xgrep, prep: &Prepared) -> Vec<String> {
             "If the code was written moments ago, retry with fresh:true (the index may lag behind the working tree)."
                 .to_string(),
         );
+    }
+    if let Some(o) = xg.oversize_files() {
+        hints.push(format!(
+            "{}.",
+            o.hint("search them outside the index (e.g. `xg PATTERN FILE` or rg)")
+        ));
     }
     hints
 }
@@ -1425,6 +1590,13 @@ pub fn handle_index_status(xg: &Xgrep) -> (String, bool) {
             });
             if let Some(c) = changed_files {
                 json["changed_files"] = c.into();
+            }
+            if let Some(o) = info.oversize {
+                json["oversize_files"] = serde_json::json!({
+                    "count": o.count,
+                    "limit_bytes": o.limit,
+                    "examples": o.examples,
+                });
             }
             (json.to_string(), false)
         }
@@ -2085,7 +2257,76 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_argument_is_error() {
+    fn test_oversize_files_in_index_status_and_zero_result_hint() {
+        let (_dir, xg) = setup_test_repo();
+        // Without skipped files: no field, no hint.
+        let (s, _) = handle_index_status(&xg);
+        assert!(!s.contains("oversize_files"), "{s}");
+        let (t, _) = search(&xg, serde_json::json!({"pattern": "zzz_nothing"}));
+        assert!(!t.contains("not indexed"), "{t}");
+
+        let info = crate::OversizeInfo {
+            limit: 10 << 20,
+            count: 2,
+            examples: vec!["data/dump.sql".into(), "logs/a.log".into()],
+        };
+        fs::write(
+            crate::index::builder::oversize_path(xg.index_path()),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+        let (s, err) = handle_index_status(&xg);
+        assert!(!err, "{s}");
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["oversize_files"]["count"], 2);
+        assert_eq!(v["oversize_files"]["limit_bytes"], 10 << 20);
+        assert_eq!(v["oversize_files"]["examples"][0], "data/dump.sql");
+
+        let (t, _) = search(&xg, serde_json::json!({"pattern": "zzz_nothing"}));
+        assert!(
+            t.contains("hint: 2 files over 10MB are not indexed (e.g. data/dump.sql)")
+                && t.contains("XGREP_MAX_FILESIZE=0"),
+            "{t}"
+        );
+        // Not added to non-empty results.
+        let (t, _) = search(&xg, serde_json::json!({"pattern": "hello"}));
+        assert!(!t.contains("not indexed"), "{t}");
+    }
+
+    #[test]
+    fn test_strip_unknown_args() {
+        let (args, note) =
+            strip_unknown_args("read_file", &serde_json::json!({"paht": "a", "path": "b"}));
+        assert_eq!(args, serde_json::json!({"path": "b"}));
+        assert_eq!(
+            note.as_deref(),
+            Some("note: ignored unknown argument(s): paht (did you mean path?)")
+        );
+        let (args, note) = strip_unknown_args(
+            "search",
+            &serde_json::json!({"pattern": "x", "pathpattern": "src", "limit": 3, "context": 2}),
+        );
+        assert_eq!(args, serde_json::json!({"pattern": "x"}));
+        let note = note.unwrap();
+        assert!(
+            note.contains("pathpattern (did you mean path_pattern?)"),
+            "{note}"
+        );
+        assert!(note.contains("limit (did you mean max_results?)"), "{note}");
+        assert!(
+            note.contains("context (did you mean context_lines?)"),
+            "{note}"
+        );
+        // Known arguments only, unknown tools and non-objects: unchanged.
+        let ok = serde_json::json!({"pattern": "x", "word": true});
+        assert_eq!(strip_unknown_args("search", &ok), (ok.clone(), None));
+        assert_eq!(strip_unknown_args("nope", &ok), (ok.clone(), None));
+    }
+
+    #[test]
+    fn test_unknown_argument_reaches_handler_only_via_dispatch() {
+        // Handlers still reject unknown fields (the MCP dispatcher strips
+        // them first), which keeps the schema and the param structs in sync.
         let (_dir, xg) = setup_test_repo();
         let (output, is_error) = search(&xg, serde_json::json!({"pattern": "hello", "paht": "x"}));
         assert!(is_error);

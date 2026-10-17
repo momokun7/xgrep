@@ -445,7 +445,14 @@ fn repo_map_ranks_and_respects_budget() {
         "{}",
         r[3].0
     );
-    assert!(r[4].1, "unknown parameters are errors");
+    // Unknown parameters are ignored with a note.
+    assert!(!r[4].1, "{}", r[4].0);
+    assert!(
+        r[4].0
+            .starts_with("note: ignored unknown argument(s): bogus\nRepo map: "),
+        "{}",
+        r[4].0
+    );
 }
 
 #[test]

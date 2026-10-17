@@ -189,7 +189,7 @@ fn test_mcp_input_validation_error() {
 fn test_mcp_stderr_suppressed() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-    // Short pattern (< 3 chars) normally triggers a stderr warning
+    // A single-character pattern normally triggers a full-scan warning on stderr
     fs::write(root.join("a.rs"), "fn ab() {}").unwrap();
 
     let output = send_mcp_messages_full(
@@ -197,14 +197,14 @@ fn test_mcp_stderr_suppressed() {
         &[
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"pattern":"ab"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"pattern":"b"}}}"#,
         ],
     );
 
     // Search should succeed
     assert_eq!(output.responses[1]["id"], 2);
     assert_eq!(output.responses[1]["result"]["isError"], false);
-    // stderr should be empty in MCP mode (no "pattern shorter than 3" warning)
+    // stderr should be empty in MCP mode (no full-scan warning)
     assert!(
         output.stderr.is_empty(),
         "Expected no stderr in MCP mode, got: {}",
@@ -418,7 +418,14 @@ fn test_mcp_validation_and_hints() {
     let (t, _) = &out[7];
     assert!(t.contains("3 matches exist outside"), "{t}");
     let (t, e) = &out[8];
-    assert!(*e && t.contains("unknown field `pathpattern`"), "{t}");
+    // Unknown arguments are ignored with a note, not an error.
+    assert!(!*e, "{t}");
+    assert!(
+        t.starts_with(
+            "note: ignored unknown argument(s): pathpattern (did you mean path_pattern?)\n"
+        ),
+        "{t}"
+    );
 }
 
 // ---------------------------------------------------------------------------

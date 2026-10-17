@@ -60,6 +60,7 @@ pub use error::{Result, XgrepError};
 pub use filetype::extensions_for_type;
 pub use filetype::list_all_types;
 pub use history::{CommitMatch, DiffMatch, DiffSide};
+pub use index::builder::OversizeInfo;
 pub use search::{FileMatches, OutputMode, SearchResult};
 pub use watch::WatchStatus;
 
@@ -294,6 +295,9 @@ pub struct IndexStatusInfo {
     pub index_size_bytes: u64,
     /// Path to the index file.
     pub index_path: PathBuf,
+    /// Files the last build left out for exceeding the max file size
+    /// (`XGREP_MAX_FILESIZE`), if any.
+    pub oversize: Option<OversizeInfo>,
 }
 
 impl std::fmt::Display for IndexStatusInfo {
@@ -320,7 +324,23 @@ impl std::fmt::Display for IndexStatusInfo {
                 self.indexed_files,
                 self.index_size_bytes,
                 self.index_path.display()
-            )
+            )?;
+            if let Some(o) = &self.oversize {
+                write!(
+                    f,
+                    "\nNot indexed (over {}): {} file{}{} (set {}=0 to index them)",
+                    o.limit_display(),
+                    o.count,
+                    if o.count == 1 { "" } else { "s" },
+                    if o.examples.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", e.g. {}", o.examples.join(", "))
+                    },
+                    index::builder::MAX_FILESIZE_ENV
+                )?;
+            }
+            Ok(())
         }
     }
 }
@@ -529,6 +549,13 @@ impl Xgrep {
     /// Returns the index file path.
     pub fn index_path(&self) -> &Path {
         &self.index_path
+    }
+
+    /// Files the last index build left out for exceeding the max file size
+    /// (`XGREP_MAX_FILESIZE`, default 10MB). `None` when none were skipped
+    /// (or no index has been built). Reads a small sidecar; no walk.
+    pub fn oversize_files(&self) -> Option<OversizeInfo> {
+        index::builder::read_oversize(&self.index_path)
     }
 
     /// Build (or rebuild) the search index.
@@ -1444,6 +1471,7 @@ impl Xgrep {
                 indexed_files: file_count,
                 index_size_bytes: size,
                 index_path: self.index_path.clone(),
+                oversize: self.oversize_files(),
             })
         } else {
             Ok(IndexStatusInfo {
@@ -1451,6 +1479,7 @@ impl Xgrep {
                 indexed_files: 0,
                 index_size_bytes: 0,
                 index_path: self.index_path.clone(),
+                oversize: None,
             })
         }
     }

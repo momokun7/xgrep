@@ -223,8 +223,8 @@ your own hardware; the script runs both focused and distributed queries for a co
 
 ## Limitations
 
-- **One-character queries** bypass the index — no speed advantage over ripgrep (two-character queries use it)
-- **Files over 10MB** are not indexed by default (`XGREP_MAX_FILESIZE`); `xg status` reports how many were skipped
+- **Single-character queries** bypass the index (full scan) — no speed advantage over ripgrep; 2-character literals use a coarser trigram-prefix lookup
+- **Large files (> 10MB by default)** are left out of the index; `xg status`, MCP `index_status` and zero-result hints report how many. Set `XGREP_MAX_FILESIZE` (e.g. `50M`, or `0` for no limit) and rebuild to index them
 - **Binary files** (any NUL byte, including UTF-16 text) are not indexed
 - **Freshness** — edited files are rescanned on each search; with more than 500 changed files the search warns and relies on the background rebuild (`--fresh` rebuilds first)
 - **Syntax features** cover Rust, Python, JS/TS, Go, Java, C/C++ and Ruby; other languages fall back to regex heuristics. The npm and Python packages are built without them

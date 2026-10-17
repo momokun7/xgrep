@@ -23,13 +23,7 @@ const MAX_LITERAL_TERMS: usize = 12;
 /// looked up for both case-sensitive and case-insensitive searches (the
 /// content match afterwards decides). For patterns of 3+ bytes the `loc` /
 /// `next` masks are checked as well (see [`literal_candidates`]).
-pub(crate) fn resolve_literal_candidates(
-    reader: &IndexReader,
-    _original_pattern: &str,
-    search_pattern: &str,
-    _trigrams: &[[u8; 3]],
-    _case_insensitive: bool,
-) -> Vec<u32> {
+pub(crate) fn resolve_literal_candidates(reader: &IndexReader, search_pattern: &str) -> Vec<u32> {
     let pat: Vec<u8> = search_pattern.bytes().map(fold).collect();
     match pat.len() {
         0 | 1 => (0..reader.file_count()).collect(),
@@ -288,7 +282,7 @@ mod literal_tests {
         } else {
             pattern.to_string()
         };
-        resolve_literal_candidates(reader, pattern, &p, &[], ci)
+        resolve_literal_candidates(reader, &p)
     }
 
     fn files(list: &[(&str, &[u8])]) -> Vec<(String, Vec<u8>)> {
