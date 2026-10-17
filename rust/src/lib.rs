@@ -407,38 +407,40 @@ impl Xgrep {
     pub fn search(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
         let (pattern, regex) = Self::effective_pattern(pattern, opts);
         let pattern = pattern.as_ref();
-        let mut results = if opts.changed_only || opts.since.is_some() {
-            self.search_changed(pattern, regex, opts)?
+
+        // Path filters run on candidate paths before any file is read.
+        let extensions = match opts.file_type.as_deref() {
+            Some(ft) => {
+                let exts = filetype::extensions_for_type(ft);
+                if exts.is_none() && !self.config.quiet {
+                    eprintln!("warning: unknown file type '{}', showing all results", ft);
+                }
+                exts
+            }
+            None => None,
+        };
+        let globs = if opts.globs.is_empty() {
+            None
         } else {
-            self.search_indexed(pattern, regex, opts)?
+            Some(globfilter::GlobFilter::new(&opts.globs)?)
+        };
+        let filter = search::ScanFilter {
+            extensions,
+            path_substring: opts.path_pattern.clone(),
+            globs,
+            // The fresh path drops index results for changed files after
+            // scanning, so a pushed-down limit could lose results there.
+            max_count: if opts.fresh { None } else { opts.max_count },
         };
 
-        // file_type filter
-        if let Some(ref ft) = opts.file_type {
-            if let Some(exts) = filetype::extensions_for_type(ft) {
-                results.retain(|r| {
-                    Path::new(&*r.file)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| exts.contains(&e))
-                });
-            } else if !self.config.quiet {
-                eprintln!("warning: unknown file type '{}', showing all results", ft);
+        let mut results = search::with_scan_filter(filter, || {
+            if opts.changed_only || opts.since.is_some() {
+                self.search_changed(pattern, regex, opts)
+            } else {
+                self.search_indexed(pattern, regex, opts)
             }
-        }
+        })?;
 
-        // path_pattern filter
-        if let Some(ref pp) = opts.path_pattern {
-            results.retain(|r| r.file.contains(pp));
-        }
-
-        // glob filter (-g)
-        if !opts.globs.is_empty() {
-            let filter = globfilter::GlobFilter::new(&opts.globs)?;
-            results.retain(|r| filter.matches(&r.file));
-        }
-
-        // max_count
         if let Some(max) = opts.max_count {
             results.truncate(max);
         }

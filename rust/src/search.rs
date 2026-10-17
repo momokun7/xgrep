@@ -1,5 +1,6 @@
 use crate::candidates::{resolve_literal_candidates, resolve_regex_candidates};
 use crate::error::{Result, XgrepError};
+use crate::globfilter::GlobFilter;
 use crate::index::reader::IndexReader;
 use crate::trigram;
 use memchr::memmem;
@@ -190,36 +191,203 @@ impl Matcher for RegexMatcher {
 }
 
 // ---------------------------------------------------------------------------
+// Path filters and limits (applied before files are read)
+// ---------------------------------------------------------------------------
+
+/// Path-based filters and a result limit, applied to candidate files before
+/// they are read.
+#[derive(Default)]
+pub(crate) struct ScanFilter {
+    /// Keep only files with one of these extensions (`-t`).
+    pub(crate) extensions: Option<Vec<&'static str>>,
+    /// Keep only paths containing this substring.
+    pub(crate) path_substring: Option<String>,
+    /// Include/exclude globs (`-g`).
+    pub(crate) globs: Option<GlobFilter>,
+    /// Stop once this many results are collected. Results are the first
+    /// `max_count` in (file, line) order.
+    pub(crate) max_count: Option<usize>,
+}
+
+impl ScanFilter {
+    pub(crate) fn accepts(&self, path: &str) -> bool {
+        if let Some(exts) = &self.extensions {
+            let ext = Path::new(path).extension().and_then(|e| e.to_str());
+            if !ext.is_some_and(|e| exts.contains(&e)) {
+                return false;
+            }
+        }
+        if let Some(sub) = &self.path_substring {
+            if !path.contains(sub.as_str()) {
+                return false;
+            }
+        }
+        if let Some(globs) = &self.globs {
+            if !globs.matches(path) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn has_path_filter(&self) -> bool {
+        self.extensions.is_some() || self.path_substring.is_some() || self.globs.is_some()
+    }
+}
+
+thread_local! {
+    static SCOPED_FILTER: RefCell<Option<ScanFilter>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with `filter` applied to every `search*` call it makes on this
+/// thread. Lets callers that cannot pass a filter explicitly still get
+/// filter pushdown.
+pub(crate) fn with_scan_filter<R>(filter: ScanFilter, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<ScanFilter>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            SCOPED_FILTER.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let prev = SCOPED_FILTER.with(|c| c.borrow_mut().replace(filter));
+    let _restore = Restore(prev);
+    f()
+}
+
+/// Run `f` with the scoped filter (or the default). The filter is taken out
+/// while `f` runs so that work stolen onto this thread does not see it.
+fn with_active_filter<R>(f: impl FnOnce(&ScanFilter) -> R) -> R {
+    struct PutBack(Option<ScanFilter>);
+    impl Drop for PutBack {
+        fn drop(&mut self) {
+            if let Some(filter) = self.0.take() {
+                SCOPED_FILTER.with(|c| *c.borrow_mut() = Some(filter));
+            }
+        }
+    }
+    let guard = PutBack(SCOPED_FILTER.with(|c| c.borrow_mut().take()));
+    match &guard.0 {
+        Some(filter) => f(filter),
+        None => f(&ScanFilter::default()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Scan functions
 // ---------------------------------------------------------------------------
 
-/// Scan files directly from index candidate ID list (no intermediate Vec).
+/// Below this many files, scan sequentially: starting the rayon pool costs
+/// more than it saves.
+const PARALLEL_THRESHOLD: usize = 64;
+/// First chunk size when scanning with a result limit; doubles per chunk.
+const LIMIT_CHUNK: usize = 64;
+
+/// A file to scan: its path relative to the root and its display name.
+struct Target<'a> {
+    path: &'a Path,
+    name: std::borrow::Cow<'a, str>,
+}
+
+fn scan_one<M: Matcher + ?Sized>(
+    root: &Path,
+    target: &Target<'_>,
+    matcher: &M,
+    skip_binary: bool,
+    quiet: bool,
+) -> Vec<SearchResult> {
+    let full_path = root.join(target.path);
+    let content = match fs::read(&full_path) {
+        Ok(c) => c,
+        Err(e) => {
+            if !quiet {
+                eprintln!("xgrep: {}: {}", full_path.display(), e);
+            }
+            return vec![];
+        }
+    };
+    if skip_binary && memchr::memchr(0, &content).is_some() {
+        return vec![];
+    }
+    matcher.find_matches(&content, &target.name)
+}
+
+fn scan_many<M: Matcher + ?Sized>(
+    root: &Path,
+    targets: &[Target<'_>],
+    matcher: &M,
+    skip_binary: bool,
+    quiet: bool,
+) -> Vec<Vec<SearchResult>> {
+    let one = |t: &Target<'_>| scan_one(root, t, matcher, skip_binary, quiet);
+    if targets.len() < PARALLEL_THRESHOLD {
+        targets.iter().map(one).collect()
+    } else {
+        targets.par_iter().map(one).collect()
+    }
+}
+
+/// Filter targets by path, scan them in path order and return results
+/// sorted by (file, line). With a limit, files are scanned in growing
+/// chunks and scanning stops once enough results are collected.
+fn scan<M: Matcher + ?Sized>(
+    root: &Path,
+    mut targets: Vec<Target<'_>>,
+    matcher: &M,
+    filter: &ScanFilter,
+    skip_binary: bool,
+    quiet: bool,
+) -> Vec<SearchResult> {
+    if filter.has_path_filter() {
+        targets.retain(|t| filter.accepts(&t.name));
+    }
+    targets.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+
+    let Some(limit) = filter.max_count else {
+        return scan_many(root, &targets, matcher, skip_binary, quiet)
+            .into_iter()
+            .flatten()
+            .collect();
+    };
+
+    let mut results = Vec::new();
+    let mut rest = &targets[..];
+    let mut chunk = LIMIT_CHUNK;
+    while results.len() < limit && !rest.is_empty() {
+        let (head, tail) = rest.split_at(chunk.min(rest.len()));
+        for file_results in scan_many(root, head, matcher, skip_binary, quiet) {
+            results.extend(file_results);
+            if results.len() >= limit {
+                break;
+            }
+        }
+        rest = tail;
+        chunk *= 2;
+    }
+    results.truncate(limit);
+    results
+}
+
+/// Scan files from an index candidate ID list.
 fn scan_indexed<M: Matcher + ?Sized>(
     reader: &IndexReader,
     root: &Path,
     candidate_ids: &[u32],
     matcher: &M,
+    filter: &ScanFilter,
     quiet: bool,
 ) -> Vec<SearchResult> {
-    let mut results: Vec<SearchResult> = candidate_ids
-        .par_iter()
-        .flat_map(|&fid| {
-            let rel_path = reader.file_path(fid);
-            let full_path = root.join(rel_path);
-            let content = match fs::read(&full_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    if !quiet {
-                        eprintln!("xgrep: {}: {}", full_path.display(), e);
-                    }
-                    return vec![];
-                }
-            };
-            matcher.find_matches(&content, rel_path)
+    let targets = candidate_ids
+        .iter()
+        .map(|&fid| {
+            let name = reader.file_path(fid);
+            Target {
+                path: Path::new(name),
+                name: name.into(),
+            }
         })
         .collect();
-    results.sort_unstable_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
-    results
+    scan(root, targets, matcher, filter, false, quiet)
 }
 
 /// Scan files directly from a file path list (skipping binary files).
@@ -227,43 +395,87 @@ fn scan_direct<M: Matcher + ?Sized>(
     root: &Path,
     files: &[PathBuf],
     matcher: &M,
+    filter: &ScanFilter,
     quiet: bool,
 ) -> Vec<SearchResult> {
-    let mut results: Vec<SearchResult> = files
-        .par_iter()
-        .flat_map(|rel_path| {
-            let full_path = root.join(rel_path);
-            let content = match fs::read(&full_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    if !quiet {
-                        eprintln!("xgrep: {}: {}", full_path.display(), e);
-                    }
-                    return vec![];
-                }
-            };
-            // Skip binary files
-            if memchr::memchr(0, &content).is_some() {
-                return vec![];
-            }
-            let rel_str = rel_path.to_string_lossy();
-            matcher.find_matches(&content, &rel_str)
+    let targets = files
+        .iter()
+        .map(|p| Target {
+            path: p.as_path(),
+            name: p.to_string_lossy(),
         })
         .collect();
-    results.sort_unstable_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
-    results
+    scan(root, targets, matcher, filter, true, quiet)
 }
 
 // ---------------------------------------------------------------------------
-// Public API (signature preserved)
+// Public API
 // ---------------------------------------------------------------------------
 
+/// Index-based search with path filters and a result limit pushed down
+/// into the scan. Dispatches to literal or regex matching.
+pub(crate) fn search_with_filter(
+    reader: &IndexReader,
+    root: &Path,
+    pattern: &str,
+    regex: bool,
+    case_insensitive: bool,
+    quiet: bool,
+    filter: &ScanFilter,
+) -> Result<Vec<SearchResult>> {
+    if regex {
+        search_regex_filtered(reader, root, pattern, case_insensitive, quiet, filter)
+    } else {
+        search_literal_filtered(reader, root, pattern, case_insensitive, quiet, filter)
+    }
+}
+
+/// Direct (non-index) search over `files` with path filters and a limit.
+pub(crate) fn search_files_with_filter(
+    root: &Path,
+    files: &[PathBuf],
+    pattern: &str,
+    regex: bool,
+    case_insensitive: bool,
+    quiet: bool,
+    filter: &ScanFilter,
+) -> Result<Vec<SearchResult>> {
+    if regex {
+        let matcher = RegexMatcher {
+            re: build_regex(pattern, case_insensitive)?,
+        };
+        return Ok(scan_direct(root, files, &matcher, filter, quiet));
+    }
+    if case_insensitive && pattern.bytes().any(|b| b > 127) && !quiet {
+        eprintln!(
+            "xgrep: warning: case-insensitive search with non-ASCII pattern '{}' uses ASCII-only folding",
+            pattern
+        );
+    }
+    let matcher = literal_matcher(pattern, case_insensitive);
+    Ok(scan_direct(root, files, &*matcher, filter, quiet))
+}
+
+/// Literal search. Honors a filter installed with [`with_scan_filter`].
 pub(crate) fn search(
     reader: &IndexReader,
     root: &Path,
     pattern: &str,
     case_insensitive: bool,
     quiet: bool,
+) -> Result<Vec<SearchResult>> {
+    with_active_filter(|f| {
+        search_with_filter(reader, root, pattern, false, case_insensitive, quiet, f)
+    })
+}
+
+fn search_literal_filtered(
+    reader: &IndexReader,
+    root: &Path,
+    pattern: &str,
+    case_insensitive: bool,
+    quiet: bool,
+    filter: &ScanFilter,
 ) -> Result<Vec<SearchResult>> {
     let pattern_bytes = pattern.as_bytes();
     if pattern_bytes.len() < 3 && !pattern_bytes.is_empty() && !quiet {
@@ -311,7 +523,7 @@ pub(crate) fn search(
     let t1 = perf.then(std::time::Instant::now);
 
     let matcher = literal_matcher(pattern, case_insensitive);
-    let results = scan_indexed(reader, root, &candidate_ids, &*matcher, quiet);
+    let results = scan_indexed(reader, root, &candidate_ids, &*matcher, filter, quiet);
 
     if let Some(t) = t1 {
         eprintln!(
@@ -324,7 +536,8 @@ pub(crate) fn search(
     Ok(results)
 }
 
-/// Search specified files directly without using the index
+/// Search specified files directly without using the index.
+/// Honors a filter installed with [`with_scan_filter`].
 pub(crate) fn search_files(
     root: &Path,
     files: &[PathBuf],
@@ -332,17 +545,9 @@ pub(crate) fn search_files(
     case_insensitive: bool,
     quiet: bool,
 ) -> Result<Vec<SearchResult>> {
-    if case_insensitive && pattern.bytes().any(|b| b > 127) && !quiet {
-        eprintln!(
-            "xgrep: warning: case-insensitive search with non-ASCII pattern '{}' uses ASCII-only folding",
-            pattern
-        );
-    }
-
-    let matcher = literal_matcher(pattern, case_insensitive);
-    let results = scan_direct(root, files, &*matcher, quiet);
-
-    Ok(results)
+    with_active_filter(|f| {
+        search_files_with_filter(root, files, pattern, false, case_insensitive, quiet, f)
+    })
 }
 
 /// Compile a search regex. `^`/`$` match at line boundaries (LF or CRLF),
@@ -357,7 +562,8 @@ fn build_regex(pattern: &str, case_insensitive: bool) -> Result<regex::bytes::Re
 }
 
 /// Regex search: extract literal trigrams from pattern for index lookup,
-/// then verify with full regex on candidate files
+/// then verify with full regex on candidate files.
+/// Honors a filter installed with [`with_scan_filter`].
 pub(crate) fn search_regex(
     reader: &IndexReader,
     root: &Path,
@@ -365,17 +571,34 @@ pub(crate) fn search_regex(
     case_insensitive: bool,
     quiet: bool,
 ) -> Result<Vec<SearchResult>> {
-    let re = build_regex(pattern, case_insensitive)?;
-
-    let candidate_ids = resolve_regex_candidates(reader, pattern, case_insensitive, quiet);
-
-    let matcher = RegexMatcher { re };
-    let results = scan_indexed(reader, root, &candidate_ids, &matcher, quiet);
-
-    Ok(results)
+    with_active_filter(|f| {
+        search_with_filter(reader, root, pattern, true, case_insensitive, quiet, f)
+    })
 }
 
-/// Also add search_files_regex for --changed/--since with regex
+fn search_regex_filtered(
+    reader: &IndexReader,
+    root: &Path,
+    pattern: &str,
+    case_insensitive: bool,
+    quiet: bool,
+    filter: &ScanFilter,
+) -> Result<Vec<SearchResult>> {
+    let re = build_regex(pattern, case_insensitive)?;
+    let candidate_ids = resolve_regex_candidates(reader, pattern, case_insensitive, quiet);
+    let matcher = RegexMatcher { re };
+    Ok(scan_indexed(
+        reader,
+        root,
+        &candidate_ids,
+        &matcher,
+        filter,
+        quiet,
+    ))
+}
+
+/// Also add search_files_regex for --changed/--since with regex.
+/// Honors a filter installed with [`with_scan_filter`].
 pub(crate) fn search_files_regex(
     root: &Path,
     files: &[PathBuf],
@@ -383,12 +606,9 @@ pub(crate) fn search_files_regex(
     case_insensitive: bool,
     quiet: bool,
 ) -> Result<Vec<SearchResult>> {
-    let re = build_regex(pattern, case_insensitive)?;
-
-    let matcher = RegexMatcher { re };
-    let results = scan_direct(root, files, &matcher, quiet);
-
-    Ok(results)
+    with_active_filter(|f| {
+        search_files_with_filter(root, files, pattern, true, case_insensitive, quiet, f)
+    })
 }
 
 /// Extract literal substrings from a regex pattern (simple heuristic)
@@ -1019,5 +1239,139 @@ mod tests {
         assert_eq!(r.len(), 2);
         let r = m.find_matches(b"a\n\nb", "f");
         assert_eq!(r.len(), 3);
+    }
+
+    struct CountingMatcher {
+        inner: LiteralMatcher,
+        files: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Matcher for CountingMatcher {
+        fn find_matches(&self, content: &[u8], rel_path: &str) -> Vec<SearchResult> {
+            self.files.lock().unwrap().push(rel_path.to_string());
+            self.inner.find_matches(content, rel_path)
+        }
+    }
+
+    fn counting(pattern: &str) -> CountingMatcher {
+        CountingMatcher {
+            inner: LiteralMatcher::new(pattern.as_bytes()),
+            files: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn many_files(n: usize) -> (tempfile::TempDir, IndexReader) {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        for i in 0..n {
+            let body = format!("needle one {i}\nother\nneedle two {i}\n");
+            fs::write(root.join(format!("src/f{i:03}.rs")), &body).unwrap();
+            fs::write(root.join(format!("docs/d{i:03}.md")), &body).unwrap();
+        }
+        let index_path = root.join("index.xgrep");
+        builder::build_index(root, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        (dir, reader)
+    }
+
+    #[test]
+    fn test_path_filters_skip_files_before_reading() {
+        let (dir, reader) = many_files(100);
+        let root = dir.path();
+        let ids: Vec<u32> = (0..reader.file_count()).collect();
+
+        let filter = ScanFilter {
+            extensions: Some(vec!["md"]),
+            ..Default::default()
+        };
+        let m = counting("needle");
+        let results = scan_indexed(&reader, root, &ids, &m, &filter, true);
+        assert_eq!(results.len(), 200);
+        let read = m.files.lock().unwrap();
+        assert_eq!(read.len(), 100);
+        assert!(read.iter().all(|f| f.ends_with(".md")));
+
+        let filter = ScanFilter {
+            path_substring: Some("f00".to_string()),
+            globs: Some(GlobFilter::new(&["*.rs".to_string(), "!*f009.rs".to_string()]).unwrap()),
+            ..Default::default()
+        };
+        let m = counting("needle");
+        let results = scan_indexed(&reader, root, &ids, &m, &filter, true);
+        assert_eq!(m.files.lock().unwrap().len(), 9);
+        assert_eq!(results.len(), 18);
+    }
+
+    #[test]
+    fn test_max_count_stops_early_and_keeps_order() {
+        let (dir, reader) = many_files(150);
+        let root = dir.path();
+        let ids: Vec<u32> = (0..reader.file_count()).rev().collect();
+
+        let full = scan_indexed(
+            &reader,
+            root,
+            &ids,
+            &counting("needle"),
+            &ScanFilter::default(),
+            true,
+        );
+        assert_eq!(full.len(), 600);
+        let sorted = full
+            .windows(2)
+            .all(|w| (&w[0].file, w[0].line_number) < (&w[1].file, w[1].line_number));
+        assert!(sorted, "results must be sorted by (file, line)");
+
+        for limit in [0usize, 1, 3, 130, 599, 600, 1000] {
+            let filter = ScanFilter {
+                max_count: Some(limit),
+                ..Default::default()
+            };
+            let m = counting("needle");
+            let limited = scan_indexed(&reader, root, &ids, &m, &filter, true);
+            let expected: Vec<(String, usize)> = full
+                .iter()
+                .take(limit)
+                .map(|r| (r.file.to_string(), r.line_number))
+                .collect();
+            let got: Vec<(String, usize)> = limited
+                .iter()
+                .map(|r| (r.file.to_string(), r.line_number))
+                .collect();
+            assert_eq!(got, expected, "limit {limit}");
+            if limit <= 3 {
+                assert!(m.files.lock().unwrap().len() <= LIMIT_CHUNK);
+            }
+        }
+    }
+
+    #[test]
+    fn test_scoped_filter_applies_to_legacy_entry_points() {
+        let (dir, reader) = many_files(10);
+        let root = dir.path();
+        let filter = ScanFilter {
+            extensions: Some(vec!["rs"]),
+            max_count: Some(3),
+            ..Default::default()
+        };
+        let results = with_scan_filter(filter, || {
+            let a = search(&reader, root, "needle", false, true).unwrap();
+            let b = search_regex(&reader, root, "needle", false, true).unwrap();
+            let files = vec![PathBuf::from("docs/d000.md"), PathBuf::from("src/f000.rs")];
+            let c = search_files(root, &files, "needle", false, true).unwrap();
+            (a, b, c)
+        });
+        assert_eq!(results.0.len(), 3);
+        assert_eq!(results.1.len(), 3);
+        assert_eq!(results.2.len(), 2);
+        assert!(results.0.iter().all(|r| r.file.ends_with(".rs")));
+        assert!(results.2.iter().all(|r| r.file.ends_with(".rs")));
+        // Scope ended: no filter applies.
+        assert_eq!(
+            search(&reader, root, "needle", false, true).unwrap().len(),
+            40
+        );
     }
 }
