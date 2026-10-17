@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 pub use error::{Result, XgrepError};
 pub use filetype::extensions_for_type;
 pub use filetype::list_all_types;
-pub use search::SearchResult;
+pub use search::{FileMatches, OutputMode, SearchResult};
 
 /// Returns true if the pattern contains an uppercase letter.
 ///
@@ -133,6 +133,14 @@ pub struct SearchOptions {
     /// Include/exclude result paths by glob (ripgrep -g compatible).
     /// Prefix a glob with `!` to exclude. Empty = no filtering.
     pub globs: Vec<String>,
+    /// File-level AND: a file is reported only if it also matches every one
+    /// of these patterns (anywhere in the file). Interpreted like the main
+    /// pattern (`regex`, `word`, `case_insensitive`). Used to narrow index
+    /// candidates by posting-list intersection.
+    pub and_patterns: Vec<String>,
+    /// File-level NOT: a file is skipped if it matches any of these patterns.
+    /// Interpreted like the main pattern. Verified on file contents.
+    pub not_patterns: Vec<String>,
 }
 
 impl SearchOptions {
@@ -211,6 +219,18 @@ impl SearchOptions {
     /// Filter results by path substring match (e.g. `"src/auth"`, `"tests/"`).
     pub fn with_path_pattern(mut self, pattern: impl Into<String>) -> Self {
         self.path_pattern = Some(pattern.into());
+        self
+    }
+
+    /// Require files to also match `pattern` (file-level AND). Repeatable.
+    pub fn with_and(mut self, pattern: impl Into<String>) -> Self {
+        self.and_patterns.push(pattern.into());
+        self
+    }
+
+    /// Skip files that match `pattern` (file-level NOT). Repeatable.
+    pub fn with_not(mut self, pattern: impl Into<String>) -> Self {
+        self.not_patterns.push(pattern.into());
         self
     }
 }
@@ -509,8 +529,9 @@ impl Xgrep {
             // neighbouring character is consumed instead; results are
             // line-based, so this does not change which lines match.
             // `\n` is excluded so a match never starts on the previous line.
+            // Capture group 1 holds the user's pattern (the match column).
             (
-                format!(r"(?:(?m:^)|[^\w\n])(?:{})(?:(?m:$)|[^\w\n])", inner).into(),
+                format!(r"(?:(?m:^)|[^\w\n])({})(?:(?m:$)|[^\w\n])", inner).into(),
                 true,
             )
         } else {
@@ -518,12 +539,94 @@ impl Xgrep {
         }
     }
 
-    /// Execute a search. Auto-build, hybrid search, and git-changed-file search are handled internally.
-    pub fn search(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
-        let (pattern, regex) = Self::effective_pattern(pattern, opts);
-        let pattern = pattern.as_ref();
+    /// The executable pattern (after word wrapping) for one user pattern.
+    fn pattern_spec(pattern: &str, opts: &SearchOptions) -> search::PatternSpec {
+        let (p, regex) = Self::effective_pattern(pattern, opts);
+        search::PatternSpec {
+            pattern: p.into_owned(),
+            regex,
+            word: opts.word,
+        }
+    }
 
-        // Path filters run on candidate paths before any file is read.
+    /// Compile the main pattern plus `opts.and_patterns` / `opts.not_patterns`.
+    fn compile_query(&self, pattern: &str, opts: &SearchOptions) -> Result<search::CompiledQuery> {
+        let spec = search::QuerySpec {
+            main: Self::pattern_spec(pattern, opts),
+            and: opts
+                .and_patterns
+                .iter()
+                .map(|p| Self::pattern_spec(p, opts))
+                .collect(),
+            not: opts
+                .not_patterns
+                .iter()
+                .map(|p| Self::pattern_spec(p, opts))
+                .collect(),
+            case_insensitive: opts.case_insensitive,
+        };
+        search::CompiledQuery::new(spec, self.config.quiet)
+    }
+
+    /// Execute a search. Auto-build, hybrid search, and git-changed-file search are handled internally.
+    ///
+    /// Results are sorted by (file, line). For large result sets prefer
+    /// [`search_stream`](Self::search_stream), which does not hold every
+    /// result in memory.
+    pub fn search(&self, pattern: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
+        let mut results = Vec::new();
+        self.search_stream(
+            pattern,
+            opts,
+            OutputMode::Lines,
+            search::collect_into(&mut results),
+        )?;
+        Ok(results)
+    }
+
+    /// Streaming search: calls `sink` once per matching file, in path order,
+    /// as soon as that file's results are complete.
+    ///
+    /// Files are scanned in parallel; only a bounded window of finished
+    /// files waits for earlier ones, so memory does not grow with the total
+    /// output. `mode` selects what is computed per file: every line
+    /// ([`OutputMode::Lines`]), only the number of matching lines
+    /// ([`OutputMode::Count`], no line text is built) or only whether the
+    /// file matches ([`OutputMode::FilesOnly`], stops at the first match).
+    ///
+    /// `opts.max_count` limits the total number of matching lines delivered.
+    /// Return `false` from `sink` to stop the search early.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use xgrep_search::{OutputMode, SearchOptions, Xgrep};
+    ///
+    /// let xg = Xgrep::open(".").unwrap();
+    /// xg.search_stream("TODO", &SearchOptions::new(), OutputMode::Count, |fm| {
+    ///     println!("{}:{}", fm.file, fm.count);
+    ///     true
+    /// })
+    /// .unwrap();
+    /// ```
+    pub fn search_stream(
+        &self,
+        pattern: &str,
+        opts: &SearchOptions,
+        mode: OutputMode,
+        mut sink: impl FnMut(FileMatches) -> bool,
+    ) -> Result<()> {
+        let q = self.compile_query(pattern, opts)?;
+        let filter = self.scan_filter(opts)?;
+        if opts.changed_only || opts.since.is_some() {
+            self.search_changed(&q, opts, &filter, mode, &mut sink)
+        } else {
+            self.search_indexed(&q, opts, &filter, mode, &mut sink)
+        }
+    }
+
+    /// Path filters and limit for `opts` (applied before files are read).
+    fn scan_filter(&self, opts: &SearchOptions) -> Result<search::ScanFilter> {
         let extensions = match opts.file_type.as_deref() {
             Some(ft) => {
                 let exts = filetype::extensions_for_type(ft);
@@ -539,25 +642,13 @@ impl Xgrep {
         } else {
             Some(globfilter::GlobFilter::new(&opts.globs)?)
         };
-        let filter = search::ScanFilter {
+        Ok(search::ScanFilter {
             extensions,
             path_substring: opts.path_pattern.clone(),
             globs,
             exclude_paths: None,
             max_count: opts.max_count,
-        };
-
-        let mut results = if opts.changed_only || opts.since.is_some() {
-            self.search_changed(pattern, regex, opts, &filter)?
-        } else {
-            self.search_indexed(pattern, regex, opts, &filter)?
-        };
-
-        if let Some(max) = opts.max_count {
-            results.truncate(max);
-        }
-
-        Ok(results)
+        })
     }
 
     /// Index-based search with a freshness overlay.
@@ -574,11 +665,12 @@ impl Xgrep {
     /// rebuilds the index synchronously first.
     fn search_indexed(
         &self,
-        pattern: &str,
-        regex: bool,
+        q: &search::CompiledQuery,
         opts: &SearchOptions,
         filter: &search::ScanFilter,
-    ) -> Result<Vec<SearchResult>> {
+        mode: OutputMode,
+        sink: &mut dyn FnMut(FileMatches) -> bool,
+    ) -> Result<()> {
         self.set_last_freshness(None);
 
         if !self.index_path.exists() {
@@ -591,7 +683,7 @@ impl Xgrep {
             }
             let reader = index::reader::IndexReader::open(&self.index_path)?;
             self.set_last_freshness(Some(Freshness::default()));
-            return self.search_reader(&reader, pattern, regex, opts, filter);
+            return self.search_reader(&reader, q, filter, &[], mode, sink);
         }
 
         let reader = index::reader::IndexReader::open(&self.index_path)?;
@@ -623,9 +715,9 @@ impl Xgrep {
         let Some(overlay) = overlay else {
             // Probe disabled, backed off, or timed out: use the index as-is
             // (freshness unknown).
-            let results = self.search_reader(&reader, pattern, regex, opts, filter);
+            self.search_reader(&reader, q, filter, &[], mode, sink)?;
             self.spawn_background_rebuild();
-            return results;
+            return Ok(());
         };
 
         let changed = overlay.changed.len();
@@ -634,7 +726,7 @@ impl Xgrep {
             if overlay.meta_outdated {
                 self.spawn_background_rebuild();
             }
-            return self.search_reader(&reader, pattern, regex, opts, filter);
+            return self.search_reader(&reader, q, filter, &[], mode, sink);
         }
 
         if overlay.truncated || changed > OVERLAY_MAX_FILES {
@@ -650,7 +742,7 @@ impl Xgrep {
                 }
                 let reader = index::reader::IndexReader::open(&self.index_path)?;
                 self.set_last_freshness(Some(Freshness::default()));
-                return self.search_reader(&reader, pattern, regex, opts, filter);
+                return self.search_reader(&reader, q, filter, &[], mode, sink);
             }
             let info = Freshness {
                 changed_files: changed,
@@ -664,9 +756,9 @@ impl Xgrep {
                 );
             }
             self.set_last_freshness(Some(info));
-            let results = self.search_reader(&reader, pattern, regex, opts, filter);
+            self.search_reader(&reader, q, filter, &[], mode, sink)?;
             self.spawn_background_rebuild();
-            return results;
+            return Ok(());
         }
 
         // Overlay: skip changed files in the index scan and scan them
@@ -681,26 +773,24 @@ impl Xgrep {
             exclude_paths: Some(changed_keys),
             ..filter.clone()
         };
-        let mut results = self.search_reader(&reader, pattern, regex, opts, &index_filter)?;
-        drop(reader);
-
         let scan: Vec<PathBuf> = overlay
             .changed
             .into_iter()
             .filter(|p| self.root.join(p).is_file())
             .collect();
-        let direct = search::search_files_with_filter(
+        // One merged, path-ordered scan of index candidates and changed files.
+        let mut targets = search::index_targets(&reader, q, &index_filter, self.config.quiet);
+        targets.extend(search::file_targets(&scan, filter));
+        search::run(
             &self.root,
-            &scan,
-            pattern,
-            regex,
-            opts.case_insensitive,
+            targets,
+            q,
+            filter.max_count,
+            mode,
             self.config.quiet,
-            filter,
-        )?;
-        results.extend(direct);
-        results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_number.cmp(&b.line_number)));
-        results.dedup_by(|a, b| a.file == b.file && a.line_number == b.line_number);
+            sink,
+        );
+        drop(reader);
 
         self.set_last_freshness(Some(Freshness {
             changed_files: changed,
@@ -708,27 +798,32 @@ impl Xgrep {
             truncated: false,
         }));
         self.spawn_background_rebuild();
-        Ok(results)
+        Ok(())
     }
 
-    /// Run a literal or regex search against an open index reader.
+    /// Run a query against an open index reader, plus `direct` files read
+    /// from disk, streaming per-file results to `sink` in path order.
     fn search_reader(
         &self,
         reader: &index::reader::IndexReader,
-        pattern: &str,
-        regex: bool,
-        opts: &SearchOptions,
+        q: &search::CompiledQuery,
         filter: &search::ScanFilter,
-    ) -> Result<Vec<SearchResult>> {
-        search::search_with_filter(
-            reader,
+        direct: &[PathBuf],
+        mode: OutputMode,
+        sink: &mut dyn FnMut(FileMatches) -> bool,
+    ) -> Result<()> {
+        let mut targets = search::index_targets(reader, q, filter, self.config.quiet);
+        targets.extend(search::file_targets(direct, filter));
+        search::run(
             &self.root,
-            pattern,
-            regex,
-            opts.case_insensitive,
+            targets,
+            q,
+            filter.max_count,
+            mode,
             self.config.quiet,
-            filter,
-        )
+            sink,
+        );
+        Ok(())
     }
 
     /// Marker written when a freshness probe exceeds its budget (e.g. git on
@@ -910,8 +1005,28 @@ impl Xgrep {
         pattern: &str,
         opts: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        let (pattern, regex) = Self::effective_pattern(pattern, opts);
-        let pattern = pattern.as_ref();
+        let mut results = Vec::new();
+        self.search_files_stream(
+            files,
+            pattern,
+            opts,
+            OutputMode::Lines,
+            search::collect_into(&mut results),
+        )?;
+        Ok(results)
+    }
+
+    /// Streaming variant of [`search_files`](Self::search_files); see
+    /// [`search_stream`](Self::search_stream) for `mode` and `sink`.
+    pub fn search_files_stream(
+        &self,
+        files: &[PathBuf],
+        pattern: &str,
+        opts: &SearchOptions,
+        mode: OutputMode,
+        mut sink: impl FnMut(FileMatches) -> bool,
+    ) -> Result<()> {
+        let q = self.compile_query(pattern, opts)?;
         let filter = search::ScanFilter {
             globs: if opts.globs.is_empty() {
                 None
@@ -921,25 +1036,28 @@ impl Xgrep {
             max_count: opts.max_count,
             ..Default::default()
         };
-        search::search_files_with_filter(
+        let targets = search::file_targets(files, &filter);
+        search::run(
             &self.root,
-            files,
-            pattern,
-            regex,
-            opts.case_insensitive,
+            targets,
+            &q,
+            filter.max_count,
+            mode,
             self.config.quiet,
-            &filter,
-        )
+            &mut sink,
+        );
+        Ok(())
     }
 
     /// Search only git-changed files. Returns error if not a git repository.
     fn search_changed(
         &self,
-        pattern: &str,
-        regex: bool,
+        q: &search::CompiledQuery,
         opts: &SearchOptions,
         filter: &search::ScanFilter,
-    ) -> Result<Vec<SearchResult>> {
+        mode: OutputMode,
+        sink: &mut dyn FnMut(FileMatches) -> bool,
+    ) -> Result<()> {
         self.set_last_freshness(None);
         if !git::is_git_repo(&self.root) {
             return Err(XgrepError::NotGitRepo);
@@ -955,15 +1073,17 @@ impl Xgrep {
         files.sort();
         files.dedup();
 
-        search::search_files_with_filter(
+        let targets = search::file_targets(&files, filter);
+        search::run(
             &self.root,
-            &files,
-            pattern,
-            regex,
-            opts.case_insensitive,
+            targets,
+            q,
+            filter.max_count,
+            mode,
             self.config.quiet,
-            filter,
-        )
+            sink,
+        );
+        Ok(())
     }
 
     /// Find files matching a glob or substring pattern.

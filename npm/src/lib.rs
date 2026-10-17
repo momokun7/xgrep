@@ -139,6 +139,7 @@ fn to_rust_opts(opts: Option<SearchOptions>) -> xgrep_search::SearchOptions {
             fresh: o.fresh.unwrap_or(false),
             word: o.word.unwrap_or(false),
             globs: o.globs.unwrap_or_default(),
+            ..Default::default()
         },
     }
 }

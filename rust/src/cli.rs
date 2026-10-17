@@ -4,7 +4,8 @@ use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{output, Config, SearchOptions, Xgrep};
+use crate::{output, Config, FileMatches, OutputMode, SearchOptions, Xgrep};
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "xg", about = "Ultra-fast indexed code search (xgrep)", version)]
@@ -119,6 +120,16 @@ struct Cli {
     /// Include or exclude files by glob (prefix with ! to exclude; repeatable)
     #[arg(short = 'g', long = "glob", value_name = "GLOB")]
     globs: Vec<String>,
+
+    /// Only report files that also contain PATTERN (file-level AND;
+    /// repeatable). Interpreted like the main pattern (-e, -w, case)
+    #[arg(long = "and", value_name = "PATTERN")]
+    and_patterns: Vec<String>,
+
+    /// Skip files that contain PATTERN (file-level NOT; repeatable).
+    /// Interpreted like the main pattern (-e, -w, case)
+    #[arg(long = "not", value_name = "PATTERN")]
+    not_patterns: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -200,45 +211,6 @@ fn resolve_dir(path: Option<&Path>) -> Result<PathBuf> {
             anyhow::bail!("expected a directory, not a file");
         }
     }
-}
-
-/// Combine per-PATH search results into one list.
-///
-/// With a single PATH, results stay relative to that search root (the
-/// historical behaviour). With several, they are re-rooted at the deepest
-/// common ancestor directory so file names stay unambiguous; duplicates
-/// from overlapping PATHs are dropped.
-fn merge_path_groups(
-    mut groups: Vec<(PathBuf, Vec<crate::SearchResult>)>,
-) -> (PathBuf, Vec<crate::SearchResult>) {
-    if groups.len() == 1 {
-        return groups.pop().expect("one group");
-    }
-    let mut base = groups[0].0.clone();
-    for (dir, _) in &groups[1..] {
-        while !dir.starts_with(&base) {
-            if !base.pop() {
-                break;
-            }
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut merged = Vec::new();
-    for (dir, results) in groups {
-        let prefix = dir
-            .strip_prefix(&base)
-            .unwrap_or(Path::new(""))
-            .to_path_buf();
-        for mut r in results {
-            if !prefix.as_os_str().is_empty() {
-                r.file = prefix.join(&*r.file).to_string_lossy().into();
-            }
-            if seen.insert((r.file.clone(), r.line_number)) {
-                merged.push(r);
-            }
-        }
-    }
-    (base, merged)
 }
 
 fn run() -> Result<()> {
@@ -442,12 +414,38 @@ fn run() -> Result<()> {
             // with the process.
             crate::set_background_rebuild_process(true);
 
-            // --exclude is applied here, after the library search, so the
-            // --max-count limit must be applied after it (not inside search).
-            let lib_max_count = if cli.exclude.is_empty() {
-                cli.max_count
-            } else {
-                None
+            let base_opts = SearchOptions {
+                case_insensitive,
+                regex: cli.regex,
+                word: cli.word_regexp,
+                globs: cli.globs.clone(),
+                and_patterns: cli.and_patterns.clone(),
+                not_patterns: cli.not_patterns.clone(),
+                ..Default::default()
+            };
+            let excluded = |file: &str| {
+                cli.exclude
+                    .iter()
+                    .any(|ex| !ex.is_empty() && file.contains(ex.as_str()))
+            };
+            // 0 means "no limit", like ripgrep's --max-columns.
+            let max_columns = cli.max_columns.filter(|&n| n > 0);
+            let text_opts = |base: usize| output::TextOptions {
+                before_context: cli.before_context.unwrap_or(base),
+                after_context: cli.after_context.unwrap_or(base),
+                absolute_paths: use_absolute,
+                max_columns,
+            };
+            let llm_opts = output::LlmOptions {
+                before_context: 0,
+                after_context: 0,
+                max_tokens: cli.max_tokens,
+                absolute_paths: use_absolute,
+                max_line_chars: match cli.max_columns {
+                    Some(0) => None,
+                    Some(n) => Some(n),
+                    None => Some(output::DEFAULT_LLM_MAX_LINE_CHARS),
+                },
             };
 
             let targets: Vec<Option<&Path>> = if cli.paths.is_empty() {
@@ -455,140 +453,190 @@ fn run() -> Result<()> {
             } else {
                 cli.paths.iter().map(|p| Some(p.as_path())).collect()
             };
-            let mut groups: Vec<(PathBuf, Vec<crate::SearchResult>)> = Vec::new();
-            for target in targets {
-                let group = match resolve_path(target)? {
-                    ResolvedPath::Dir(dir) => {
-                        let xg = Xgrep::open(&dir)?;
-                        let opts = SearchOptions {
-                            case_insensitive,
-                            regex: cli.regex,
-                            file_type: cli.file_type.clone(),
-                            max_count: lib_max_count,
-                            changed_only: cli.changed,
-                            since: cli.since.clone(),
-                            path_pattern: None,
-                            fresh: cli.fresh,
-                            word: cli.word_regexp,
-                            globs: cli.globs.clone(),
-                        };
-                        let results = xg.search(&pattern, &opts)?;
-                        (dir, results)
-                    }
-                    ResolvedPath::File { dir, file } => {
-                        let rel_path = file.strip_prefix(&dir).unwrap_or(&file).to_path_buf();
-                        let xg = Xgrep::open(&dir)?;
-                        let opts = SearchOptions {
-                            case_insensitive,
-                            regex: cli.regex,
-                            max_count: lib_max_count,
-                            word: cli.word_regexp,
-                            globs: cli.globs.clone(),
-                            ..Default::default()
-                        };
-                        let results = xg.search_files(&[rel_path], &pattern, &opts)?;
-                        (dir, results)
-                    }
-                };
-                groups.push(group);
-            }
-            let (dir, results) = merge_path_groups(groups);
+            let resolved = targets
+                .into_iter()
+                .map(resolve_path)
+                .collect::<Result<Vec<_>>>()?;
+            let dirs: Vec<PathBuf> = resolved
+                .iter()
+                .map(|r| match r {
+                    ResolvedPath::Dir(d) => d.clone(),
+                    ResolvedPath::File { dir, .. } => dir.clone(),
+                })
+                .collect();
+            // With several PATHs, results are re-rooted at the deepest common
+            // ancestor so file names stay unambiguous.
+            let base = common_base(&dirs);
+            let multi = resolved.len() > 1;
 
-            // Apply --exclude filter, then --max-count
-            let mut results: Vec<crate::SearchResult> = if cli.exclude.is_empty() {
-                results
-            } else {
-                results
-                    .into_iter()
-                    .filter(|r| {
-                        !cli.exclude
-                            .iter()
-                            .any(|ex| !ex.is_empty() && r.file.contains(ex.as_str()))
-                    })
-                    .collect()
-            };
-            // The search stopped at --max-count, so there may be more matches.
-            let hit_max_count = cli.max_count.is_some_and(|m| results.len() >= m);
-            if let Some(max) = cli.max_count {
-                results.truncate(max);
-            }
-
-            if results.is_empty() {
-                std::process::exit(1);
-            }
-
-            let make_path = |rel: &str| -> String {
-                if use_absolute {
-                    dir.join(rel).to_string_lossy().to_string()
-                } else {
-                    rel.to_string()
-                }
-            };
-
-            // Stream everything through one buffered handle instead of building
-            // the whole output in memory first.
             let stdout = std::io::stdout();
             let mut out = std::io::BufWriter::new(stdout.lock());
-            // 0 means "no limit", like ripgrep's --max-columns.
-            let max_columns = cli.max_columns.filter(|&n| n > 0);
 
-            if cli.count {
-                let mut counts: std::collections::BTreeMap<String, usize> =
-                    std::collections::BTreeMap::new();
-                for r in &results {
-                    *counts.entry(make_path(&r.file)).or_insert(0) += 1;
-                }
-                for (file, count) in counts {
-                    writeln!(out, "{}:{}", file, count)?;
-                }
-            } else if cli.files_only {
-                let mut seen = std::collections::BTreeSet::new();
-                for r in &results {
-                    let p = make_path(&r.file);
-                    if seen.insert(p.clone()) {
-                        writeln!(out, "{}", p)?;
-                    }
-                }
-            } else if cli.json_output {
-                output::write_json_lines(&mut out, &results, &dir, use_absolute, hit_max_count)?;
-            } else if cli.format == "llm" {
-                let base = cli.context.unwrap_or_else(|| {
+            let has_context = cli.context.is_some()
+                || cli.before_context.is_some()
+                || cli.after_context.is_some();
+            let ctx_opts = text_opts(cli.context.unwrap_or(0));
+            let llm_opts = {
+                let base_ctx = cli.context.unwrap_or_else(|| {
                     std::env::var("XGREP_LLM_CONTEXT")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(3)
                 });
-                let opts = output::LlmOptions {
-                    before_context: cli.before_context.unwrap_or(base),
-                    after_context: cli.after_context.unwrap_or(base),
-                    max_tokens: cli.max_tokens,
-                    absolute_paths: use_absolute,
-                    max_line_chars: match cli.max_columns {
-                        Some(0) => None,
-                        Some(n) => Some(n),
-                        None => Some(output::DEFAULT_LLM_MAX_LINE_CHARS),
-                    },
-                };
-                output::write_llm(&mut out, &results, &dir, &opts)?;
+                output::LlmOptions {
+                    before_context: cli.before_context.unwrap_or(base_ctx),
+                    after_context: cli.after_context.unwrap_or(base_ctx),
+                    ..llm_opts
+                }
+            };
+            let mut emitter = if cli.count {
+                Emitter::Count
+            } else if cli.files_only {
+                Emitter::Files
+            } else if cli.json_output {
+                Emitter::Json(output::JsonLinesWriter::new(&base, use_absolute))
+            } else if cli.format == "llm" {
+                Emitter::Llm(output::LlmWriter::new(&base, &llm_opts))
+            } else if has_context {
+                Emitter::Context(output::ContextWriter::new(&base, &ctx_opts))
             } else {
-                let has_context = cli.context.is_some()
-                    || cli.before_context.is_some()
-                    || cli.after_context.is_some();
-                let base = cli.context.unwrap_or(0);
-                let opts = output::TextOptions {
-                    before_context: cli.before_context.unwrap_or(base),
-                    after_context: cli.after_context.unwrap_or(base),
-                    absolute_paths: use_absolute,
-                    max_columns,
+                Emitter::Plain(&ctx_opts)
+            };
+            // -l with a line limit needs exact counts to honour the limit.
+            let mode = if cli.count || (cli.files_only && cli.max_count.is_some()) {
+                OutputMode::Count
+            } else if cli.files_only {
+                OutputMode::FilesOnly
+            } else {
+                OutputMode::Lines
+            };
+
+            let mut remaining = cli.max_count.unwrap_or(usize::MAX);
+            let mut total = 0usize;
+            let mut seen: std::collections::HashSet<Arc<str>> = Default::default();
+            let mut io_err: Option<std::io::Error> = None;
+            for (target, dir) in resolved.iter().zip(&dirs) {
+                if remaining == 0 {
+                    break;
+                }
+                let prefix = dir.strip_prefix(&base).unwrap_or(Path::new(""));
+                // Results stream out file by file; --exclude, multi-PATH
+                // de-duplication and --max-count are applied here.
+                let mut sink = |mut fm: FileMatches| -> bool {
+                    if !prefix.as_os_str().is_empty() {
+                        let file: Arc<str> = prefix.join(&*fm.file).to_string_lossy().into();
+                        for l in &mut fm.lines {
+                            l.file = Arc::clone(&file);
+                        }
+                        fm.file = file;
+                    }
+                    if excluded(&fm.file) || (multi && !seen.insert(Arc::clone(&fm.file))) {
+                        return true;
+                    }
+                    fm.lines.truncate(remaining);
+                    fm.count = fm.count.min(remaining);
+                    remaining -= fm.count;
+                    total += fm.count;
+                    if let Err(e) = emitter.write(&mut out, &fm, &base, use_absolute) {
+                        io_err = Some(e);
+                        return false;
+                    }
+                    remaining > 0
                 };
-                if has_context {
-                    output::write_default_context(&mut out, &results, &dir, &opts)?;
-                } else {
-                    output::write_default(&mut out, &results, &dir, &opts)?;
+                let xg = Xgrep::open(dir)?;
+                match target {
+                    ResolvedPath::Dir(_) => {
+                        let opts = SearchOptions {
+                            file_type: cli.file_type.clone(),
+                            changed_only: cli.changed,
+                            since: cli.since.clone(),
+                            fresh: cli.fresh,
+                            ..base_opts.clone()
+                        };
+                        xg.search_stream(&pattern, &opts, mode, &mut sink)?;
+                    }
+                    ResolvedPath::File { dir, file } => {
+                        let rel_path = file.strip_prefix(dir).unwrap_or(file).to_path_buf();
+                        xg.search_files_stream(&[rel_path], &pattern, &base_opts, mode, &mut sink)?;
+                    }
+                }
+                if let Some(e) = io_err.take() {
+                    return Err(e.into());
                 }
             }
+
+            if total == 0 {
+                std::process::exit(1);
+            }
+            // The search stopped at --max-count, so there may be more matches.
+            let hit_max_count = cli.max_count.is_some_and(|m| total >= m);
+            emitter.finish(&mut out, hit_max_count)?;
             out.flush()?;
         }
     }
     Ok(())
+}
+
+/// Path as printed: relative to `root`, or joined with it.
+fn make_display_path(root: &Path, rel: &str, absolute: bool) -> String {
+    if absolute {
+        root.join(rel).to_string_lossy().to_string()
+    } else {
+        rel.to_string()
+    }
+}
+
+/// Deepest common ancestor of `dirs` (the directory itself for one PATH).
+fn common_base(dirs: &[PathBuf]) -> PathBuf {
+    let mut base = dirs[0].clone();
+    for dir in &dirs[1..] {
+        while !dir.starts_with(&base) {
+            if !base.pop() {
+                break;
+            }
+        }
+    }
+    base
+}
+
+/// Writes streamed per-file results in the selected output format.
+enum Emitter<'a> {
+    Count,
+    Files,
+    Json(output::JsonLinesWriter<'a>),
+    Llm(output::LlmWriter<'a>),
+    Context(output::ContextWriter<'a>),
+    Plain(&'a output::TextOptions),
+}
+
+impl Emitter<'_> {
+    fn write<W: Write>(
+        &mut self,
+        w: &mut W,
+        fm: &FileMatches,
+        root: &Path,
+        absolute: bool,
+    ) -> std::io::Result<()> {
+        match self {
+            Emitter::Count => writeln!(
+                w,
+                "{}:{}",
+                make_display_path(root, &fm.file, absolute),
+                fm.count
+            ),
+            Emitter::Files => writeln!(w, "{}", make_display_path(root, &fm.file, absolute)),
+            Emitter::Json(jw) => jw.write_results(w, &fm.lines),
+            Emitter::Llm(lw) => lw.write_results(w, &fm.lines),
+            Emitter::Context(cw) => cw.write_results(w, &fm.lines),
+            Emitter::Plain(opts) => output::write_default(w, &fm.lines, root, opts),
+        }
+    }
+
+    fn finish<W: Write>(self, w: &mut W, truncated: bool) -> std::io::Result<()> {
+        match self {
+            Emitter::Json(jw) => jw.finish(w, truncated),
+            Emitter::Llm(lw) => lw.finish(w).map(|_| ()),
+            _ => Ok(()),
+        }
+    }
 }

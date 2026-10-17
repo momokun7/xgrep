@@ -337,6 +337,7 @@ mod tests {
             file: Arc::from(file),
             line_number: line,
             line: String::new(),
+            column: 0,
         }
     }
 

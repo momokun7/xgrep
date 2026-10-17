@@ -118,6 +118,7 @@ impl Xgrep {
             fresh,
             word,
             globs: globs.unwrap_or_default(),
+            ..Default::default()
         };
         let results = self
             .inner

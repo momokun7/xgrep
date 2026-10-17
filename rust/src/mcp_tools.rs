@@ -481,6 +481,7 @@ impl Prepared {
             since: self.since.clone(),
             fresh: self.fresh,
             max_count: None,
+            ..Default::default()
         }
     }
 

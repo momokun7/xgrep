@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::error::Result;
 
@@ -109,6 +110,50 @@ pub fn truncate_line(line: &str, max_chars: Option<usize>) -> Cow<'_, str> {
     }
 }
 
+/// Like [`truncate_line`], but keeps the match at byte offset `column`
+/// visible: when the match lies beyond the first `max_chars` characters
+/// (e.g. in minified code), a window of `max_chars` characters starting a
+/// little before the match is shown instead, as
+/// `[+N chars]…window…[+M chars]`.
+pub fn truncate_line_at(
+    line: &str,
+    max_chars: Option<usize>,
+    column: Option<usize>,
+) -> Cow<'_, str> {
+    let Some(max) = max_chars else {
+        return Cow::Borrowed(line);
+    };
+    if line.len() <= max {
+        return Cow::Borrowed(line);
+    }
+    let Some(mut col) = column.filter(|&c| c > 0 && c < line.len()) else {
+        return truncate_line(line, max_chars);
+    };
+    while !line.is_char_boundary(col) {
+        col -= 1;
+    }
+    // Characters of context shown before the match.
+    let lead = max / 4;
+    let match_char = line[..col].chars().count();
+    if match_char + lead <= max {
+        return truncate_line(line, max_chars);
+    }
+    let total = match_char + line[col..].chars().count();
+    if total <= max {
+        return Cow::Borrowed(line);
+    }
+    let start = (match_char - lead).min(total - max);
+    let mut idx = line.char_indices().map(|(i, _)| i).skip(start);
+    let start_b = idx.next().unwrap_or(line.len());
+    let end_b = idx.nth(max - 1).unwrap_or(line.len());
+    let right = total - start - max;
+    let mut out = format!("[+{} chars]…{}", start, &line[start_b..end_b]);
+    if right > 0 {
+        out.push_str(&format!("…[+{} chars]", right));
+    }
+    Cow::Owned(out)
+}
+
 /// Read a file for display, never failing on its contents.
 ///
 /// Bytes that are not valid UTF-8 are replaced with U+FFFD. Line splitting
@@ -123,27 +168,39 @@ fn read_display_text(path: &Path) -> Option<String> {
     })
 }
 
+/// Matched lines of one file: line number -> (text, match column).
+type MatchMap<'a> = BTreeMap<usize, (&'a str, usize)>;
+
 /// Return the text of line `n` (1-based): from the file when available,
 /// otherwise from the search result for that line (if it is a match).
-fn line_text<'a>(
-    lines: &[&'a str],
-    matches: &BTreeMap<usize, &'a str>,
-    n: usize,
-) -> Option<&'a str> {
+fn line_text<'a>(lines: &[&'a str], matches: &MatchMap<'a>, n: usize) -> Option<&'a str> {
     match lines.get(n - 1) {
         Some(l) => Some(l),
-        None => matches.get(&n).copied(),
+        None => matches.get(&n).map(|m| m.0),
     }
 }
 
+/// Text of line `n` shortened to `max` characters; matched lines keep
+/// their match visible.
+fn shown_line<'a>(
+    lines: &[&'a str],
+    matches: &MatchMap<'a>,
+    n: usize,
+    max: Option<usize>,
+) -> Option<Cow<'a, str>> {
+    let text = line_text(lines, matches, n)?;
+    let column = matches.get(&n).map(|m| m.1);
+    Some(truncate_line_at(text, max, column))
+}
+
 /// Group results by file (sorted), keeping each matched line's text.
-fn group_by_file(results: &[SearchResult]) -> BTreeMap<&str, BTreeMap<usize, &str>> {
-    let mut by_file: BTreeMap<&str, BTreeMap<usize, &str>> = BTreeMap::new();
+fn group_by_file(results: &[SearchResult]) -> BTreeMap<&str, MatchMap<'_>> {
+    let mut by_file: BTreeMap<&str, MatchMap<'_>> = BTreeMap::new();
     for r in results {
         by_file
             .entry(&r.file)
             .or_default()
-            .insert(r.line_number, r.line.as_str());
+            .insert(r.line_number, (r.line.as_str(), r.column));
     }
     by_file
 }
@@ -194,6 +251,8 @@ fn render_to_string(f: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> Result<St
 }
 
 /// Write matches in ripgrep-compatible `path:line:text` form, one per line.
+///
+/// Can be called repeatedly (e.g. once per file of a streaming search).
 pub fn write_default<W: Write>(
     w: &mut W,
     results: &[SearchResult],
@@ -206,7 +265,7 @@ pub fn write_default<W: Write>(
             "{}:{}:{}",
             display_path(root, &r.file, opts.absolute_paths),
             r.line_number,
-            truncate_line(&r.line, opts.max_columns)
+            truncate_line_at(&r.line, opts.max_columns, Some(r.column))
         )?;
     }
     Ok(())
@@ -218,19 +277,48 @@ pub fn format_default(results: &[SearchResult]) -> String {
         .unwrap_or_default()
 }
 
-/// Write matches with context in ripgrep-compatible form: `path:N:text` for
+/// Streaming writer for ripgrep-style context output: `path:N:text` for
 /// matched lines, `path-N-text` for context lines and `--` between groups.
-pub fn write_default_context<W: Write>(
-    w: &mut W,
-    results: &[SearchResult],
-    root: &Path,
-    opts: &TextOptions,
-) -> io::Result<()> {
-    let mut first_group = true;
-    for (file, matches) in &group_by_file(results) {
-        let content = read_display_text(&root.join(file)).unwrap_or_default();
+///
+/// Feed it results file by file with [`write_results`](Self::write_results).
+pub struct ContextWriter<'a> {
+    root: &'a Path,
+    opts: &'a TextOptions,
+    first_group: bool,
+}
+
+impl<'a> ContextWriter<'a> {
+    /// Create a writer for files under `root`.
+    pub fn new(root: &'a Path, opts: &'a TextOptions) -> Self {
+        Self {
+            root,
+            opts,
+            first_group: true,
+        }
+    }
+
+    /// Write the results of one or more files (grouped and sorted by file).
+    pub fn write_results<W: Write>(
+        &mut self,
+        w: &mut W,
+        results: &[SearchResult],
+    ) -> io::Result<()> {
+        for (file, matches) in &group_by_file(results) {
+            self.write_group(w, file, matches)?;
+        }
+        Ok(())
+    }
+
+    fn write_group<W: Write>(
+        &mut self,
+        w: &mut W,
+        file: &str,
+        matches: &MatchMap<'_>,
+    ) -> io::Result<()> {
+        let opts = self.opts;
+        let content = read_display_text(&self.root.join(file)).unwrap_or_default();
         let lines: Vec<&str> = content.lines().collect();
-        let path = display_path(root, file, opts.absolute_paths);
+        let path = display_path(self.root, file, opts.absolute_paths);
         let ranges = context_ranges(
             matches.keys().copied(),
             opts.before_context,
@@ -241,31 +329,34 @@ pub fn write_default_context<W: Write>(
         for (start, end) in ranges {
             // Separator between context groups (ripgrep uses -- for both
             // intra-file and inter-file).
-            if !first_group {
+            if !self.first_group {
                 w.write_all(b"--\n")?;
             }
-            first_group = false;
+            self.first_group = false;
             // Both the lines and the match keys ascend, so walk them together
             // instead of searching the match list for every line.
             let mut match_cursor = matches.range(start..=end).map(|(&k, _)| k).peekable();
             for i in start..=end {
                 let is_match = match_cursor.next_if_eq(&i).is_some();
-                if let Some(text) = line_text(&lines, matches, i) {
+                if let Some(text) = shown_line(&lines, matches, i, opts.max_columns) {
                     let sep = if is_match { ':' } else { '-' };
-                    writeln!(
-                        w,
-                        "{}{}{}{}{}",
-                        path,
-                        sep,
-                        i,
-                        sep,
-                        truncate_line(text, opts.max_columns)
-                    )?;
+                    writeln!(w, "{}{}{}{}{}", path, sep, i, sep, text)?;
                 }
             }
         }
+        Ok(())
     }
-    Ok(())
+}
+
+/// Write matches with context in ripgrep-compatible form: `path:N:text` for
+/// matched lines, `path-N-text` for context lines and `--` between groups.
+pub fn write_default_context<W: Write>(
+    w: &mut W,
+    results: &[SearchResult],
+    root: &Path,
+    opts: &TextOptions,
+) -> io::Result<()> {
+    ContextWriter::new(root, opts).write_results(w, results)
 }
 
 /// Format output with context in ripgrep-compatible format (`--` separator).
@@ -285,14 +376,77 @@ pub fn format_default_context(
     render_to_string(|buf| write_default_context(buf, results, root, &opts))
 }
 
+/// Streaming JSON Lines writer (see [`write_json_lines`] for the format).
+///
+/// Call [`write_results`](Self::write_results) as results arrive and
+/// [`finish`](Self::finish) once to write the summary object.
+pub struct JsonLinesWriter<'a> {
+    root: &'a Path,
+    absolute_paths: bool,
+    matches: usize,
+    files: std::collections::HashSet<Arc<str>>,
+}
+
+impl<'a> JsonLinesWriter<'a> {
+    /// Create a writer for files under `root`.
+    pub fn new(root: &'a Path, absolute_paths: bool) -> Self {
+        Self {
+            root,
+            absolute_paths,
+            matches: 0,
+            files: Default::default(),
+        }
+    }
+
+    /// Write one `match` object per result.
+    pub fn write_results<W: Write>(
+        &mut self,
+        w: &mut W,
+        results: &[SearchResult],
+    ) -> io::Result<()> {
+        for r in results {
+            if !self.files.contains(&r.file) {
+                self.files.insert(Arc::clone(&r.file));
+            }
+            self.matches += 1;
+            w.write_all(b"{\"type\":\"match\",\"file\":")?;
+            serde_json::to_writer(
+                &mut *w,
+                &*display_path(self.root, &r.file, self.absolute_paths),
+            )?;
+            write!(
+                w,
+                ",\"line_number\":{},\"column\":{},\"line\":",
+                r.line_number,
+                r.column + 1
+            )?;
+            serde_json::to_writer(&mut *w, &r.line)?;
+            w.write_all(b"}\n")?;
+        }
+        Ok(())
+    }
+
+    /// Write the summary object.
+    pub fn finish<W: Write>(self, w: &mut W, truncated: bool) -> io::Result<()> {
+        writeln!(
+            w,
+            "{{\"type\":\"summary\",\"total_matches\":{},\"total_files\":{},\"truncated\":{}}}",
+            self.matches,
+            self.files.len(),
+            truncated
+        )
+    }
+}
+
 /// Write results as JSON Lines (NDJSON): one object per matched line,
 ///
-/// `{"type":"match","file":"src/a.rs","line_number":3,"line":"..."}`
+/// `{"type":"match","file":"src/a.rs","line_number":3,"column":5,"line":"..."}`
 ///
 /// followed by one summary object:
 ///
 /// `{"type":"summary","total_matches":N,"total_files":M,"truncated":false}`
 ///
+/// `column` is the 1-based byte column of the first match in the line.
 /// `truncated` tells whether the results were cut short by a result limit.
 /// Objects are written directly, without building a JSON tree in memory.
 pub fn write_json_lines<W: Write>(
@@ -302,22 +456,9 @@ pub fn write_json_lines<W: Write>(
     absolute_paths: bool,
     truncated: bool,
 ) -> io::Result<()> {
-    let mut files: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for r in results {
-        files.insert(&r.file);
-        w.write_all(b"{\"type\":\"match\",\"file\":")?;
-        serde_json::to_writer(&mut *w, &*display_path(root, &r.file, absolute_paths))?;
-        write!(w, ",\"line_number\":{},\"line\":", r.line_number)?;
-        serde_json::to_writer(&mut *w, &r.line)?;
-        w.write_all(b"}\n")?;
-    }
-    writeln!(
-        w,
-        "{{\"type\":\"summary\",\"total_matches\":{},\"total_files\":{},\"truncated\":{}}}",
-        results.len(),
-        files.len(),
-        truncated
-    )
+    let mut jw = JsonLinesWriter::new(root, absolute_paths);
+    jw.write_results(w, results)?;
+    jw.finish(w, truncated)
 }
 
 /// Format output as JSON Lines (see [`write_json_lines`]).
@@ -362,19 +503,6 @@ impl TokenMeter {
     }
 }
 
-/// Writer that keeps a token estimate of what passes through it.
-struct MeteredWriter<'w, W: Write> {
-    inner: &'w mut W,
-    meter: TokenMeter,
-}
-
-impl<W: Write> MeteredWriter<'_, W> {
-    fn put(&mut self, text: &str) -> io::Result<()> {
-        self.meter.add(text);
-        self.inner.write_all(text.as_bytes())
-    }
-}
-
 /// Length of the longest run of consecutive backticks in `s`.
 fn longest_backtick_run(s: &str) -> usize {
     let mut longest = 0;
@@ -390,40 +518,75 @@ fn longest_backtick_run(s: &str) -> usize {
     longest
 }
 
-/// Write results as Markdown code blocks for LLMs.
+/// Streaming Markdown writer for LLMs (see [`write_llm`] for the format).
 ///
-/// Each block is headed by `## path:start-end` and every line is prefixed by
-/// its line number, with `>` marking matched lines (`181> ...`) and a space
-/// marking context lines (`178  ...`). The code fence is longer than any
-/// backtick run inside the block so content cannot close it early. When
-/// `max_tokens` is set, the budget is checked before every line; output stops
-/// with a `... (truncated, ...)` notice once the next line would not fit.
-pub fn write_llm<W: Write>(
-    w: &mut W,
-    results: &[SearchResult],
-    root: &Path,
-    opts: &LlmOptions,
-) -> io::Result<LlmSummary> {
-    let by_file = group_by_file(results);
-    let total_matches: usize = by_file.values().map(|m| m.len()).sum();
-    let limit = match opts.max_tokens {
-        Some(max) => max.saturating_sub(LLM_FOOTER_RESERVE_TOKENS),
-        None => usize::MAX,
-    };
+/// Feed results file by file with [`write_results`](Self::write_results),
+/// then call [`finish`](Self::finish). Once the token budget is exhausted,
+/// later results are only counted (for the truncation notice).
+pub struct LlmWriter<'a> {
+    root: &'a Path,
+    opts: &'a LlmOptions,
+    limit: usize,
+    meter: TokenMeter,
+    shown_matches: usize,
+    total_matches: usize,
+    shown_any_line: bool,
+    /// Set once output was cut: files with matches not shown so far.
+    files_left: Option<usize>,
+}
 
-    let mut out = MeteredWriter {
-        inner: w,
-        meter: TokenMeter::default(),
-    };
-    let mut shown_matches = 0;
-    let mut shown_any_line = false;
-    // (index of the file being written, matches shown from it) when truncated.
-    let mut cut: Option<(usize, usize)> = None;
+impl<'a> LlmWriter<'a> {
+    /// Create a writer for files under `root`.
+    pub fn new(root: &'a Path, opts: &'a LlmOptions) -> Self {
+        let limit = match opts.max_tokens {
+            Some(max) => max.saturating_sub(LLM_FOOTER_RESERVE_TOKENS),
+            None => usize::MAX,
+        };
+        Self {
+            root,
+            opts,
+            limit,
+            meter: TokenMeter::default(),
+            shown_matches: 0,
+            total_matches: 0,
+            shown_any_line: false,
+            files_left: None,
+        }
+    }
 
-    'files: for (file_idx, (file, matches)) in by_file.iter().enumerate() {
-        let content = read_display_text(&root.join(file)).unwrap_or_default();
+    fn put<W: Write>(&mut self, w: &mut W, text: &str) -> io::Result<()> {
+        self.meter.add(text);
+        w.write_all(text.as_bytes())
+    }
+
+    /// Write the results of one or more files (grouped and sorted by file).
+    pub fn write_results<W: Write>(
+        &mut self,
+        w: &mut W,
+        results: &[SearchResult],
+    ) -> io::Result<()> {
+        for (file, matches) in &group_by_file(results) {
+            self.write_group(w, file, matches)?;
+        }
+        Ok(())
+    }
+
+    fn write_group<W: Write>(
+        &mut self,
+        w: &mut W,
+        file: &str,
+        matches: &MatchMap<'_>,
+    ) -> io::Result<()> {
+        self.total_matches += matches.len();
+        if let Some(left) = self.files_left.as_mut() {
+            *left += 1;
+            return Ok(());
+        }
+        let opts = self.opts;
+        let limit = self.limit;
+        let content = read_display_text(&self.root.join(file)).unwrap_or_default();
         let lines: Vec<&str> = content.lines().collect();
-        let path = display_path(root, file, opts.absolute_paths);
+        let path = display_path(self.root, file, opts.absolute_paths);
         let lang = Path::new(file)
             .extension()
             .and_then(|e| e.to_str())
@@ -436,25 +599,29 @@ pub fn write_llm<W: Write>(
             lines.len(),
         );
         let mut shown_in_file = 0;
+        let cut = |this: &mut Self, shown_in_file: usize| {
+            this.files_left = Some(usize::from(matches.len() > shown_in_file));
+        };
 
         for (start, end) in ranges {
             let mut match_cursor = matches.range(start..=end).map(|(&k, _)| k).peekable();
-            let block: Vec<(usize, bool, Cow<str>)> = (start..=end)
+            let block: Vec<(usize, bool, &str, Cow<str>)> = (start..=end)
                 .filter_map(|i| {
                     let is_match = match_cursor.next_if_eq(&i).is_some();
-                    line_text(&lines, matches, i)
-                        .map(|t| (i, is_match, truncate_line(t, opts.max_line_chars)))
+                    let text = line_text(&lines, matches, i)?;
+                    let shown = shown_line(&lines, matches, i, opts.max_line_chars)?;
+                    Some((i, is_match, text, shown))
                 })
                 .collect();
             let fence_len = block
                 .iter()
-                .map(|(_, _, t)| longest_backtick_run(t) + 1)
+                .map(|(_, _, _, t)| longest_backtick_run(t) + 1)
                 .max()
                 .unwrap_or(0)
                 .max(3);
             let fence = "`".repeat(fence_len);
             let width = end.to_string().len();
-            let sep = if shown_any_line { "\n" } else { "" };
+            let sep = if self.shown_any_line { "\n" } else { "" };
             let header = if start == end {
                 format!("{}## {}:{}\n\n{}{}\n", sep, path, start, fence, lang)
             } else {
@@ -466,82 +633,103 @@ pub fn write_llm<W: Write>(
             let close = format!("{}\n", fence);
 
             let mut opened = false;
-            for (i, is_match, text) in &block {
+            for (i, is_match, raw, text) in &block {
                 let marker = if *is_match { '>' } else { ' ' };
                 let mut line = format!("{:>width$}{} {}\n", i, marker, text);
                 let pending_header = if opened { "" } else { header.as_str() };
-                if out.meter.tokens_with(&[pending_header, &line, &close]) > limit {
-                    if shown_any_line {
+                if self.meter.tokens_with(&[pending_header, &line, &close]) > limit {
+                    if self.shown_any_line {
                         if opened {
-                            out.put(&close)?;
+                            self.put(w, &close)?;
                         }
-                        cut = Some((file_idx, shown_in_file));
-                        break 'files;
+                        cut(self, shown_in_file);
+                        return Ok(());
                     }
                     // Nothing shown yet: show a shortened first line rather
                     // than an empty answer.
+                    let column = matches.get(i).map(|m| m.1);
                     let mut chars = limit.saturating_mul(4).max(16);
                     loop {
-                        let short = truncate_line(text, Some(chars));
+                        let short = truncate_line_at(raw, Some(chars), column);
                         line = format!("{:>width$}{} {}\n", i, marker, short);
                         if chars <= 16
-                            || out.meter.tokens_with(&[pending_header, &line, &close]) <= limit
+                            || self.meter.tokens_with(&[pending_header, &line, &close]) <= limit
                         {
                             break;
                         }
                         chars /= 2;
                     }
-                    out.put(pending_header)?;
-                    out.put(&line)?;
-                    out.put(&close)?;
+                    self.put(w, pending_header)?;
+                    self.put(w, &line)?;
+                    self.put(w, &close)?;
                     if *is_match {
                         shown_in_file += 1;
-                        shown_matches += 1;
+                        self.shown_matches += 1;
                     }
-                    cut = Some((file_idx, shown_in_file));
-                    break 'files;
+                    cut(self, shown_in_file);
+                    return Ok(());
                 }
                 if !opened {
-                    out.put(&header)?;
+                    self.put(w, &header)?;
                     opened = true;
                 }
-                out.put(&line)?;
-                shown_any_line = true;
+                self.put(w, &line)?;
+                self.shown_any_line = true;
                 if *is_match {
                     shown_in_file += 1;
-                    shown_matches += 1;
+                    self.shown_matches += 1;
                 }
             }
             if opened {
-                out.put(&close)?;
+                self.put(w, &close)?;
             }
         }
+        Ok(())
     }
 
-    let truncated = cut.is_some();
-    if let Some((file_idx, shown_in_file)) = cut {
-        let remaining_matches = total_matches - shown_matches;
-        let current_left = by_file
-            .values()
-            .nth(file_idx)
-            .is_some_and(|m| m.len() > shown_in_file);
-        let remaining_files = by_file.len() - file_idx - 1 + usize::from(current_left);
-        let sep = if shown_any_line { "\n" } else { "" };
-        if remaining_matches > 0 {
-            out.put(&format!(
-                "{}... (truncated, {} more matches in {} more files)\n",
-                sep, remaining_matches, remaining_files
-            ))?;
-        } else {
-            out.put(&format!("{}... (truncated)\n", sep))?;
+    /// Write the truncation notice (if output was cut) and return totals.
+    pub fn finish<W: Write>(mut self, w: &mut W) -> io::Result<LlmSummary> {
+        let truncated = self.files_left.is_some();
+        if let Some(remaining_files) = self.files_left {
+            let remaining_matches = self.total_matches - self.shown_matches;
+            let sep = if self.shown_any_line { "\n" } else { "" };
+            let notice = if remaining_matches > 0 {
+                format!(
+                    "{}... (truncated, {} more matches in {} more files)\n",
+                    sep, remaining_matches, remaining_files
+                )
+            } else {
+                format!("{}... (truncated)\n", sep)
+            };
+            self.put(w, &notice)?;
         }
+        Ok(LlmSummary {
+            shown_matches: self.shown_matches,
+            total_matches: self.total_matches,
+            truncated,
+        })
     }
+}
 
-    Ok(LlmSummary {
-        shown_matches,
-        total_matches,
-        truncated,
-    })
+/// Write results as Markdown code blocks for LLMs.
+///
+/// Each block is headed by `## path:start-end` and every line is prefixed by
+/// its line number, with `>` marking matched lines (`181> ...`) and a space
+/// marking context lines (`178  ...`). The code fence is longer than any
+/// backtick run inside the block so content cannot close it early. When
+/// `max_tokens` is set, the budget is checked before every line; output stops
+/// with a `... (truncated, ...)` notice once the next line would not fit.
+/// Long matched lines are shortened around the match (see
+/// [`truncate_line_at`]).
+pub fn write_llm<W: Write>(
+    w: &mut W,
+    results: &[SearchResult],
+    root: &Path,
+    opts: &LlmOptions,
+) -> io::Result<LlmSummary> {
+    let mut lw = LlmWriter::new(root, opts);
+    lw.write_results(w, results)?;
+    lw.finish(w)
 }
 
 /// Format results as Markdown for LLMs using `opts`.
@@ -585,6 +773,7 @@ mod tests {
             file: "src/main.rs".into(),
             line_number: 42,
             line: "fn handle_auth() {}".to_string(),
+            column: 0,
         }];
         let json = format_json(&results);
         let parsed = parse_ndjson(&json);
@@ -646,11 +835,13 @@ mod tests {
                 file: "a.rs".into(),
                 line_number: 1,
                 line: "foo".to_string(),
+                column: 0,
             },
             SearchResult {
                 file: "b.rs".into(),
                 line_number: 2,
                 line: "bar".to_string(),
+                column: 0,
             },
         ];
         let json = format_json(&results);
@@ -666,6 +857,7 @@ mod tests {
             file: "src/main.rs".into(),
             line_number: 42,
             line: "    fn handle_auth() {}".to_string(),
+            column: 0,
         }];
         let output = format_default(&results);
         assert_eq!(output, "src/main.rs:42:    fn handle_auth() {}");
@@ -678,11 +870,13 @@ mod tests {
                 file: "a.rs".into(),
                 line_number: 1,
                 line: "foo".to_string(),
+                column: 0,
             },
             SearchResult {
                 file: "b.rs".into(),
                 line_number: 10,
                 line: "bar".to_string(),
+                column: 0,
             },
         ];
         let output = format_default(&results);
@@ -715,6 +909,7 @@ mod tests {
             file: "test.rs".into(),
             line_number: 3,
             line: "fn hello() {}".to_string(),
+            column: 0,
         }];
         let output = format_llm(&results, root, 2, 2, None, false).unwrap();
         assert!(output.contains("## test.rs:"));
@@ -734,11 +929,13 @@ mod tests {
                 file: "test.rs".into(),
                 line_number: 3,
                 line: "l3".to_string(),
+                column: 0,
             },
             SearchResult {
                 file: "test.rs".into(),
                 line_number: 5,
                 line: "l5".to_string(),
+                column: 0,
             },
         ];
         let output = format_llm(&results, root, 1, 1, None, false).unwrap();
@@ -759,6 +956,7 @@ mod tests {
             file: "test.rs".into(),
             line_number: 3,
             line: "match_line".to_string(),
+            column: 0,
         }];
         let output = format_default_context(&results, root, 1, 1, false).unwrap();
         assert!(output.contains("test.rs-2-line2")); // context line uses -
@@ -775,6 +973,7 @@ mod tests {
             file: "bin.rs".into(),
             line_number: 2,
             line: "\u{fffd}\u{fffd} target \u{fffd}".to_string(),
+            column: 0,
         }];
         let llm = format_llm(&results, root, 1, 1, None, false).unwrap();
         assert!(llm.contains("ok1"));
@@ -795,11 +994,13 @@ mod tests {
                 file: "gone.rs".into(),
                 line_number: 5,
                 line: "hit in deleted file".to_string(),
+                column: 0,
             },
             SearchResult {
                 file: "ok.rs".into(),
                 line_number: 2,
                 line: "hit".to_string(),
+                column: 0,
             },
         ];
         let llm = format_llm(&results, root, 1, 1, None, false).unwrap();
@@ -823,6 +1024,7 @@ mod tests {
                 file: "big.txt".into(),
                 line_number: i,
                 line: format!("m{}", i),
+                column: 0,
             })
             .collect();
         let start = std::time::Instant::now();
@@ -848,6 +1050,7 @@ mod tests {
                 file: "t.rs".into(),
                 line_number: i,
                 line: "m".to_string(),
+                column: 0,
             })
             .collect();
         let output = format_default_context(&results, root, 1, 1, false).unwrap();
@@ -862,6 +1065,7 @@ mod tests {
             file: file.into(),
             line_number,
             line: line.to_string(),
+            column: 0,
         }
     }
 
@@ -1065,6 +1269,7 @@ mod tests {
             file: "Makefile".into(),
             line_number: 2,
             line: "\techo hello".to_string(),
+            column: 0,
         }];
         let output = format_llm(&results, root, 1, 1, None, false).unwrap();
         // No extension = empty language
@@ -1081,6 +1286,7 @@ mod tests {
             file: "test.rs".into(),
             line_number: 3,
             line: "line3".to_string(),
+            column: 0,
         }];
         let output = format_llm(&results, root, 0, 0, None, false).unwrap();
         assert!(output.contains("line3"));
@@ -1112,6 +1318,7 @@ mod tests {
                     file: (*file).into(),
                     line_number: i,
                     line: format!("line number {}", i),
+                    column: 0,
                 });
             }
         }
@@ -1161,6 +1368,7 @@ mod tests {
             file: "a.rs".into(),
             line_number: 2,
             line: "line2".to_string(),
+            column: 0,
         }];
 
         let output = format_llm(&results, root, 1, 1, None, false).unwrap();
@@ -1181,6 +1389,7 @@ mod tests {
             file: "test.rs".into(),
             line_number: 3,
             line: "match_line".to_string(),
+            column: 0,
         }];
         // before=0, after=2: no lines before, two lines after
         let output = format_default_context(&results, root, 0, 2, false).unwrap();
@@ -1199,6 +1408,7 @@ mod tests {
             file: "test.rs".into(),
             line_number: 3,
             line: "l3".to_string(),
+            column: 0,
         }];
         // before=2, after=0
         let output = format_llm(&results, root, 2, 0, None, false).unwrap();
@@ -1218,11 +1428,13 @@ mod tests {
                 file: "test.rs".into(),
                 line_number: 2,
                 line: "l2".to_string(),
+                column: 0,
             },
             SearchResult {
                 file: "test.rs".into(),
                 line_number: 5,
                 line: "l5".to_string(),
+                column: 0,
             },
         ];
         // before=0, after=3: match at 2 covers 2-5, match at 5 covers 5-8 -> one merged block 2-8
@@ -1231,5 +1443,157 @@ mod tests {
         assert_eq!(block_count, 1, "overlapping asymmetric ranges must merge");
         assert!(output.contains("## test.rs:2-8"));
         assert!(!output.contains("l1"));
+    }
+
+    fn result_at(file: &str, line_number: usize, line: &str, column: usize) -> SearchResult {
+        SearchResult {
+            column,
+            ..result(file, line_number, line)
+        }
+    }
+
+    #[test]
+    fn test_truncate_line_at_shows_window_around_match() {
+        let line = format!("{}NEEDLE{}", "a".repeat(1000), "b".repeat(1000));
+        let out = truncate_line_at(&line, Some(40), Some(1000));
+        // 10 chars (max / 4) of lead before the match.
+        assert_eq!(
+            out,
+            format!(
+                "[+990 chars]…{}NEEDLE{}…[+976 chars]",
+                "a".repeat(10),
+                "b".repeat(24)
+            )
+        );
+        // Match near the start: plain head truncation.
+        assert_eq!(
+            truncate_line_at(&line, Some(40), Some(5)),
+            truncate_line(&line, Some(40))
+        );
+        // Match at the very end: window is shifted to end at the line end.
+        let line = format!("{}END", "x".repeat(100));
+        assert_eq!(
+            truncate_line_at(&line, Some(10), Some(100)),
+            format!("[+93 chars]…{}END", "x".repeat(7))
+        );
+        // No limit / short line / unknown column.
+        assert_eq!(truncate_line_at(&line, None, Some(100)), line);
+        assert_eq!(truncate_line_at("short", Some(10), Some(3)), "short");
+        assert_eq!(
+            truncate_line_at(&line, Some(10), None),
+            truncate_line(&line, Some(10))
+        );
+    }
+
+    #[test]
+    fn test_truncate_line_at_multibyte_column() {
+        // Column in bytes, inside a multi-byte char: snapped to a boundary.
+        let line = format!("{}target{}", "あ".repeat(100), "い".repeat(100));
+        let col = "あ".len() * 100;
+        let out = truncate_line_at(&line, Some(20), Some(col + 1));
+        assert!(out.starts_with("[+"), "{}", out);
+        let out = truncate_line_at(&line, Some(20), Some(col));
+        assert!(out.contains("target"), "{}", out);
+        assert!(out.starts_with("[+95 chars]…あああああtarget"), "{}", out);
+    }
+
+    #[test]
+    fn test_write_default_shows_match_in_minified_line() {
+        let line = format!("{}findme{}", "x".repeat(5000), "y".repeat(5000));
+        let results = vec![result_at("app.min.js", 1, &line, 5000)];
+        let opts = TextOptions {
+            max_columns: Some(80),
+            ..TextOptions::default()
+        };
+        let mut buf = Vec::new();
+        write_default(&mut buf, &results, Path::new(""), &opts).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("findme"), "{}", out);
+        assert!(out.len() < 200);
+    }
+
+    #[test]
+    fn test_format_llm_shows_match_in_minified_line() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let line = format!("{}findme{}", "x".repeat(5000), "y".repeat(5000));
+        fs::write(root.join("app.min.js"), format!("{}\nnext\n", line)).unwrap();
+        let results = vec![result_at("app.min.js", 1, &line, 5000)];
+        let output = format_llm(&results, root, 1, 1, None, false).unwrap();
+        assert!(output.contains("findme"), "{}", output);
+        assert!(output.contains("2  next"));
+    }
+
+    #[test]
+    fn test_json_includes_one_based_column() {
+        let results = vec![result_at("a.rs", 2, "  let x", 2)];
+        let parsed = parse_ndjson(&format_json(&results));
+        assert_eq!(parsed[0]["column"], 3);
+    }
+
+    #[test]
+    fn test_streaming_writers_match_batch_output() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let content: String = (1..=30).map(|i| format!("line {}\n", i)).collect();
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(root.join(f), &content).unwrap();
+        }
+        let results: Vec<SearchResult> = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .flat_map(|f| {
+                [3usize, 4, 20]
+                    .iter()
+                    .map(move |&n| result_at(f, n, &format!("line {}", n), 0))
+            })
+            .collect();
+        let per_file: Vec<&[SearchResult]> = results.chunks(3).collect();
+
+        // LLM, with and without a budget that cuts in the middle.
+        for max_tokens in [None, Some(120)] {
+            let opts = LlmOptions {
+                max_tokens,
+                ..LlmOptions::default()
+            };
+            let mut batch = Vec::new();
+            let s1 = write_llm(&mut batch, &results, root, &opts).unwrap();
+            let mut streamed = Vec::new();
+            let mut lw = LlmWriter::new(root, &opts);
+            for chunk in &per_file {
+                lw.write_results(&mut streamed, chunk).unwrap();
+            }
+            let s2 = lw.finish(&mut streamed).unwrap();
+            assert_eq!(batch, streamed);
+            assert_eq!(s1, s2);
+            if max_tokens.is_some() {
+                assert!(s2.truncated);
+            }
+        }
+
+        // Context.
+        let opts = TextOptions {
+            before_context: 1,
+            after_context: 1,
+            ..TextOptions::default()
+        };
+        let mut batch = Vec::new();
+        write_default_context(&mut batch, &results, root, &opts).unwrap();
+        let mut streamed = Vec::new();
+        let mut cw = ContextWriter::new(root, &opts);
+        for chunk in &per_file {
+            cw.write_results(&mut streamed, chunk).unwrap();
+        }
+        assert_eq!(batch, streamed);
+
+        // JSON.
+        let mut batch = Vec::new();
+        write_json_lines(&mut batch, &results, root, false, true).unwrap();
+        let mut streamed = Vec::new();
+        let mut jw = JsonLinesWriter::new(root, false);
+        for chunk in &per_file {
+            jw.write_results(&mut streamed, chunk).unwrap();
+        }
+        jw.finish(&mut streamed, true).unwrap();
+        assert_eq!(batch, streamed);
     }
 }
