@@ -18,7 +18,9 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 - **LLM-optimized output** — `--format llm` produces Markdown with language tags, context lines, and token-aware truncation
 - **Git-aware** — search only changed files (`--changed`), recent commits (`--since 1h`), respects `.gitignore`
 - **Zero config** — install via cargo/npm/pip, then `xg "pattern"`. Index builds automatically on first search
-- **Hybrid search** — serves results from index instantly while rebuilding in the background
+- **Always fresh** — files edited since the last index build are rescanned on every search; `xg serve` watches the tree so this costs ~0.1ms
+- **Syntax-aware** — tree-sitter outlines (`--outline`), enclosing-block results (`--expand block`), definitions, references and a repo map for Rust, Python, JS/TS, Go, Java, C/C++ and Ruby
+- **Boolean and history search** — file-level `--and` / `--not`, search inside `git diff` (`--in-diff`) or commit messages (`--log`)
 
 ## Why xgrep?
 
@@ -28,9 +30,8 @@ Pre-builds a trigram inverted index, then searches in milliseconds. Designed for
 | First search | Instant | After server start | Auto-builds index |
 | Repeated search (Linux kernel) | 1,687ms | 170ms (server) | 37ms |
 | File discovery (next.js, 26K files) | N/A | N/A | 9ms (fd: 191ms) |
-| Index size | N/A | 155% of source | 8% of source |
+| Index size | N/A | 155% of source | ~13% of source (+6% build-only sidecar) |
 | AI agent integration | None | None | MCP server built-in |
-| Memory (search) | 11MB | 288MB | 208MB |
 
 xgrep is not a ripgrep replacement. Use ripgrep for one-off searches. Use xgrep when you search the same codebase repeatedly — the index pays for itself after ~2 searches.
 
@@ -88,6 +89,13 @@ xg "pattern" --format llm --max-tokens 4000  # Cap LLM output (approx. tokens)
 xg "pattern" -M 200           # Cut lines longer than 200 chars (--max-columns)
 xg "pattern" --json           # JSON Lines: one object per match + summary
 xg "pattern" --changed        # Only git changed files
+xg "pattern" --fresh          # Rebuild a very stale index before searching
+xg "foo" --and bar --not test # Files containing foo and bar but not test
+xg "pattern" --in-diff main...HEAD  # Only lines added/removed in a git diff
+xg "pattern" --log            # Search commit messages
+xg "pattern" --expand block   # Show the enclosing function/class per match
+xg --outline src/lib.rs       # List symbols without bodies
+xg "pattern" dir1 dir2        # Search several paths
 xg "pattern" --exclude vendor  # Exclude paths containing "vendor"
 xg "pattern" --absolute-paths # Show absolute paths
 xg "pattern" --no-hints       # Suppress regex pattern hints
@@ -106,6 +114,9 @@ Search is **smart-case** by default: an all-lowercase pattern matches case-insen
 | `XGREP_LLM_CONTEXT` | Default context lines for `--format llm` | `3` |
 | `XGREP_ABSOLUTE_PATHS` | Set to `1` to always use absolute paths | unset |
 | `XGREP_NO_HINTS` | Set to `1` to suppress regex pattern hints | unset |
+| `XGREP_MAX_FILESIZE` | Skip larger files when indexing (`512K`, `20M`, `0` = no limit) | `10M` |
+| `XGREP_NO_OVERLAY` | Set to `1` to skip rescanning files changed since the index build | unset |
+| `XGREP_NO_WATCH` | Set to `1` to disable file watching in `xg serve` | unset |
 
 Run `xg --help` for all options.
 
@@ -131,7 +142,9 @@ xg serve --root /path/to/repo   # Specific directory
 }
 ```
 
-**Available tools:** `search`, `find_definitions`, `read_file`, `index_status`, `build_index`
+**Available tools:** `search` (ranked, paginated, multi-query, `expand:"block"`), `find_definitions`, `find_references`, `find_files`, `outline`, `repo_map`, `read_file`, `index_status`, `build_index`, `session_reset`
+
+Results already returned in the session are collapsed to one line (`already shown: path:L10-40`), and every tool honours `max_tokens`.
 
 See [docs/agents.md](docs/agents.md) for agent-oriented usage patterns.
 
@@ -140,6 +153,9 @@ See [docs/agents.md](docs/agents.md) for agent-oriented usage patterns.
 > **Measurement environment (tables below):** Apple M4, 32GB RAM, NVMe SSD, macOS 15.
 > Warm filesystem cache, `hyperfine --warmup 5 --runs 20`. Results on other hardware — especially
 > shared Linux machines or HDD — will differ; see [Reproducibility](#reproducibility) below.
+
+> The Linux kernel, next.js and index-cost tables below were measured with v0.7 (index format v3)
+> and have not been re-run for the current index format (v4).
 
 ### Search: Linux kernel (92,947 files, 2.0GB)
 
@@ -170,6 +186,21 @@ see the [Reproducibility](#reproducibility) section for honest numbers.
 
 > First run includes a one-time index build. See [docs/benchmarks.md](docs/benchmarks.md) for full results including medium/small repos.
 
+### v0.7 → current, same machine
+
+crates.io registry sources (13,818 files, 361MB), WSL2 on a 28-core machine, warm cache, median of 5 runs:
+
+| | v0.7 | current |
+|---|---|---|
+| Index build | 1.8s | 0.2s |
+| Index on disk (incl. sidecar) | 138MB | 70MB |
+| `serialize` | 43ms | 20ms |
+| `the` (151k matching lines) | 107ms | 40ms |
+| `the -l` | 107ms | 22ms |
+| `the -g '*.md'` | 160ms | 11ms |
+
+Lowercased trigrams with per-posting position/next-byte masks cut candidate files that do not match by ~77%.
+
 ### Reproducibility
 
 The numbers above were measured on the author's Apple M4 with a warm filesystem cache.
@@ -190,19 +221,21 @@ your own hardware; the script runs both focused and distributed queries for a co
 
 ## Limitations
 
-- **Short queries (< 3 chars)** bypass the index — no speed advantage over ripgrep
-- **Tiny files (< 3 bytes)** hold no trigrams and are invisible to indexed content search — a deliberate trade-off of the trigram index
-- **Index staleness** — background rebuild runs every ~30s. Use `--fresh` for up-to-date results
-- **find_definitions** uses regex heuristics, not AST analysis — false positives expected
+- **One-character queries** bypass the index — no speed advantage over ripgrep (two-character queries use it)
+- **Files over 10MB** are not indexed by default (`XGREP_MAX_FILESIZE`); `xg status` reports how many were skipped
+- **Binary files** (any NUL byte, including UTF-16 text) are not indexed
+- **Freshness** — edited files are rescanned on each search; with more than 500 changed files the search warns and relies on the background rebuild (`--fresh` rebuilds first)
+- **Syntax features** cover Rust, Python, JS/TS, Go, Java, C/C++ and Ruby; other languages fall back to regex heuristics. The npm and Python packages are built without them
+- **find_references** is text-based: different symbols with the same name are not told apart
 
-When to use ripgrep instead: one-off searches, very small codebases (< 100 files), or queries shorter than 3 characters.
+When to use ripgrep instead: one-off searches, very small codebases (< 100 files), or single-character queries.
 
 ## How It Works
 
-1. **Index Build**: Walks the codebase, extracts 3-byte trigrams from each file, builds an inverted index with delta+varint compression
-2. **Search**: Extracts trigrams from query, intersects posting lists to find candidate files, verifies matches
-3. **Hybrid Mode**: Combines index results with direct scanning of changed files when index is stale
-4. **MCP Server**: Exposes search via JSON-RPC over stdio, with token-aware truncation
+1. **Index Build**: Walks the codebase, extracts ASCII-lowercased 3-byte trigrams from each file, and builds an inverted index with delta+varint compression plus a 2-byte mask per posting (position mod 8, next-byte bloom)
+2. **Search**: Intersects the rarest posting lists first, prunes candidates with the masks, then verifies matches in the files, streaming results in path order
+3. **Freshness**: Files changed since the build (found by a parallel stat probe, or by the file watcher in `xg serve`) are excluded from the index scan and searched directly
+4. **MCP Server**: Exposes search, syntax tools and file reading via JSON-RPC over stdio, with ranking, pagination, token budgets and session dedup
 
 ## Contributing
 
