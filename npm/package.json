@@ -29,7 +29,7 @@
     "test": "node __test__/index.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2"
+    "@napi-rs/cli": "^3"
   },
   "napi": {
     "name": "xgrep",
