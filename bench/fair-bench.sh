@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# bench/fair-bench.sh — xgrep vs ripgrep vs zoekt 公正ベンチマーク
+# bench/fair-bench.sh — fair benchmark of xgrep vs ripgrep vs zoekt
 #
-# レビュー指摘を全て反映:
-#   0. 環境情報の記録
-#   1. 正確性の検証 (match count diff)
-#   2. インデックス構築コスト
-#   3. コールドスタート (初回利用コスト)
-#   4. ウォーム検索レイテンシ (hyperfine --shell=none)
-#   5. メモリ使用量 (/usr/bin/time -l)
-#   6. 損益分岐分析 (何回検索でインデックスの元が取れるか)
-#   7. サマリーテーブル
+# Covers:
+#   0. Environment information
+#   1. Correctness (match count diff)
+#   2. Index build cost
+#   3. Cold start (first-use cost)
+#   4. Warm search latency (hyperfine --shell=none)
+#   5. Memory use (/usr/bin/time -l)
+#   6. Break-even (searches needed to pay back the index build)
+#   7. Summary table
 set -euo pipefail
 
 ###############################################################################
@@ -45,11 +45,11 @@ fi
 # Large: mix of focused (xg wins) and distributed (xg ties/loses) patterns.
 # The label comments show expected behaviour on a warm-cache Linux/SSD machine.
 QUERIES_LARGE=(
-    "CONFIG_PREEMPT_RT"         # focused   ~300 hits  → xg大幅優位
-    "struct file_operations"    # medium  ~2600 hits  → xgやや優位〜互角(環境依存)
-    "EXPORT_SYMBOL_GPL"         # distributed ~21000 hits → xgやや優位
-    "raw_spin_lock_irqsave"     # distributed ~1200 hits  → xg互角
-    "devm_kzalloc"              # distributed ~7400 hits  → xg不利(候補多すぎ)
+    "CONFIG_PREEMPT_RT"         # focused   ~300 hits  → xg far ahead
+    "struct file_operations"    # medium  ~2600 hits  → xg slightly ahead to even (machine-dependent)
+    "EXPORT_SYMBOL_GPL"         # distributed ~21000 hits → xg slightly ahead
+    "raw_spin_lock_irqsave"     # distributed ~1200 hits  → even
+    "devm_kzalloc"              # distributed ~7400 hits  → xg behind (too many candidates)
 )
 QUERIES_MEDIUM=("fn main" "Options" "pub struct")
 QUERIES_SMALL=("fn search" "trigram")
@@ -249,7 +249,7 @@ for query in "${QUERIES_LARGE[@]}"; do
   xgrep_out="$RESULTS_DIR/correctness_xgrep_${query// /_}.txt"
   rg_out="$RESULTS_DIR/correctness_rg_${query// /_}.txt"
 
-  # パス形式を正規化して比較（xgrep: path:line:content, rg: ./path:line:content）
+  # Normalize paths before comparing (xgrep: path:line:content, rg: ./path:line:content)
   (cd "$DS_LARGE" && "$XGREP" "$query" 2>/dev/null) | sort > "$xgrep_out"
   "$RG" --no-heading "$query" "$DS_LARGE" 2>/dev/null | sed "s|^$DS_LARGE/||" | sort > "$rg_out"
 
