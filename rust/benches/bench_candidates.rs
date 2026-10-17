@@ -54,7 +54,7 @@ fn bench_candidate_resolution(c: &mut Criterion) {
                 .search("xgrep_unique_target_pattern", &SearchOptions::default())
                 .unwrap();
             let match_files: HashSet<&str> = results.iter().map(|r| &*r.file).collect();
-            criterion::black_box(match_files.len());
+            std::hint::black_box(match_files.len());
         });
     });
 
@@ -121,7 +121,7 @@ fn bench_focused_vs_distributed(c: &mut Criterion) {
                     let results = xg
                         .search("xgrep_rare_needle_unique", &SearchOptions::default())
                         .unwrap();
-                    criterion::black_box(results.len())
+                    std::hint::black_box(results.len())
                 });
             });
             // Print match stats once outside the bench loop
@@ -150,7 +150,7 @@ fn bench_focused_vs_distributed(c: &mut Criterion) {
                     let results = xg
                         .search("xgrep_distributed_needle", &SearchOptions::default())
                         .unwrap();
-                    criterion::black_box(results.len())
+                    std::hint::black_box(results.len())
                 });
             });
             let results = xg
