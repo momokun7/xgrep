@@ -1,5 +1,101 @@
 # Changelog
 
+## [1.0.0](https://github.com/momokun7/xgrep/compare/v0.7.0...v1.0.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **index:** index format v4 with folded trigrams, posting masks and a build-only sidecar
+* --json output is no longer a single JSON array.
+
+### Features
+
+* add --version flag and optional path argument ([d9c1aee](https://github.com/momokun7/xgrep/commit/d9c1aee9864e7e696cd45e0cb717eca8b27c96b4)), closes [#17](https://github.com/momokun7/xgrep/issues/17) [#16](https://github.com/momokun7/xgrep/issues/16)
+* add case-insensitive file type matching ([b6ae906](https://github.com/momokun7/xgrep/commit/b6ae906dc818108267dee126e035e5b300519d82))
+* add criterion.rs benchmark infrastructure ([0d079a5](https://github.com/momokun7/xgrep/commit/0d079a518193ef10cf26f3f6e8bb26b94812a40c)), closes [#26](https://github.com/momokun7/xgrep/issues/26)
+* add strict input validation to MCP tool handlers ([c406d20](https://github.com/momokun7/xgrep/commit/c406d20a1824ebd0814ee66f55a03373c46989bb))
+* add version header to trigram cache format ([bcf0a9d](https://github.com/momokun7/xgrep/commit/bcf0a9d3dd922593d907671d8f2dc66da0fb1d2d))
+* **cli:** accept multiple PATH arguments ([ef5f1ff](https://github.com/momokun7/xgrep/commit/ef5f1ff35f5807348fa081d4e1cfed009c39e746))
+* distributed パターンのボトルネック計測基盤を追加 ([10181a6](https://github.com/momokun7/xgrep/commit/10181a640cad8843fec725286eacf0c1261f9059))
+* emit --json as JSON Lines with a summary object ([85d9f3a](https://github.com/momokun7/xgrep/commit/85d9f3a4a09839bb053ee99b7f61cedb65ebbcc1))
+* enforce llm token budgets per line and add --max-tokens/--max-columns ([ba0e5fd](https://github.com/momokun7/xgrep/commit/ba0e5fd184f7deff708358186dc8199bcb47f7e5))
+* **history:** search git diffs (--in-diff) and commit messages (--log) ([83493e0](https://github.com/momokun7/xgrep/commit/83493e08547d823046e4be511c4c85c1dda28f3c))
+* **index:** index format v4 with folded trigrams, posting masks and a build-only sidecar ([cac0e23](https://github.com/momokun7/xgrep/commit/cac0e23ab7289fa1ee492823d8023669c77c1e1d))
+* **mcp:** add ranking, definition heuristics, session and paging modules ([1eb3135](https://github.com/momokun7/xgrep/commit/1eb31356a42d1385fbd1945487bb8f7b82cb470f))
+* **mcp:** ignore unknown arguments with a note instead of failing ([aa98181](https://github.com/momokun7/xgrep/commit/aa98181fc411d6198c0815cfff9ee0ed4766c196))
+* **mcp:** ranked, paginated tools with validation, find_files and multi-query ([1685465](https://github.com/momokun7/xgrep/commit/16854655ffbc51b769eee3cf89751b09b6986ba4))
+* MCPパラメータをserde構造体化、find_definitionsにmax_results追加 ([#55](https://github.com/momokun7/xgrep/issues/55)) ([d2e97ab](https://github.com/momokun7/xgrep/commit/d2e97ab86a5b2a7c780492df9aad3aa9f6390be5))
+* PyPI への xgrep-search パッケージ追加（PyO3 バインディング + xg バイナリ） ([#58](https://github.com/momokun7/xgrep/issues/58)) ([7785704](https://github.com/momokun7/xgrep/commit/7785704dcb2027db7dafad8d9be185bab1b5a93c))
+* report files skipped for exceeding the max file size ([34df71c](https://github.com/momokun7/xgrep/commit/34df71c5198352a72c1d40a34b93e5647aececeb))
+* **search:** stream results in path order, add -l/-c fast paths, AND/NOT queries and match columns ([76d3019](https://github.com/momokun7/xgrep/commit/76d3019658a79ea216c98745636ba32a99a7c536))
+* **serve:** watch the tree and skip the freshness probe in long-lived processes ([fe897e0](https://github.com/momokun7/xgrep/commit/fe897e05123ec45ae75c3bf40838b635933687f9))
+* **syntax:** tree-sitter outline, definitions, references, block expansion and repo map ([905d0d3](https://github.com/momokun7/xgrep/commit/905d0d36716d1b81dfa85d3d09dae476cfd3843b))
+* v0.2.0 release ([#24](https://github.com/momokun7/xgrep/issues/24)) ([1306afa](https://github.com/momokun7/xgrep/commit/1306afade6aa975b8343ed12d90129a0ef2b168f))
+* v0.4.0 — ripgrep-compatible search UX and AI-friendly API ([#35](https://github.com/momokun7/xgrep/issues/35)) ([1768b78](https://github.com/momokun7/xgrep/commit/1768b78f98244b2b4f9c425ed132e589fb46afac))
+* v3インデックス差分更新を実装（2段階ウォーク・PerFileSection・フィンガープリントキャッシュ） ([e1cccc2](https://github.com/momokun7/xgrep/commit/e1cccc209634b822262c6b6aba48659606a371ef))
+* 検索後にバックグラウンドでインデックスを自動リビルド（30秒間隔制限付き） ([a130aec](https://github.com/momokun7/xgrep/commit/a130aecb47bc8e936b95bba8c8fa88c7441ccfce))
+
+
+### Bug Fixes
+
+* address code review findings across [#25](https://github.com/momokun7/xgrep/issues/25)-[#29](https://github.com/momokun7/xgrep/issues/29) ([bab8a5e](https://github.com/momokun7/xgrep/commit/bab8a5ee0f5c6011a774688108c2cf29e1b4694b))
+* bincache 4テスト追加・text→binary bug 修正・v2→v3 移行メッセージ追加 ([b907864](https://github.com/momokun7/xgrep/commit/b9078642227c7e1681815c5133cff9c6b47124fa))
+* canonicalize the root before hashing the cache index path ([238334d](https://github.com/momokun7/xgrep/commit/238334dc01c28340a618bb292e24623707158c3e))
+* cargo publish --allow-dirty追加、v0.1.4 ([4e6f2a0](https://github.com/momokun7/xgrep/commit/4e6f2a00be279b9bf63d6c2315a210d1976c919c))
+* **ci:** make watcher tests portable and update audited dependencies ([dc81e35](https://github.com/momokun7/xgrep/commit/dc81e35c44a9f1d391ce04946f1abc114918e8a3))
+* **cli:** aggregate --in-diff -c counts per path, not per run ([14a0227](https://github.com/momokun7/xgrep/commit/14a0227e1405f389ae963b2c700942a593e7112e))
+* **cli:** apply --exclude before --max-count ([c585973](https://github.com/momokun7/xgrep/commit/c5859732364c20439a5160b07886cdadb5fc1f50))
+* crates.io の readme パスをパッケージ内に変更 ([cc538fd](https://github.com/momokun7/xgrep/commit/cc538fd6b99bc10564f60bb60cb98d06c4ff1fe9))
+* eliminate false negatives in regex trigram extraction ([5043bfc](https://github.com/momokun7/xgrep/commit/5043bfc074d8af5eb8a4f9100d6385309a90bdd7))
+* exclude index-related files from newest_file_mtime detection ([c5d0347](https://github.com/momokun7/xgrep/commit/c5d034793c7a01fff5ba138009706ceb6168d8b9))
+* **freshness:** detect new files in directories without indexed files ([925ce99](https://github.com/momokun7/xgrep/commit/925ce99153c46f3ec1c6bf617b456613bef0f73c))
+* **freshness:** share the builder's internal-file predicate with the probe and watcher ([9f0b21e](https://github.com/momokun7/xgrep/commit/9f0b21e0c80bc17b7d439b788b10dcc619623f90))
+* GitHub Actions Node24対応、ハウスキーピング、Arc&lt;str&gt;移行 ([#49](https://github.com/momokun7/xgrep/issues/49)) ([8aae6f6](https://github.com/momokun7/xgrep/commit/8aae6f68e58d8a64016c827207081b1184622152))
+* **git:** read NUL-separated git output so non-ASCII paths work ([bc92c12](https://github.com/momokun7/xgrep/commit/bc92c122cd2d9c4ed47ac25bbb6d600dadf9fd74))
+* **index:** catch same-second edits and harden/speed up index builds ([3c26d63](https://github.com/momokun7/xgrep/commit/3c26d6387466e1125e34b1804097e0d182213e08))
+* keep default searches fresh and rebuild the index in-process ([2bdf4c1](https://github.com/momokun7/xgrep/commit/2bdf4c132aa456261b7c8fed3e8afc29d59332e3))
+* make -w work for patterns with non-word edges ([9831c0b](https://github.com/momokun7/xgrep/commit/9831c0bfe97489799b514ae39c6128277382a087))
+* match regex ^/$ per line and run regex on raw bytes ([8510f3c](https://github.com/momokun7/xgrep/commit/8510f3c629814ca6cc6728fbe96db6b6383f35c7))
+* **mcp:** mark only emitted lines as shown when a block is hard-cut ([45a6d00](https://github.com/momokun7/xgrep/commit/45a6d00a862be227e7245dc1eb7228a310fe5370))
+* MSRV を 1.85 → 1.74 へ引き下げ (is_none_or を map_or に置換) ([3e3029a](https://github.com/momokun7/xgrep/commit/3e3029ae396d8d55c59c816b13de06d1054fb535))
+* never fail context/llm output on non-UTF-8 or unreadable files ([f413c12](https://github.com/momokun7/xgrep/commit/f413c126d74110493e40d45f3db1213f7d41fa3d))
+* release.yml修正（macos-13→macos-latest、publish-crateをビルド非依存に） ([3c88b8a](https://github.com/momokun7/xgrep/commit/3c88b8af26e02c63fd1aa9f11331e3df5066fc3e))
+* resolve path doubling in --fresh and --changed for git subdirectories ([9b92a7f](https://github.com/momokun7/xgrep/commit/9b92a7fac0502479c648278fdeb79532143abc1d)), closes [#15](https://github.com/momokun7/xgrep/issues/15)
+* RUSTSEC-2026-0097 修正（rand 更新）+ pip install ハッシュ固定 ([#63](https://github.com/momokun7/xgrep/issues/63)) ([4551e4f](https://github.com/momokun7/xgrep/commit/4551e4fbc32c9d47de9e5537fa2ac4b78a98f1b8))
+* **search:** warn about a full scan only for single-byte literals ([f831c4d](https://github.com/momokun7/xgrep/commit/f831c4dc81fe6aa2fc55de1d52eedc619ebdf338))
+* sed -i を macOS 互換に修正 (-i.bak) ([f24ef35](https://github.com/momokun7/xgrep/commit/f24ef3523b70aa8114fe56b30e873ee32a60a62f))
+* suppress stderr output in MCP server mode ([1bd8da5](https://github.com/momokun7/xgrep/commit/1bd8da542784b5c16ae34f0167d1991e6a341d96))
+* **syntax:** re-verify racily clean tag cache entries by content hash ([efd4865](https://github.com/momokun7/xgrep/commit/efd4865366b07f7e5483be72bdcf354c969d57d5))
+* use `/`-separated relative paths on every platform ([3b04998](https://github.com/momokun7/xgrep/commit/3b049982764870c627dcd27c2a7a2c8a75a2cfdb))
+* use ASCII-only pattern folding for smart-case search ([25f7ca4](https://github.com/momokun7/xgrep/commit/25f7ca443a034458c017cf838a2b8102d8194200))
+* use tempdir instead of NamedTempFile in cache tests for CI stability ([44bdd1a](https://github.com/momokun7/xgrep/commit/44bdd1a1d88710788e2ad85049ce4f4c155c7d0e))
+* **watch:** don't trust the watcher's change set without a fence ([6cff448](https://github.com/momokun7/xgrep/commit/6cff44872add4bfea64a2ca39484509b400361de))
+* **watch:** stop fencing after setup failure, probe after ignore-rule changes, sync only on post-setup builds ([6c8fb16](https://github.com/momokun7/xgrep/commit/6c8fb16b8f7642026100be80813b0ad4c9a232fc))
+* Windows mtime精度対応（sleep 1s→2s） ([f95cb00](https://github.com/momokun7/xgrep/commit/f95cb000e954b9870f04934426228250d4f5529e))
+* Windows対応（stale lock回復のmtimeフォールバック、テストをcfg(unix)化） ([21287fe](https://github.com/momokun7/xgrep/commit/21287fe6403f313af565f56e1434fd3686ba7796))
+* パッケージレジストリのメタデータを修正 (PyPI 0.5.0 固着・crates.io README なし) ([fe1b355](https://github.com/momokun7/xgrep/commit/fe1b3558536eb85e8397fec3c0412e9abd382b71))
+
+
+### Performance Improvements
+
+* benchmark BTreeSet vs HashSet for trigram extraction ([fbfd79b](https://github.com/momokun7/xgrep/commit/fbfd79be58da27c47b2705e9378a6cb7eda6fff6))
+* check_index_statusの高速パス追加（commit hash同一時にgit ls-files --othersをスキップ、170ms削減） ([8b166e0](https://github.com/momokun7/xgrep/commit/8b166e00189f6d688e426a3012f5f04f38532718))
+* **index:** replace git-status freshness probe with a parallel stat scan ([89565c1](https://github.com/momokun7/xgrep/commit/89565c1f976eede3bebdd29bfeb1328fe53791e7))
+* make context output linear in the number of matches ([04bc435](https://github.com/momokun7/xgrep/commit/04bc435c60a31628023eb3a71871f1809d0ddb39))
+* optimize RegexMatcher and CaseInsensitiveMatcher hot paths ([6379546](https://github.com/momokun7/xgrep/commit/6379546b412467378ff00a059935d4428ebba205)), closes [#27](https://github.com/momokun7/xgrep/issues/27)
+* push path filters and max_count down into the scan ([64d6bec](https://github.com/momokun7/xgrep/commit/64d6bec2d26a22cb6cc5b804c2123fc9cdc4504f))
+* search whole buffer and map lines incrementally in matchers ([01faf09](https://github.com/momokun7/xgrep/commit/01faf097550be1b5732d0e73fea271b4cca68b79))
+* search性能回復（中間Vec排除、line_offsets遅延化、チャンキング廃止） ([40c796c](https://github.com/momokun7/xgrep/commit/40c796c157029dfbd1c2c9186b2e9f4e167417dc))
+* search性能回復（中間Vec排除、line_offsets遅延化）、ベンチマーク実測値更新、doc comment英語化 ([1c04251](https://github.com/momokun7/xgrep/commit/1c04251fba8cbacf525cac19df8de2f584cf6f87))
+* **syntax:** fast repo_map on large repos and journaled tags cache ([2d0f491](https://github.com/momokun7/xgrep/commit/2d0f49126dde785b8b19f67e1161a461ab7dfdb8))
+* **trigram:** dedup trigrams with a reusable bitset instead of HashSet ([b924ba1](https://github.com/momokun7/xgrep/commit/b924ba1c557975a217071e2f90e25678067c996d))
+* **trigram:** reuse per-thread scratch for trigram extraction ([4dae4ba](https://github.com/momokun7/xgrep/commit/4dae4ba792c47fdb5362b1502d5f91d2cd01b169))
+* v3差分更新・bincache・sorted insertでCase3を15s→1.6s(warm)に最適化 ([93e7b72](https://github.com/momokun7/xgrep/commit/93e7b722fb9fc2952e1db29b04e9c70036781fd8))
+* コーパスフィンガープリントで変更なし早期リターンを実装 (Step1) ([99e7ce6](https://github.com/momokun7/xgrep/commit/99e7ce6504399b4a69e5d1beb96cf485308e130d))
+* デフォルトで鮮度チェック無効化（--freshでオプトイン）、37ms達成（ripgrep比55x） ([fada96d](https://github.com/momokun7/xgrep/commit/fada96df54eaa5f2f0e205be6fad64d53bbd59ac))
+* 全ボトルネック (BN-1〜BN-10) を一括修正 ([0e2cf4f](https://github.com/momokun7/xgrep/commit/0e2cf4f6dc00f76162da3d723147857dbda94407))
+* 差分更新を sorted insert + binary cache で最適化 (Case3: 9.05s→1.6s) ([8b0d3f6](https://github.com/momokun7/xgrep/commit/8b0d3f67e85f1c04e188cd35a32c01b0adf21d72))
+
 ## [0.7.0](https://github.com/momokun7/xgrep/compare/v0.6.0...v0.7.0) (2026-06-19)
 
 
