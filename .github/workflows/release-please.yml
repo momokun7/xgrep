@@ -20,6 +20,11 @@ jobs:
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Release PRs are opened by the maintainer (see CONTRIBUTING.md):
+          # a PR opened with GITHUB_TOKEN never triggers CI, so it could not
+          # pass the required checks. Merging that PR still creates the
+          # GitHub release and starts release.yml here.
+          skip-github-pull-request: true
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
       - name: Trigger release workflow
