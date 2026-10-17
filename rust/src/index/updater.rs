@@ -6,6 +6,7 @@ use std::collections::HashSet;
 
 use crate::error::Result;
 use crate::git::{bytes_to_path, find_toplevel_fs, git_cmd, split_nul};
+use crate::index::builder::is_xgrep_internal;
 use crate::index::format::FileEntry;
 use crate::index::reader::IndexReader;
 use ignore::WalkBuilder;
@@ -29,7 +30,13 @@ pub enum IndexStatus {
 /// ```text
 /// <commit hash or empty>
 /// verified-ns <start> <end>     # build window (unix nanos); index reflects the tree as of <start>
+/// dir <path>                    # walked directory without indexed files (repeated)
 /// ```
+///
+/// `dir` lines list the directories the build walked that contain no indexed
+/// file anywhere below them (empty directories, directories holding only
+/// binary or oversized files). The probe stats them along with the parents
+/// of indexed files, so a file created in one of them later is found.
 ///
 /// Older versions also wrote `dirty <path>` / `dirty-overflow` lines (git
 /// status at build time); they are ignored now that the freshness probe
@@ -38,6 +45,8 @@ pub enum IndexStatus {
 struct IndexMeta {
     commit_hash: Option<String>,
     verified_at: Option<Window>,
+    /// Walked directories not implied by indexed file paths (index form).
+    dirs: Vec<String>,
 }
 
 impl IndexMeta {
@@ -60,6 +69,8 @@ impl IndexMeta {
                 if let (Some(Some(start)), end) = (it.next(), it.next()) {
                     meta.verified_at = Some((start, end.flatten().unwrap_or(start)));
                 }
+            } else if let Some(d) = line.strip_prefix("dir ") {
+                meta.dirs.push(d.to_string());
             }
         }
         Some(meta)
@@ -69,12 +80,17 @@ impl IndexMeta {
         index_path: &Path,
         commit_hash: Option<&str>,
         verified_at: Option<Window>,
+        dirs: &[String],
     ) -> Result<()> {
         use std::fmt::Write as _;
         let meta_path = Self::path_for(index_path);
         let mut content = commit_hash.unwrap_or("").to_string();
         if let Some((start, end)) = verified_at {
             let _ = write!(content, "\nverified-ns {start} {end}");
+        }
+        for d in dirs {
+            // `extra_dirs` never yields names with line breaks.
+            let _ = write!(content, "\ndir {d}");
         }
         // Write atomically so concurrent readers never see a truncated file.
         let tmp = meta_path.with_extension("meta.tmp");
@@ -396,10 +412,71 @@ pub fn save_meta(
     index_path: &Path,
     build_started: Option<std::time::SystemTime>,
 ) -> Result<()> {
+    // Walked after the build: a directory created or filled meanwhile has an
+    // mtime inside the build window and is re-listed by the next probe.
+    let dirs = extra_dirs(root, index_path);
     let verified = build_started.map(|s| (unix_nanos(s), unix_nanos(std::time::SystemTime::now())));
     // Only spawn git inside a work tree (cheap filesystem check first).
     let hash = find_toplevel_fs(root).and_then(|_| current_commit_hash(root));
-    IndexMeta::save(index_path, hash.as_deref(), verified)
+    IndexMeta::save(index_path, hash.as_deref(), verified, &dirs)
+}
+
+/// Directories the builder walks (same ignore rules) that contain no
+/// indexed file below them, in index form, sorted. These are invisible to
+/// [`indexed_dirs`], so without them the probe would never notice a file
+/// created in, say, an empty `src/new/` or an `assets/` holding only
+/// binaries.
+fn extra_dirs(root: &Path, index_path: &Path) -> Vec<String> {
+    let Ok(reader) = IndexReader::open(index_path) else {
+        return Vec::new();
+    };
+    let known = indexed_dirs(&reader);
+    let found: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|e| {
+            e.file_type().is_some_and(|t| t.is_dir())
+                && !is_xgrep_internal(&e.file_name().to_string_lossy())
+        })
+        .build_parallel()
+        .run(|| {
+            let known = &known;
+            struct Flush<'a>(Vec<String>, &'a std::sync::Mutex<Vec<String>>);
+            impl Drop for Flush<'_> {
+                fn drop(&mut self) {
+                    if let Ok(mut out) = self.1.lock() {
+                        out.append(&mut self.0);
+                    }
+                }
+            }
+            let mut sink = Flush(Vec::new(), &found);
+            Box::new(move |entry| {
+                let Ok(entry) = entry else {
+                    return ignore::WalkState::Continue;
+                };
+                // Paths the index cannot store (non-UTF-8, line breaks) are
+                // skipped, like the builder skips such files.
+                if let Some(rel) = entry
+                    .path()
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .filter(|r| !r.is_empty() && !r.contains(['\n', '\r']))
+                {
+                    let key = index_key(Path::new(rel));
+                    if !known.contains(key.as_str()) {
+                        sink.0.push(key);
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
+    let mut dirs = found.into_inner().unwrap_or_else(|e| e.into_inner());
+    dirs.sort_unstable();
+    dirs
 }
 
 /// Check index freshness and return changed file list (does not rebuild).
@@ -480,10 +557,10 @@ pub(crate) fn compute_overlay(
     reader: &IndexReader,
     deadline: Option<Instant>,
 ) -> Option<Overlay> {
-    let meta = IndexMeta::load(index_path);
-    let meta_outdated = meta.as_ref().is_none_or(|m| m.verified_at.is_none());
-    let window = verified_window(&meta.unwrap_or_default(), index_path);
-    let mut ov = stat_scan(root, reader, window, deadline).ok()?;
+    let meta = IndexMeta::load(index_path).unwrap_or_default();
+    let meta_outdated = meta.verified_at.is_none();
+    let window = verified_window(&meta, index_path);
+    let mut ov = stat_scan(root, reader, &meta.dirs, window, deadline).ok()?;
     ov.meta_outdated = meta_outdated;
     // The index and its sidecars (meta, cache, stamps) may live inside the
     // root (e.g. tests, custom layouts); they are never source files.
@@ -682,7 +759,7 @@ fn walk_subtree(root: &Path, rel: &Path, limit: usize) -> (Vec<PathBuf>, bool) {
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .filter_entry(|e| !is_xgrep_internal_name(&e.file_name().to_string_lossy()))
+        .filter_entry(|e| !is_xgrep_internal(&e.file_name().to_string_lossy()))
         .build();
     let mut out = Vec::new();
     for entry in walker.flatten() {
@@ -722,14 +799,6 @@ pub(crate) fn index_key(rel: &Path) -> String {
         .collect::<PathBuf>()
         .to_string_lossy()
         .into_owned()
-}
-
-pub(crate) fn is_xgrep_internal_name(name: &str) -> bool {
-    name == ".xgrep"
-        || name.ends_with(".xgrep")
-        || name.ends_with(".xgrep.fp")
-        || name.ends_with(".xgrep.lock")
-        || name.starts_with(".xgrep_tmp_")
 }
 
 // --- stat helpers ----------------------------------------------------------
@@ -1008,11 +1077,14 @@ struct ScanLocal<'a> {
     dirs_seen: HashSet<&'a str>,
 }
 
-/// Freshness probe: stat every indexed file and every directory containing
-/// indexed files; re-list directories modified since the build.
+/// Freshness probe: stat every indexed file, every directory containing
+/// indexed files and the `extra_dirs` recorded at build time (walked
+/// directories without indexed files); re-list directories modified since
+/// the build.
 fn stat_scan(
     root: &Path,
     reader: &IndexReader,
+    extra_dirs: &[String],
     window: Window,
     deadline: Option<Instant>,
 ) -> std::result::Result<Overlay, TimedOut> {
@@ -1027,15 +1099,18 @@ fn stat_scan(
         });
     };
     let n = reader.file_count() as usize;
+    let total = n + extra_dirs.len();
     let slow = crate::fsinfo::is_remote_fs(root);
-    let threads = probe_threads(n, slow);
+    let threads = probe_threads(total, slow);
     let chunk = if slow { 4 } else { 256 };
 
     // Hits: `Ok(fid)` = stale indexed file, `Err(dir)` = directory
     // modified since the build. Directories are discovered on the fly from
     // the (sorted) file paths; each thread stats a directory at most once.
+    // Indices past the files are the recorded extra directories (their
+    // ancestors are indexed or extra directories themselves).
     let hits = par_scan(
-        n,
+        total,
         threads,
         chunk,
         deadline,
@@ -1044,6 +1119,14 @@ fn stat_scan(
             dirs_seen: HashSet::new(),
         },
         |i, local, out| {
+            if let Some(d) = i.checked_sub(n).and_then(|j| extra_dirs.get(j)) {
+                if let Some(st) = sr.stat(d, &mut local.buf) {
+                    if st.kind == Kind::Dir && ns_at_or_after(st.mtime_ns, window.0) {
+                        out.push(Err(d.as_str()));
+                    }
+                }
+                return;
+            }
             let fid = i as u32;
             let path = reader.file_path(fid);
             if let Some(entry) = reader.file_entry(fid) {
@@ -1088,6 +1171,7 @@ fn stat_scan(
             .collect();
         let known: HashSet<String> = indexed_dirs(reader)
             .into_iter()
+            .chain(extra_dirs.iter().map(String::as_str))
             .map(str::to_string)
             .collect();
         let (new_files, hit_limit) = walk_new_files(root, known, changed_dirs, &indexed, deadline)?;
@@ -1135,7 +1219,7 @@ fn walk_new_files(
         .git_global(true)
         .git_exclude(true)
         .filter_entry(move |e| {
-            if is_xgrep_internal_name(&e.file_name().to_string_lossy()) {
+            if is_xgrep_internal(&e.file_name().to_string_lossy()) {
                 return false;
             }
             let Ok(rel) = e.path().strip_prefix(&root_owned) else {
@@ -1377,15 +1461,17 @@ mod tests {
         let index_path = dir.path().join("test.xgrep");
         fs::write(&index_path, "dummy").unwrap();
 
-        IndexMeta::save(&index_path, Some("abc123"), None).unwrap();
+        IndexMeta::save(&index_path, Some("abc123"), None, &[]).unwrap();
         let meta = IndexMeta::load(&index_path).unwrap();
         assert_eq!(meta.commit_hash, Some("abc123".to_string()));
         assert_eq!(meta.verified_at, None);
 
-        IndexMeta::save(&index_path, Some("def"), Some((10, 12))).unwrap();
+        let dirs = vec!["assets".to_string(), "src/empty dir".to_string()];
+        IndexMeta::save(&index_path, Some("def"), Some((10, 12)), &dirs).unwrap();
         let meta = IndexMeta::load(&index_path).unwrap();
         assert_eq!(meta.commit_hash, Some("def".to_string()));
         assert_eq!(meta.verified_at, Some((10, 12)));
+        assert_eq!(meta.dirs, dirs);
 
         // Lines written by older versions are ignored.
         fs::write(
@@ -2111,6 +2197,84 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs\0\
         assert_eq!(
             overlay_paths(&ov),
             vec!["keep.rs", "new/x.rs", "new/y.rs", "old", "old/x.rs", "old/y.rs"]
+        );
+    }
+
+    /// Files the builder never indexes (its `is_xgrep_internal` list, e.g.
+    /// sidecars of an index stored inside the tree) are not reported as new
+    /// by the probe or the watcher overlay either.
+    #[test]
+    fn test_overlay_skips_builder_internal_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.rs"), "a").unwrap();
+        backdate(&root.join("sub/a.rs"), 10);
+        let index_path = dir.path().join("index");
+        build_with_meta(&root, &index_path);
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        let internal = [
+            "i.xgrep.cache",
+            "i.xgrep.bincache",
+            "i.xgrep.fp.tmp",
+            ".xgrep_cache_tmp_1",
+        ];
+        for name in internal {
+            assert!(crate::index::builder::is_xgrep_internal(name), "{name}");
+            fs::write(root.join("sub").join(name), "x").unwrap();
+        }
+        fs::write(root.join("sub/new.rs"), "n").unwrap();
+
+        let ov = compute_overlay(&root, &index_path, &reader, None).unwrap();
+        assert_eq!(overlay_paths(&ov), vec!["sub/new.rs"]);
+        let ov = overlay_from_paths(&root, &index_path, &reader, vec![PathBuf::from("sub")]);
+        assert_eq!(overlay_paths(&ov), vec!["sub/a.rs", "sub/new.rs"]);
+    }
+
+    /// New files in directories that held no indexed file at build time
+    /// (empty, or only binaries) are found by the probe.
+    #[test]
+    fn test_stat_probe_finds_files_in_dirs_without_indexed_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(root.join("code")).unwrap();
+        fs::create_dir_all(root.join("empty/deeper")).unwrap();
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::create_dir_all(root.join("ignored")).unwrap();
+        fs::write(root.join(".ignore"), "ignored/\n").unwrap();
+        fs::write(root.join("code/a.rs"), "a").unwrap();
+        fs::write(root.join("assets/logo.bin"), b"\x00\x01\x02binary").unwrap();
+        for f in [".ignore", "code/a.rs", "assets/logo.bin"] {
+            backdate(&root.join(f), 10);
+        }
+        let index_path = dir.path().join("idx").join("index");
+        fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        build_with_meta(&root, &index_path);
+        let reader = IndexReader::open(&index_path).unwrap();
+        let meta = IndexMeta::load(&index_path).unwrap();
+        let mut expected = vec!["assets", "empty", "empty/deeper"]
+            .into_iter()
+            .map(|d| index_key(Path::new(d)))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(meta.dirs, expected);
+
+        // Directory mtimes must predate the build window for the old
+        // probe to miss the new files; wait out the window's second.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let ov = compute_overlay(&root, &index_path, &reader, None).unwrap();
+        assert!(ov.changed.is_empty(), "{:?}", ov.changed);
+
+        fs::write(root.join("empty/deeper/n.rs"), "new").unwrap();
+        fs::write(root.join("assets/readme.txt"), "new").unwrap();
+        fs::write(root.join("ignored/x.rs"), "ignored").unwrap();
+        // (Unindexed binaries in a re-listed directory are rescanned too,
+        // as anywhere else.)
+        let ov = compute_overlay(&root, &index_path, &reader, None).unwrap();
+        assert_eq!(
+            overlay_paths(&ov),
+            vec!["assets/logo.bin", "assets/readme.txt", "empty/deeper/n.rs"]
         );
     }
 }

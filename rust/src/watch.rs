@@ -15,7 +15,9 @@
 //! - **Starting**: until watches are in place *and* an index rebuild that
 //!   started afterwards has finished, searches keep probing.
 //! - **Lost events** (inotify queue overflow, watcher errors, too many
-//!   dirty paths): searches probe until the next rebuild completes.
+//!   dirty paths) and **ignore-file changes** (`.gitignore`/`.ignore`
+//!   edits change which files are indexed without per-file events):
+//!   searches probe until the next rebuild completes.
 //!
 //! Remote filesystems (WSL `/mnt/<drive>` 9p/drvfs, NFS, SMB, FUSE) are not
 //! watched at all: change events there are unreliable (on WSL2 `/mnt/c`,
@@ -50,7 +52,7 @@ use ignore::{Match, WalkBuilder};
 use notify::event::{EventKind, ModifyKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 
-use crate::index::updater::is_xgrep_internal_name;
+use crate::index::builder::is_xgrep_internal;
 
 /// Default reuse window for probe results in polling mode.
 const REMOTE_PROBE_TTL_MS: u64 = 2000;
@@ -80,8 +82,8 @@ pub enum WatchStatus {
     /// and reuse the result for a couple of seconds, so an edit made there
     /// may take that long to show up.
     Polling,
-    /// Change events were lost (overflow or watcher error); searches probe
-    /// until the next index rebuild completes.
+    /// Change events were lost (overflow or watcher error), or ignore rules
+    /// changed; searches probe until the next index rebuild completes.
     Degraded,
     /// The watcher could not be started; searches probe as without it.
     Failed(String),
@@ -120,6 +122,9 @@ pub(crate) struct WatchConfig {
     /// Beyond this many dirty paths, drop the set and probe until the next
     /// rebuild (bounded memory and search cost).
     pub dirty_limit: usize,
+    /// Make watcher setup fail after the fence directory is watched.
+    #[cfg(test)]
+    pub fail_setup: bool,
 }
 
 impl Default for WatchConfig {
@@ -131,6 +136,8 @@ impl Default for WatchConfig {
             min_interval: Duration::from_secs(1),
             retry_after_error: Duration::from_secs(10),
             dirty_limit: 20_000,
+            #[cfg(test)]
+            fail_setup: false,
         }
     }
 }
@@ -160,6 +167,10 @@ struct State {
     synced: bool,
     /// Watches are set up.
     active: bool,
+    /// When all watches were in place. Only a rebuild that started at or
+    /// after this instant can sync the dirty set (earlier edits may have
+    /// been missed by both the rebuild walk and the watcher).
+    active_at: Option<Instant>,
     failed: Option<String>,
     shutdown: bool,
     rebuild_requested: bool,
@@ -186,6 +197,22 @@ struct Shared {
     fence_dir: Option<PathBuf>,
     /// Serializes fences; holds the last token issued.
     fence_lock: Mutex<u64>,
+}
+
+impl State {
+    /// The dirty set is complete (modulo events still in flight).
+    fn trusted(&self) -> bool {
+        self.failed.is_none()
+            && !self.shutdown
+            && self.active
+            && self.synced
+            && self.lost_since.is_none()
+    }
+
+    /// A fence file's event can be expected.
+    fn fence_usable(&self) -> bool {
+        self.fence_ready && self.failed.is_none() && self.active && !self.shutdown
+    }
 }
 
 impl Shared {
@@ -277,7 +304,8 @@ impl WatchHandle {
         let Some(dir) = self.shared.fence_dir.as_ref() else {
             return true;
         };
-        if !self.shared.lock().fence_ready {
+        if !self.shared.lock().fence_usable() {
+            // No fence event will ever arrive (watcher failed or stopped).
             return true;
         }
         let mut issued = self
@@ -309,10 +337,17 @@ impl WatchHandle {
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {
+        // Not worth a fence (a file create plus a wait) if the set could not
+        // be used anyway.
+        if !self.shared.lock().trusted() {
+            return Snapshot {
+                paths: Vec::new(),
+                usable: false,
+            };
+        }
         let fenced = self.fence();
         let st = self.shared.lock();
-        let usable =
-            fenced && st.failed.is_none() && st.active && st.synced && st.lost_since.is_none();
+        let usable = fenced && st.trusted();
         Snapshot {
             paths: if usable {
                 st.dirty.keys().cloned().collect()
@@ -338,6 +373,22 @@ impl WatchHandle {
     pub(crate) fn mark_rebuilt(&self, started: Instant) {
         let mut st = self.shared.lock();
         apply_rebuild(&mut st, started);
+    }
+
+    /// Watches are in place (tests).
+    #[cfg(test)]
+    pub(crate) fn is_active(&self) -> bool {
+        self.shared.lock().active
+    }
+
+    /// Number of fences issued so far (tests).
+    #[cfg(test)]
+    pub(crate) fn fences_issued(&self) -> u64 {
+        *self
+            .shared
+            .fence_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Number of rebuilds the worker completed (tests/diagnostics).
@@ -371,7 +422,7 @@ impl WatchHandle {
             if st.failed.is_some() {
                 return false;
             }
-            if st.active && st.synced && st.lost_since.is_none() {
+            if st.trusted() {
                 return true;
             }
             let now = Instant::now();
@@ -411,7 +462,10 @@ fn apply_rebuild(st: &mut State, started: Instant) {
     if st.lost_since.is_some_and(|l| l < started) {
         st.lost_since = None;
     }
-    if st.active {
+    // A rebuild that began before the watches were in place may have missed
+    // edits made in between, which no event reports either: keep probing
+    // until a later rebuild (the worker runs one right after setup).
+    if st.active_at.is_some_and(|a| started >= a) {
         st.synced = true;
     }
     st.rebuilds += 1;
@@ -421,8 +475,10 @@ fn run_worker(shared: Arc<Shared>, index_dir: Option<PathBuf>, rebuild: RebuildF
     let mut watcher = match setup_watcher(&shared, index_dir) {
         Ok(w) => w,
         Err(e) => {
+            // The watcher (and any fence watch it held) is gone.
             let mut st = shared.lock();
             st.failed = Some(e.to_string());
+            st.fence_ready = false;
             shared.cond.notify_all();
             return;
         }
@@ -430,6 +486,7 @@ fn run_worker(shared: Arc<Shared>, index_dir: Option<PathBuf>, rebuild: RebuildF
     {
         let mut st = shared.lock();
         st.active = true;
+        st.active_at = Some(Instant::now());
         shared.cond.notify_all();
     }
 
@@ -524,7 +581,7 @@ fn watchable_dirs(dir: &Path) -> impl Iterator<Item = PathBuf> {
         .git_exclude(true)
         .filter_entry(|e| {
             e.file_type().is_some_and(|t| t.is_dir())
-                && !is_xgrep_internal_name(&e.file_name().to_string_lossy())
+                && !is_xgrep_internal(&e.file_name().to_string_lossy())
         })
         .build()
         .flatten()
@@ -552,6 +609,10 @@ fn setup_watcher(
             if watcher.watch(fd, RecursiveMode::NonRecursive).is_ok() {
                 shared.lock().fence_ready = true;
             }
+        }
+        #[cfg(test)]
+        if shared.cfg.fail_setup {
+            return Err(notify::Error::generic("injected setup failure"));
         }
         for d in watchable_dirs(&shared.root) {
             watcher.watch(&d, RecursiveMode::NonRecursive)?;
@@ -648,7 +709,7 @@ fn handle_event(
         }
         let hidden_or_internal = rel.iter().any(|c| {
             let c = c.to_string_lossy();
-            c.starts_with('.') || is_xgrep_internal_name(&c)
+            c.starts_with('.') || is_xgrep_internal(&c)
         });
         if hidden_or_internal || index_dir.is_some_and(|d| rel.starts_with(d)) {
             continue;
@@ -695,7 +756,10 @@ fn handle_event(
     }
     st.new_dirs.extend(new_dirs);
     if ignore_changed {
-        // The set of indexed files changes without per-file events.
+        // The set of indexed files changes without per-file events: files
+        // may have become visible or ignored. Probe until a rebuild that
+        // started after this point has folded the new rules in.
+        st.lost_since.get_or_insert(now);
         st.rebuild_requested = true;
         st.rescan_watches = true;
     }
@@ -1119,6 +1183,90 @@ mod tests {
         fs::write(root.join("c.rs"), "fn c_sym() {}\n").unwrap();
         assert_eq!(hits(&xg, "c_sym"), vec!["c.rs"]);
         assert_eq!(source(&xg), "probe");
+    }
+
+    /// A watcher whose setup failed after its fence directory was watched
+    /// must not fence (create a file and wait for an event that never
+    /// comes) on every search.
+    #[test]
+    fn test_failed_setup_skips_fence() {
+        let (dir, xg) = setup(&[("a.rs", "fn a_sym() {}\n")]);
+        let root = dir.path();
+        xg.start_watching_with(WatchConfig {
+            fail_setup: true,
+            ..no_rebuild_cfg()
+        })
+        .unwrap();
+        assert!(poll(|| matches!(xg.watch_status(), WatchStatus::Failed(_))));
+        assert!(!xg.wait_for_watcher(Duration::from_millis(10)));
+
+        fs::write(root.join("b.rs"), "fn b_sym() {}\n").unwrap();
+        let started = Instant::now();
+        for _ in 0..4 {
+            assert_eq!(hits(&xg, "b_sym"), vec!["b.rs"]);
+            assert_eq!(source(&xg), "probe");
+        }
+        assert_eq!(xg.watcher_guard().as_ref().unwrap().fences_issued(), 0);
+        // Four fence timeouts would take a second.
+        assert!(
+            started.elapsed() < FENCE_TIMEOUT * 4,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Editing an ignore file changes which files are indexed without
+    /// per-file events; searches must probe until a rebuild has applied
+    /// the new rules.
+    #[test]
+    fn test_ignore_file_change_probes_until_rebuild() {
+        let (dir, xg) = setup(&[
+            (".ignore", "gen/\n"),
+            ("src/lib.rs", "fn lib() {}\n"),
+            ("gen/out.rs", "fn unignored_sym() {}\n"),
+        ]);
+        let root = dir.path();
+        xg.start_watching_with(no_rebuild_cfg()).unwrap();
+        assert!(xg.wait_for_watcher(TIMEOUT));
+        assert!(hits(&xg, "unignored_sym").is_empty());
+        assert_eq!(source(&xg), "watcher");
+
+        // Replace (not edit in place) so the root directory's mtime moves
+        // and the probe re-lists it.
+        fs::write(root.join("ignore.tmp"), "").unwrap();
+        fs::rename(root.join("ignore.tmp"), root.join(".ignore")).unwrap();
+        assert!(poll(|| xg.watch_status() == WatchStatus::Degraded));
+        assert_eq!(hits(&xg, "unignored_sym"), vec!["gen/out.rs"]);
+        assert_eq!(source(&xg), "probe");
+
+        // The rebuild (requested by the change; run explicitly here) folds
+        // the new rules in and the watcher takes over again.
+        xg.build_index().unwrap();
+        assert!(xg.wait_for_watcher(TIMEOUT));
+        assert_eq!(hits(&xg, "unignored_sym"), vec!["gen/out.rs"]);
+        assert_eq!(source(&xg), "watcher");
+    }
+
+    /// A build that started before the watches were in place cannot vouch
+    /// for edits made in between: the watcher stays unsynced until a
+    /// rebuild that started afterwards.
+    #[test]
+    fn test_build_started_before_watch_does_not_sync() {
+        let (_dir, xg) = setup(&[("a.rs", "fn a() {}\n")]);
+        let before = Instant::now();
+        // Hold the build mutex so the worker's initial sync blocks.
+        let serial = xg.build_mutex.lock().unwrap();
+        xg.start_watching_with(no_rebuild_cfg()).unwrap();
+        assert!(poll(|| xg.watcher_guard().as_ref().unwrap().is_active()));
+
+        xg.watcher_guard().as_ref().unwrap().mark_rebuilt(before);
+        assert_eq!(xg.watch_status(), WatchStatus::Starting);
+        assert!(!xg.watcher_guard().as_ref().unwrap().snapshot().usable);
+
+        // The worker's own rebuild (started after setup) syncs it.
+        drop(serial);
+        assert!(xg.wait_for_watcher(TIMEOUT));
+        assert_eq!(xg.watch_status(), WatchStatus::Active);
     }
 
     #[test]
