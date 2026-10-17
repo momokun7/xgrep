@@ -64,8 +64,12 @@ pub fn tool_result(text: &str, is_error: bool) -> Value {
 
 /// Instructions sent to the client on `initialize`.
 pub const INSTRUCTIONS: &str = "xgrep is an indexed code search engine. Pick the tool by intent: \
-find_definitions = where a symbol is declared; search = where text occurs (usages, strings; \
-word:true for identifiers; output_mode:'locations' or 'files' to survey cheaply; queries:[...] \
+repo_map = ranked overview of the important symbols (start here in an unfamiliar repo); \
+outline = a file's symbols and line ranges without bodies; \
+find_definitions = where a symbol is declared; find_references = call sites with their callers; \
+search = where text occurs (usages, strings; \
+word:true for identifiers; expand:'block' for whole enclosing functions; \
+output_mode:'locations' or 'files' to survey cheaply; queries:[...] \
 for several searches in one call); find_files = files by name/glob; read_file = a line window \
 of one file. Results are ranked (definitions and source first) and paginated: the header gives \
 the exact total and next_offset. Ranges already returned in this session are collapsed to \
