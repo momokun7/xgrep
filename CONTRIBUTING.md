@@ -20,6 +20,8 @@ cargo test
 
 `./scripts/check.sh` runs all of these, with and without default features, the same way CI does. Run it before opening a pull request (`--quick` skips the no-default-features pass).
 
+**READMEs**: crates.io and PyPI use the root `README.md`. The API section of `npm/README.md` is generated from `npm/index.d.ts`, which `napi build` writes from the doc comments in `npm/src/lib.rs`: after changing the npm API, run `npx napi build --platform` in `npm/` and then `python scripts/npm_readme.py`. CI fails if either file is out of date.
+
 ## Pull Requests
 
 1. Fork the repository

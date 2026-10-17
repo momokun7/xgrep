@@ -196,6 +196,12 @@ jobs:
       - name: Build native module
         working-directory: npm
         run: npx napi build --platform
+      # napi build rewrites index.d.ts from the doc comments in src/lib.rs, and
+      # the README's API section is generated from index.d.ts.
+      - name: Check index.d.ts and the README API section are up to date
+        run: |
+          git diff --exit-code -- npm/index.d.ts
+          python3 scripts/npm_readme.py --check
       - name: Test
         working-directory: npm
         run: node __test__/index.mjs
