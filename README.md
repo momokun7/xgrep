@@ -213,7 +213,7 @@ show a different picture depending on pattern type:
 |-------|------|-----------|------------------------------|
 | `CONFIG_PREEMPT_RT` | ~300 | xg wins big | xg wins big (cache fits in L3) |
 | `EXPORT_SYMBOL_GPL` | ~21k | xg wins | xg faster, but gap narrows |
-| `raw_spin_lock_irqsave` | ~1.2k | xg wins | xg ≈ ripgrep (互角) |
+| `raw_spin_lock_irqsave` | ~1.2k | xg wins | xg ≈ ripgrep (even) |
 | `devm_kzalloc` | ~7.4k | xg wins | **xg slower than ripgrep** |
 
 The pattern: when trigram intersection leaves many candidate files (widely-used symbols),
