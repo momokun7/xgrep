@@ -139,22 +139,23 @@ fn current_commit_hash(root: &Path) -> Option<String> {
 
 /// Get the newest file mtime in the directory (UNIX epoch seconds).
 ///
-/// The index file and its sidecars (`.meta`, `.cache`) are excluded so that
-/// writing the index itself never makes the source tree look "newer than the
-/// index". These sidecars are derived with `with_extension`, so they replace
-/// the index extension (`index.xgrep` -> `index.meta`), not append to it.
+/// The index file and its sidecars are excluded so that writing them never
+/// makes the source tree look "newer than the index"; some sidecars (the
+/// fingerprint, the binary cache) are written after the index, possibly in
+/// the next second. Sidecars either replace the index extension
+/// (`index.xgrep` -> `index.meta`) or append to the index name
+/// (`index.xgrep.fp`).
 fn newest_file_mtime(root: &Path, index_path: &Path) -> Option<u64> {
-    let sidecars = [
-        index_path.to_path_buf(),
-        index_path.with_extension("meta"),
-        index_path.with_extension("cache"),
-    ];
+    let index_base = index_path.with_extension("");
+    let index_name = index_path.as_os_str().to_string_lossy();
+    let is_sidecar = |p: &Path| {
+        p.with_extension("") == index_base
+            || p.as_os_str().to_string_lossy().starts_with(&*index_name)
+    };
     let mut newest = 0u64;
     for entry in WalkBuilder::new(root).build().flatten() {
         if entry.file_type().is_some_and(|ft| ft.is_file()) {
-            // Skip the index and its sidecars so they don't affect freshness
-            // detection for the source tree.
-            if sidecars.iter().any(|s| s == entry.path()) {
+            if is_sidecar(entry.path()) {
                 continue;
             }
             if let Ok(meta) = entry.metadata() {
@@ -1811,6 +1812,35 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs\0\
             }
             other => panic!("expected Stale, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_newest_file_mtime_ignores_index_sidecars() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let now = std::time::SystemTime::now();
+        let set = |name: &str, t: std::time::SystemTime| {
+            let f = fs::File::create(root.join(name)).unwrap();
+            f.set_modified(t).unwrap();
+        };
+        let past = now - std::time::Duration::from_secs(100);
+        let later = now + std::time::Duration::from_secs(100);
+        set("a.txt", past);
+        let index_path = root.join("test.xgrep");
+        // Sidecars written after the index, possibly in a later second.
+        for name in [
+            "test.xgrep",
+            "test.meta",
+            "test.xgrep.fp",
+            "test.xgrep.bincache",
+        ] {
+            set(name, later);
+        }
+        let past_secs = past
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(newest_file_mtime(root, &index_path), Some(past_secs));
     }
 
     #[test]
