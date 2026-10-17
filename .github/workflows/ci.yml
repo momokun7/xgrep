@@ -221,7 +221,12 @@ jobs:
             rust
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.11"
+          # 3.11 (last) builds the wheel; the others check the abi3 wheel
+          # works on the oldest and newest supported interpreters.
+          python-version: |
+            3.8
+            3.13
+            3.11
       - name: Format
         working-directory: python
         run: cargo fmt -- --check
@@ -252,6 +257,13 @@ jobs:
           xg --version
           xg -c "fn run_cli" rust/src
           python -c "import xg; print(xg.Xgrep, xg.SearchResult, xg.IndexStatus)"
+      - name: Install the abi3 wheel on other Python versions
+        run: |
+          for v in 3.8 3.13; do
+            "python$v" -m venv "$RUNNER_TEMP/venv-$v"
+            "$RUNNER_TEMP/venv-$v/bin/python" -m pip install python/target/wheels/*.whl
+            "$RUNNER_TEMP/venv-$v/bin/python" -c "import xg; assert xg.Xgrep.open('rust/src').search('fn run_cli')"
+          done
 
   python-wheel:
     name: Python wheel (${{ matrix.os }})
