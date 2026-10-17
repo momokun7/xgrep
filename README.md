@@ -190,12 +190,12 @@ your own hardware; the script runs both focused and distributed queries for a co
 
 ## Limitations
 
-- **Short queries (< 3 chars)** bypass the index — no speed advantage over ripgrep
+- **Single-character queries** bypass the index (full scan) — no speed advantage over ripgrep; 2-character literals use a coarser trigram-prefix lookup
 - **Tiny files (< 3 bytes)** hold no trigrams and are invisible to indexed content search — a deliberate trade-off of the trigram index
 - **Index staleness** — background rebuild runs every ~30s. Use `--fresh` for up-to-date results
 - **find_definitions** uses regex heuristics, not AST analysis — false positives expected
 
-When to use ripgrep instead: one-off searches, very small codebases (< 100 files), or queries shorter than 3 characters.
+When to use ripgrep instead: one-off searches, very small codebases (< 100 files), or single-character queries.
 
 ## How It Works
 

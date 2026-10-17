@@ -10,7 +10,6 @@ use crate::candidates::{intersect_postings, resolve_literal_candidates, resolve_
 use crate::error::{Result, XgrepError};
 use crate::globfilter::GlobFilter;
 use crate::index::reader::IndexReader;
-use crate::trigram;
 use memchr::memmem;
 use regex::bytes::RegexBuilder;
 use std::borrow::Cow;
@@ -491,11 +490,10 @@ fn pattern_candidates(
         return resolve_regex_candidates(reader, &spec.pattern, case_insensitive, quiet);
     }
     let pattern = spec.pattern.as_str();
-    if pattern.len() < 3 && !pattern.is_empty() && !quiet {
-        eprintln!(
-            "xgrep: warning: pattern '{}' is shorter than 3 characters, index not used (full scan)",
-            pattern
-        );
+    if let Some(w) = short_literal_warning(pattern) {
+        if !quiet {
+            eprintln!("{}", w);
+        }
     }
     // ASCII-only, matching the content folding in CaseInsensitiveMatcher.
     let search_pattern = if case_insensitive {
@@ -503,14 +501,18 @@ fn pattern_candidates(
     } else {
         pattern.to_string()
     };
-    let trigrams = trigram::extract_trigrams(search_pattern.as_bytes());
-    resolve_literal_candidates(
-        reader,
-        pattern,
-        &search_pattern,
-        &trigrams,
-        case_insensitive,
-    )
+    resolve_literal_candidates(reader, &search_pattern)
+}
+
+/// Warning for literals the index cannot narrow: only 1-byte patterns scan
+/// every file (2-byte literals use the trigram prefix range).
+fn short_literal_warning(pattern: &str) -> Option<String> {
+    (pattern.len() == 1).then(|| {
+        format!(
+            "xgrep: warning: pattern '{}' is a single character, index not used (full scan)",
+            pattern
+        )
+    })
 }
 
 /// Matches single lines (e.g. diff lines or commit message lines) with the
@@ -1105,6 +1107,18 @@ mod tests {
     use super::*;
     use crate::index::builder;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_short_literal_warning_only_for_single_byte() {
+        assert!(short_literal_warning("x")
+            .unwrap()
+            .contains("index not used (full scan)"));
+        // 2-byte literals use the trigram prefix range: no full-scan claim.
+        assert_eq!(short_literal_warning("fn"), None);
+        assert_eq!(short_literal_warning("あ"), None); // 3 bytes
+        assert_eq!(short_literal_warning(""), None);
+        assert_eq!(short_literal_warning("abc"), None);
+    }
 
     #[test]
     fn test_search_finds_match() {
