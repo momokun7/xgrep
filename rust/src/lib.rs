@@ -497,7 +497,18 @@ impl Xgrep {
             } else {
                 regex::escape(pattern)
             };
-            (format!(r"\b(?:{})\b", inner).into(), true)
+            // ripgrep semantics: the match must be preceded by start-of-line
+            // or a non-word character, and followed by end-of-line or a
+            // non-word character. Plain `\b...\b` fails for patterns whose
+            // edges are non-word characters (`-w 'foo('` would never match
+            // `call foo( x)`). The regex crate has no lookaround, so the
+            // neighbouring character is consumed instead; results are
+            // line-based, so this does not change which lines match.
+            // `\n` is excluded so a match never starts on the previous line.
+            (
+                format!(r"(?:(?m:^)|[^\w\n])(?:{})(?:(?m:$)|[^\w\n])", inner).into(),
+                true,
+            )
         } else {
             (pattern.into(), opts.regex)
         }
@@ -1631,6 +1642,56 @@ mod tests {
             .iter()
             .map(|r| (r.file.to_string(), r.line_number))
             .collect()
+    }
+
+    /// Regression (P2): `-w 'foo('` must match `call foo( x)` like ripgrep.
+    #[test]
+    fn test_word_boundary_non_word_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("a.txt"),
+            "call foo( x)\nfoo(\nxfoo( y\nfoo(x\n(bar) end\nx(bar)y\n",
+        )
+        .unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+        let opts = SearchOptions::new().with_word(true);
+
+        let r = xg.search("foo(", &opts).unwrap();
+        assert_eq!(
+            lines_of(&r),
+            vec![("a.txt".into(), 1), ("a.txt".into(), 2)],
+            "{r:?}"
+        );
+
+        let r = xg.search("(bar)", &opts).unwrap();
+        assert_eq!(lines_of(&r), vec![("a.txt".into(), 5)], "{r:?}");
+    }
+
+    /// The consumed boundary character must never attribute a match to the
+    /// previous line, and regex patterns must work too.
+    #[test]
+    fn test_word_boundary_line_attribution_and_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "abc\nfoo bar\nfoobar\n").unwrap();
+        let xg = Xgrep::open_local(root).unwrap();
+        xg.build_index().unwrap();
+
+        let r = xg
+            .search("foo", &SearchOptions::new().with_word(true))
+            .unwrap();
+        assert_eq!(lines_of(&r), vec![("a.txt".into(), 2)], "{r:?}");
+        assert_eq!(r[0].line, "foo bar");
+
+        let r = xg
+            .search(
+                "fo+|bar",
+                &SearchOptions::new().with_word(true).with_regex(true),
+            )
+            .unwrap();
+        assert_eq!(lines_of(&r), vec![("a.txt".into(), 2)], "{r:?}");
     }
 
     /// Regression (1-7): the default (non-fresh) search must not silently
