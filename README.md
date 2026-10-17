@@ -1,10 +1,9 @@
 # xgrep
 
-[![CI](https://github.com/momokun7/xgrep/actions/workflows/ci.yml/badge.svg)](https://github.com/momokun7/xgrep/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/xgrep-search.svg)](https://crates.io/crates/xgrep-search)
-[![npm](https://img.shields.io/npm/v/xgrep.svg)](https://www.npmjs.com/package/xgrep)
-[![PyPI](https://img.shields.io/pypi/v/xgrep-search.svg)](https://pypi.org/project/xgrep-search/)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![crates.io](https://img.shields.io/crates/v/xgrep-search?style=flat-square&label=crates.io)](https://crates.io/crates/xgrep-search)
+[![npm](https://img.shields.io/npm/v/xgrep?style=flat-square&label=npm)](https://www.npmjs.com/package/xgrep)
+[![PyPI](https://img.shields.io/pypi/v/xgrep-search?style=flat-square&label=PyPI)](https://pypi.org/project/xgrep-search/)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square)](#license)
 
 Ultra-fast indexed code search engine with MCP server for AI coding tools.
 
