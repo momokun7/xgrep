@@ -92,10 +92,27 @@ impl Server {
     }
 }
 
+/// True unless file watching is disabled with `XGREP_NO_WATCH=1`.
+fn watch_enabled() -> bool {
+    !std::env::var_os("XGREP_NO_WATCH").is_some_and(|v| v == "1" || v == "true")
+}
+
 /// Start the MCP server (stdio transport).
+///
+/// The server is long-lived, so it watches the root for file changes:
+/// searches then use the tracked change set instead of probing the
+/// filesystem on every call, and the index is rebuilt in the background
+/// after edits settle. If the watcher cannot start, searches probe as
+/// before. The watcher (and its threads) stop when stdin closes.
 pub fn start(xg: Xgrep) {
+    if watch_enabled() {
+        // Failure only means falling back to per-search probing.
+        let _ = xg.start_watching();
+    }
     let server = Server::new(xg);
     run_server(|msg| server.handle(msg));
+    // Dropping the server stops the watcher and joins its worker thread.
+    drop(server);
 }
 
 /// Dispatch a message with a fresh, throwaway session (used by tests).

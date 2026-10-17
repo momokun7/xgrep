@@ -34,6 +34,7 @@ mimalloc = { version = "0.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 glob = "0.3"
+notify = "8"
 
 [features]
 default = []

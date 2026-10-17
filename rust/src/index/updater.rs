@@ -616,6 +616,88 @@ pub(crate) fn compute_overlay_cached(
     Some((ov, false))
 }
 
+/// Overlay for an explicit set of root-relative paths reported by a file
+/// watcher (see [`crate::watch`]).
+///
+/// - existing regular file: rescanned directly;
+/// - existing directory (created or renamed in): walked with the builder's
+///   ignore rules, every file in it rescanned, and indexed files under it
+///   excluded from the index scan;
+/// - missing path (deleted file or directory): it and every indexed file
+///   under it are excluded from the index scan.
+pub(crate) fn overlay_from_paths(
+    root: &Path,
+    index_path: &Path,
+    reader: &IndexReader,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Overlay {
+    let mut changed = Vec::new();
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for rel in paths {
+        match fs::symlink_metadata(root.join(&rel)) {
+            Ok(md) if md.is_file() => changed.push(rel),
+            Ok(md) if md.is_dir() => {
+                let (files, hit_limit) = walk_subtree(root, &rel, NEW_FILE_WALK_LIMIT);
+                truncated |= hit_limit;
+                changed.extend(files);
+                prefixes.push(index_key(&rel));
+            }
+            _ => {
+                prefixes.push(index_key(&rel));
+                changed.push(rel);
+            }
+        }
+    }
+    if !prefixes.is_empty() {
+        let sep = std::path::MAIN_SEPARATOR;
+        for fid in 0..reader.file_count() {
+            let p = reader.file_path(fid);
+            let under = prefixes.iter().any(|pre| {
+                p.strip_prefix(pre.as_str())
+                    .is_some_and(|rest| rest.starts_with(sep) || rest.starts_with('/'))
+            });
+            if under {
+                changed.push(PathBuf::from(p));
+            }
+        }
+    }
+    changed.retain(|rel| !is_index_sidecar(root, index_path, rel));
+    changed.sort();
+    changed.dedup();
+    Overlay {
+        changed,
+        truncated,
+        meta_outdated: false,
+    }
+}
+
+/// All files under `root/rel` that the builder would index (ignore rules
+/// of `rel` and its parents apply). Returns root-relative paths and whether
+/// `limit` was hit.
+fn walk_subtree(root: &Path, rel: &Path, limit: usize) -> (Vec<PathBuf>, bool) {
+    let walker = WalkBuilder::new(root.join(rel))
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|e| !is_xgrep_internal_name(&e.file_name().to_string_lossy()))
+        .build();
+    let mut out = Vec::new();
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if let Ok(r) = entry.path().strip_prefix(root) {
+            out.push(r.to_path_buf());
+            if out.len() >= limit {
+                return (out, true);
+            }
+        }
+    }
+    (out, false)
+}
+
 /// True if `root/rel` is the index file or one of its sidecars
 /// (`<stem>.meta`, `<stem>.cache`, `<stem>.rebuild`, ...).
 pub(crate) fn is_index_sidecar(root: &Path, index_path: &Path, rel: &Path) -> bool {
@@ -1997,5 +2079,37 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs\0\
             compute_overlay_cached(&root, &index_path, &reader, None, Duration::ZERO).unwrap();
         assert!(!cached);
         assert!(!probe_cache_path(&index_path).exists());
+    }
+
+    #[test]
+    fn test_overlay_from_paths_expands_directories() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(root.join("old")).unwrap();
+        fs::write(root.join("old/x.rs"), "x").unwrap();
+        fs::write(root.join("old/y.rs"), "y").unwrap();
+        fs::write(root.join("keep.rs"), "k").unwrap();
+        let index_path = dir.path().join("index");
+        build_with_meta(&root, &index_path);
+        let reader = IndexReader::open(&index_path).unwrap();
+
+        // `old` renamed to `new` (with a hidden file inside), plus an edit.
+        fs::rename(root.join("old"), root.join("new")).unwrap();
+        fs::write(root.join("new/.secret.rs"), "s").unwrap();
+        fs::write(root.join("keep.rs"), "k2").unwrap();
+        let ov = overlay_from_paths(
+            &root,
+            &index_path,
+            &reader,
+            vec![
+                PathBuf::from("old"),
+                PathBuf::from("new"),
+                PathBuf::from("keep.rs"),
+            ],
+        );
+        assert_eq!(
+            overlay_paths(&ov),
+            vec!["keep.rs", "new/x.rs", "new/y.rs", "old", "old/x.rs", "old/y.rs"]
+        );
     }
 }
