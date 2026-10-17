@@ -3,7 +3,7 @@ use libfuzzer_sys::fuzz_target;
 use std::io::Write;
 
 fuzz_target!(|data: &[u8]| {
-    // 任意バイト列をインデックスファイルとして開く: パニックしないことを検証
+    // Open arbitrary bytes as an index file: must not panic.
     let dir = tempfile::tempdir().unwrap();
     let index_path = dir.path().join("index.xgrep");
     {
@@ -11,6 +11,6 @@ fuzz_target!(|data: &[u8]| {
         f.write_all(data).unwrap();
     }
 
-    // 不正データに対してはErrを返し、パニックしないこと
+    // Invalid data returns Err instead of panicking.
     let _ = xgrep_search::fuzz_exports::IndexReader::open(&index_path);
 });

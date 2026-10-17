@@ -19,7 +19,7 @@ def test_build_and_search(tmp_path):
     engine = xg.Xgrep.open(str(tmp_path))
     engine.build_index()
     results = engine.search("greet")
-    assert len(results) == 1  # "greet" は def greet(): の1行のみ
+    assert len(results) == 1  # "greet" matches only the `def greet():` line
     assert isinstance(results[0], xg.SearchResult)
     assert results[0].file.endswith("hello.py")
     assert results[0].line_number >= 1
