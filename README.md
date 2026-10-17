@@ -52,6 +52,8 @@ pip install xgrep-search
 
 Prebuilt binaries are also available on the [Releases](https://github.com/momokun7/xgrep/releases) page.
 
+The `cargo` build and the release binaries include tree-sitter grammars for the syntax-aware features (`--outline`, `--expand block`, `outline`/`find_references`/`repo_map` over MCP), which need a C compiler to build and add ~12MB to the binary. To leave them out, use `cargo install xgrep-search --no-default-features`; the npm and pip packages are built this way.
+
 ## Quick Start
 
 ```bash
