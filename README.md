@@ -84,6 +84,9 @@ xg "pattern" -A 2 -B 1        # 2 lines after, 1 line before
 xg "pattern" -g "*.rs"        # Include only paths matching glob (repeatable)
 xg "pattern" -g "!*_test.rs"  # Exclude paths matching glob (! prefix)
 xg "pattern" --format llm     # Markdown output for LLMs
+xg "pattern" --format llm --max-tokens 4000  # Cap LLM output (approx. tokens)
+xg "pattern" -M 200           # Cut lines longer than 200 chars (--max-columns)
+xg "pattern" --json           # JSON Lines: one object per match + summary
 xg "pattern" --changed        # Only git changed files
 xg "pattern" --exclude vendor  # Exclude paths containing "vendor"
 xg "pattern" --absolute-paths # Show absolute paths
