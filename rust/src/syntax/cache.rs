@@ -3,6 +3,12 @@
 //! mtime + size, filled lazily (only the files a tool asks about) and parsed
 //! in parallel. The main index format is not involved.
 //!
+//! Like the index builder, entries are "racily clean"-aware: an entry whose
+//! file mtime falls in the same second as (or after) the moment its content
+//! was read is not trusted on stat data alone, because a same-size edit
+//! within one timestamp tick (coarse filesystems such as WSL drvfs) leaves
+//! mtime + size unchanged. Such entries are re-verified by content hash.
+//!
 //! New entries are appended to a journal (`<index>.tags.log`) so a call that
 //! parses a handful of files does not rewrite a large cache; the journal is
 //! folded into the main file (atomic temp file + rename) once it grows past a
@@ -21,13 +27,32 @@ use super::{lang_for_path, tags_for_source, FileTags, Kind, Symbol, MAX_PARSE_BY
 
 const MAGIC: &[u8; 8] = b"XGTAGS\0\0";
 /// Bump when the extraction logic or the encoding changes.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 #[derive(Clone)]
 struct Entry {
     mtime_ns: u64,
     size: u64,
+    /// xxh64 of the file content the tags were computed from.
+    hash: u64,
+    /// When the content was read (ns since the epoch), for the racy check.
+    verified_ns: u64,
     tags: Arc<FileTags>,
+}
+
+impl Entry {
+    /// Stat data alone cannot prove the file unchanged since it was read
+    /// (same rule as [`crate::index::cache::FileStat::is_racy`]).
+    fn is_racy(&self) -> bool {
+        self.mtime_ns / 1_000_000_000 >= self.verified_ns / 1_000_000_000
+    }
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -117,7 +142,8 @@ impl TagStore {
             })
             .collect();
         let mut out: Vec<Option<Arc<FileTags>>> = vec![None; files.len()];
-        let mut misses: Vec<usize> = Vec::new();
+        // (index, racy entry with matching stat to verify by content hash)
+        let mut misses: Vec<(usize, Option<(u64, Arc<FileTags>)>)> = Vec::new();
         let mut stats = Stats::default();
         {
             let st = self.lock();
@@ -128,40 +154,62 @@ impl TagStore {
                 }
                 match st.map.get(files[i]) {
                     Some(e) if e.mtime_ns == mtime && e.size == size => {
-                        out[i] = Some(e.tags.clone());
-                        stats.hits += 1;
+                        if e.is_racy() {
+                            misses.push((i, Some((e.hash, e.tags.clone()))));
+                        } else {
+                            out[i] = Some(e.tags.clone());
+                            stats.hits += 1;
+                        }
                     }
-                    _ => misses.push(i),
+                    _ => misses.push((i, None)),
                 }
             }
         }
         if misses.is_empty() {
             return (out, stats);
         }
-        let parsed: Vec<(usize, Option<Entry>)> = misses
-            .par_iter()
-            .map(|&i| {
+        // (index, entry, parsed?)
+        let fresh: Vec<(usize, Option<Entry>, bool)> = misses
+            .into_par_iter()
+            .map(|(i, prev)| {
                 let (mtime, size) = stats_now[i].unwrap_or((0, 0));
+                let mut parsed = false;
                 let entry = (|| {
                     let lang = lang_for_path(files[i])?;
+                    // Taken before reading: an edit after this instant in
+                    // the same second keeps the entry racy.
+                    let verified_ns = now_ns();
                     let bytes = std::fs::read(root.join(files[i])).ok()?;
                     if memchr::memchr(0, &bytes).is_some() {
                         return None;
                     }
-                    let src = String::from_utf8_lossy(&bytes);
-                    let tags = tags_for_source(lang, &src)?;
+                    let hash = xxhash_rust::xxh64::xxh64(&bytes, 0);
+                    let tags = match prev {
+                        Some((h, tags)) if h == hash => tags,
+                        _ => {
+                            parsed = true;
+                            let src = String::from_utf8_lossy(&bytes);
+                            Arc::new(tags_for_source(lang, &src)?)
+                        }
+                    };
                     Some(Entry {
                         mtime_ns: mtime,
                         size,
-                        tags: Arc::new(tags),
+                        hash,
+                        verified_ns,
+                        tags,
                     })
                 })();
-                (i, entry)
+                (i, entry, parsed)
             })
             .collect();
-        stats.parsed = parsed.len();
         let mut st = self.lock();
-        for (i, e) in parsed {
+        for (i, e, parsed) in fresh {
+            if parsed {
+                stats.parsed += 1;
+            } else if e.is_some() {
+                stats.hits += 1;
+            }
             if let Some(e) = e {
                 out[i] = Some(e.tags.clone());
                 st.map.insert(files[i].to_string(), e);
@@ -264,6 +312,8 @@ fn encode<'a>(entries: impl Iterator<Item = (&'a String, &'a Entry)>) -> Vec<u8>
         put_str(&mut b, k);
         put_u64(&mut b, e.mtime_ns);
         put_u64(&mut b, e.size);
+        put_u64(&mut b, e.hash);
+        put_u64(&mut b, e.verified_ns);
         let t = &e.tags;
         put_u32(&mut b, t.lines);
         put_u32(&mut b, t.defs.len() as u32);
@@ -323,6 +373,8 @@ fn decode_chunk(c: &mut Cur, map: &mut HashMap<String, Entry>) -> Option<usize> 
         let path = c.str()?;
         let mtime_ns = c.u64()?;
         let size = c.u64()?;
+        let hash = c.u64()?;
+        let verified_ns = c.u64()?;
         let lines = c.u32()?;
         let nd = c.u32()? as usize;
         let mut defs = Vec::with_capacity(nd.min(1 << 16));
@@ -359,6 +411,8 @@ fn decode_chunk(c: &mut Cur, map: &mut HashMap<String, Entry>) -> Option<usize> 
             Entry {
                 mtime_ns,
                 size,
+                hash,
+                verified_ns,
                 tags: Arc::new(FileTags { defs, refs, lines }),
             },
         ));
@@ -468,12 +522,81 @@ mod tests {
             .append(true)
             .open(journal_path(&file))
             .unwrap();
-        j.write_all(b"XGTAGS\0\0\x03\0\0\0\x05").unwrap();
+        j.write_all(b"XGTAGS\0\0\x04\0\0\0\x05").unwrap();
         let third = TagStore {
             file,
             state: Mutex::new(State::default()),
         };
         assert_eq!(third.tags(root, &["new.md"]).1.hits, 1);
+    }
+
+    #[test]
+    fn racy_same_size_edit_is_not_served_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let f = root.join("a.md");
+        std::fs::write(&f, "# Alpha\n").unwrap();
+        let mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let file = sidecar_path(&root.join("index"));
+        let store = TagStore {
+            file: file.clone(),
+            state: Mutex::new(State::default()),
+        };
+        let (t, s) = store.tags(root, &["a.md"]);
+        assert_eq!(s.parsed, 1);
+        assert_eq!(t[0].as_ref().unwrap().defs[0].name, "Alpha");
+        store.save().unwrap();
+        // Same-size edit within the same timestamp tick: mtime + size equal.
+        std::fs::write(&f, "# Omega\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let (t, _) = store.tags(root, &["a.md"]);
+        assert_eq!(t[0].as_ref().unwrap().defs[0].name, "Omega");
+        // Also when the entry comes back from disk in a new process.
+        std::fs::write(&f, "# Gamma\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let again = TagStore {
+            file,
+            state: Mutex::new(State::default()),
+        };
+        let (t, _) = again.tags(root, &["a.md"]);
+        assert_eq!(t[0].as_ref().unwrap().defs[0].name, "Gamma");
+    }
+
+    #[test]
+    fn old_files_are_trusted_on_stat_and_racy_ones_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let f = root.join("a.md");
+        std::fs::write(&f, "# Alpha\n").unwrap();
+        let store = TagStore {
+            file: sidecar_path(&root.join("index")),
+            state: Mutex::new(State::default()),
+        };
+        // Racy (just written) but unchanged: verified by hash, not re-parsed.
+        assert_eq!(store.tags(root, &["a.md"]).1.parsed, 1);
+        let s = store.tags(root, &["a.md"]).1;
+        assert_eq!((s.hits, s.parsed), (1, 0));
+        // An old mtime is trusted on stat data alone.
+        let old = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(store.tags(root, &["a.md"]).1.parsed, 1);
+        let st = store.lock();
+        assert!(!st.map["a.md"].is_racy());
     }
 
     #[test]
