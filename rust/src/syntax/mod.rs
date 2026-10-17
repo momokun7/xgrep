@@ -428,6 +428,12 @@ pub fn clean_sig(s: &str, max_chars: usize) -> String {
             prev_space = false;
         }
     }
+    // Tidy multi-line parameter lists: `( a, b, )` -> `(a, b)`.
+    let out = out
+        .replace("( ", "(")
+        .replace(", )", ")")
+        .replace(",)", ")")
+        .replace(" )", ")");
     let out = out.trim_end_matches(['{', ':', ' ']).trim_end().to_string();
     if out.chars().count() > max_chars {
         let cut: String = out.chars().take(max_chars).collect();
@@ -448,6 +454,9 @@ pub fn display_sig(s: &Symbol) -> String {
     }
     if s.sig.starts_with(&s.name) {
         format!("{} {}", s.kind.label(), s.sig)
+    } else if !s.sig.contains(&s.name) {
+        // e.g. C `typedef struct { ... } Name;` whose first line lacks the name
+        format!("{} {} ({})", s.kind.label(), s.name, s.sig)
     } else {
         s.sig.clone()
     }
@@ -522,7 +531,7 @@ mod tests {
     fn clean_sig_collapses() {
         assert_eq!(
             clean_sig("fn  a(\n  x: u32,\n) -> u32 {", 100),
-            "fn a( x: u32, ) -> u32"
+            "fn a(x: u32) -> u32"
         );
         assert_eq!(clean_sig("abcdef", 3), "abc…");
     }

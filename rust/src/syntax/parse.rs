@@ -444,6 +444,31 @@ fn signature(node: Node, src: &str) -> String {
     clean_sig(&joined, SIG_CHARS)
 }
 
+fn is_scoped(kind: &str) -> bool {
+    matches!(
+        kind,
+        "scoped_identifier" | "scoped_type_identifier" | "scoped_use_list"
+    )
+}
+
+/// True when `n` is (the last segment of) the `path` of a scoped path.
+fn in_path_position(n: Node) -> bool {
+    let Some(p) = n.parent().filter(|p| is_scoped(p.kind())) else {
+        return false;
+    };
+    if p.child_by_field_name("path")
+        .is_some_and(|c| c.id() == n.id())
+    {
+        return true;
+    }
+    p.parent().is_some_and(|pp| {
+        is_scoped(pp.kind())
+            && pp
+                .child_by_field_name("path")
+                .is_some_and(|c| c.id() == p.id())
+    })
+}
+
 /// Count identifier leaves that are not definition names.
 fn collect_refs(root: Node, bytes: &[u8], def_names: &HashSet<usize>) -> Vec<(String, u32)> {
     let mut counts: HashMap<&[u8], u32> = HashMap::new();
@@ -451,7 +476,16 @@ fn collect_refs(root: Node, bytes: &[u8], def_names: &HashSet<usize>) -> Vec<(St
     'outer: loop {
         let n = cursor.node();
         if n.child_count() == 0 {
-            if IDENT_KINDS.contains(&n.kind()) && !def_names.contains(&n.start_byte()) {
+            // `core::fmt`, `std::io`: lowercase path segments name modules
+            // or crates, not symbols (`Foo::new` keeps `Foo`).
+            let module_path = bytes
+                .get(n.start_byte())
+                .is_some_and(|b| b.is_ascii_lowercase())
+                && in_path_position(n);
+            if IDENT_KINDS.contains(&n.kind())
+                && !module_path
+                && !def_names.contains(&n.start_byte())
+            {
                 if let Some(b) = bytes.get(n.start_byte()..n.end_byte()) {
                     if b.len() >= 2 && b.len() <= 80 {
                         *counts.entry(b).or_insert(0) += 1;
@@ -527,12 +561,29 @@ mod tests {
         let h = t.defs.iter().find(|s| s.name == "helper").unwrap();
         assert_eq!(h.kind, Kind::Function);
         assert_eq!((h.start, h.end), (17, 21));
-        assert_eq!(h.sig, "fn helper( a: u32, ) -> u32");
+        assert_eq!(h.sig, "fn helper(a: u32) -> u32");
         let imp = t.defs.iter().find(|s| s.kind == Kind::Impl).unwrap();
         assert_eq!(imp.sig, "impl<T> Display for Foo<T>");
         // refs: helper is used once (call), Display referenced
         assert!(t.refs.iter().any(|(n, c)| n == "helper" && *c == 1));
         assert!(t.refs.iter().any(|(n, _)| n == "Display"));
+        // module path segments are not references; type paths are
+        let t = parse_tags(
+            SynLang::Rust,
+            "fn f() { core::mem::swap(a, b); Foo::new(); }\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = t.refs.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            !names.contains(&"core") && !names.contains(&"mem"),
+            "{:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Foo") && names.contains(&"swap"),
+            "{:?}",
+            names
+        );
     }
 
     #[test]

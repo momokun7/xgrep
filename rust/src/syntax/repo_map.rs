@@ -19,6 +19,12 @@ const DAMPING: f64 = 0.85;
 const ITERATIONS: usize = 40;
 /// Per (file, identifier): at most this many symbols are printed (e.g. many `new`).
 const PER_NAME: usize = 3;
+/// Names defined in more files than this are not linked at all: `new`,
+/// `fmt`, `from` would otherwise add an edge to every defining file.
+const MAX_DEFINERS: usize = 25;
+/// Below this many ranked definitions, every top-level definition is added
+/// with a tiny score so small or sparsely connected repos still get a map.
+const FALLBACK_BELOW: usize = 5000;
 
 /// Inputs besides the files.
 #[derive(Debug, Default, Clone)]
@@ -68,6 +74,19 @@ fn role_weight(path: &str) -> f64 {
     }
 }
 
+/// True when symbol `k` sits inside a `mod tests` / `mod test` module.
+fn in_test_module(t: &FileTags, k: usize) -> bool {
+    let mut cur = t.defs[k].parent;
+    while let Some(p) = cur {
+        let s = &t.defs[p as usize];
+        if s.kind == Kind::Module && matches!(s.name.as_str(), "tests" | "test") {
+            return true;
+        }
+        cur = s.parent;
+    }
+    false
+}
+
 /// Personalised PageRank over a weighted edge list.
 pub fn pagerank(n: usize, edges: &[(u32, u32, f64)], personalization: &[f64]) -> Vec<f64> {
     if n == 0 {
@@ -101,11 +120,17 @@ pub fn pagerank(n: usize, edges: &[(u32, u32, f64)], personalization: &[f64]) ->
 pub fn build_map(files: &[(String, Arc<FileTags>)], opts: &MapOptions) -> MapResult {
     let n = files.len();
     let mentioned: HashSet<&str> = opts.focus_symbols.iter().map(|s| s.as_str()).collect();
-    // identifier -> files defining it
-    let mut defines: HashMap<&str, Vec<u32>> = HashMap::new();
+    // identifier -> files defining it; (file, identifier) pairs defined only
+    // inside `mod tests`-style modules are down-weighted later.
+    let mut defines: HashMap<&str, Vec<u32>> = HashMap::with_capacity(n * 16);
     let mut total_defs = 0usize;
+    // files containing a `mod tests` (their test-only helpers are down-weighted)
+    let mut has_test_mod = vec![false; n];
     for (i, (_, t)) in files.iter().enumerate() {
         for s in &t.defs {
+            if s.kind == Kind::Module && matches!(s.name.as_str(), "tests" | "test") {
+                has_test_mod[i] = true;
+            }
             if !counts_as_def(s.kind) {
                 continue;
             }
@@ -116,38 +141,46 @@ pub fn build_map(files: &[(String, Arc<FileTags>)], opts: &MapOptions) -> MapRes
             }
         }
     }
-    // edges (referencing file, defining file, weight) + per-edge identifier
-    let mut edges: Vec<(u32, u32, f64)> = Vec::new();
-    let mut edge_names: Vec<&str> = Vec::new();
+    // Weight of one reference (file r uses `name` `count` times); None when
+    // the name is too ambiguous to link (defined in very many files).
+    let edge_weight = |name: &str, count: u32, ndefs: usize| -> Option<f64> {
+        if ndefs > MAX_DEFINERS {
+            return None;
+        }
+        let mut mul = 1.0f64;
+        if mentioned.contains(name) {
+            mul *= 10.0;
+        }
+        if is_specific(name) {
+            mul *= 10.0;
+        }
+        if name.starts_with('_') || name.chars().count() <= 3 {
+            // private, or short and generic (`new`, `get`, `fmt`, `u32`)
+            mul *= 0.1;
+        }
+        if ndefs > 5 {
+            mul *= 0.1;
+        }
+        Some(mul * (count as f64).sqrt())
+    };
+    // Aggregate edges per (referencing file, defining file).
+    let mut agg: HashMap<(u32, u32), f64> = HashMap::new();
     for (r, (_, t)) in files.iter().enumerate() {
         for (name, count) in &t.refs {
             let Some(ds) = defines.get(name.as_str()) else {
                 continue;
             };
-            let mut mul = 1.0f64;
-            if mentioned.contains(name.as_str()) {
-                mul *= 10.0;
-            }
-            if is_specific(name) {
-                mul *= 10.0;
-            }
-            if name.starts_with('_') || name.chars().count() <= 3 {
-                // private, or short and generic (`new`, `get`, `fmt`, `u32`)
-                mul *= 0.1;
-            }
-            if ds.len() > 5 {
-                mul *= 0.1;
-            }
-            let w = mul * (*count as f64).sqrt();
+            let Some(w) = edge_weight(name, *count, ds.len()) else {
+                continue;
+            };
             for &d in ds {
-                if d as usize == r {
-                    continue;
+                if d as usize != r {
+                    *agg.entry((r as u32, d)).or_insert(0.0) += w;
                 }
-                edges.push((r as u32, d, w));
-                edge_names.push(name.as_str());
             }
         }
     }
+    let edges: Vec<(u32, u32, f64)> = agg.into_iter().map(|((r, d), w)| (r, d, w)).collect();
     // personalization
     let focus: HashSet<&str> = opts
         .focus
@@ -177,29 +210,60 @@ pub fn build_map(files: &[(String, Arc<FileTags>)], opts: &MapOptions) -> MapRes
     }
     let rank = pagerank(n, &edges, &pers);
 
-    // rank (defining file, identifier)
+    // Spread each file's rank over the definitions it uses.
     let mut out_w = vec![0.0f64; n];
     for &(r, _, w) in &edges {
         out_w[r as usize] += w;
     }
     let mut def_rank: HashMap<(u32, &str), f64> = HashMap::new();
-    for (k, &(r, d, w)) in edges.iter().enumerate() {
-        *def_rank.entry((d, edge_names[k])).or_insert(0.0) +=
-            rank[r as usize] * w / out_w[r as usize];
-    }
-    // Fallback when there are few edges: every top-level definition with the
-    // file's rank, so small or isolated repos still get a map.
-    for (i, (_, t)) in files.iter().enumerate() {
-        for s in &t.defs {
-            if s.parent.is_none() && counts_as_def(s.kind) {
-                def_rank
-                    .entry((i as u32, s.name.as_str()))
-                    .or_insert(rank[i] * 1e-3);
+    for (r, (_, t)) in files.iter().enumerate() {
+        if out_w[r] == 0.0 {
+            continue;
+        }
+        let share = rank[r] / out_w[r];
+        for (name, count) in &t.refs {
+            let Some(ds) = defines.get(name.as_str()) else {
+                continue;
+            };
+            let Some(w) = edge_weight(name, *count, ds.len()) else {
+                continue;
+            };
+            for &d in ds {
+                if d as usize != r {
+                    *def_rank.entry((d, name.as_str())).or_insert(0.0) += share * w;
+                }
             }
         }
     }
-    for ((f, _), v) in def_rank.iter_mut() {
-        *v *= role_weight(&files[*f as usize].0);
+    // Fallback when there are few edges: every top-level definition with the
+    // file's rank, so small or isolated repos still get a map.
+    if def_rank.len() < FALLBACK_BELOW {
+        for (i, (_, t)) in files.iter().enumerate() {
+            for s in &t.defs {
+                if s.parent.is_none() && counts_as_def(s.kind) {
+                    def_rank
+                        .entry((i as u32, s.name.as_str()))
+                        .or_insert(rank[i] * 1e-3);
+                }
+            }
+        }
+    }
+    let role: Vec<f64> = files.iter().map(|(p, _)| role_weight(p)).collect();
+    for ((f, name), v) in def_rank.iter_mut() {
+        let f = *f as usize;
+        *v *= role[f];
+        if has_test_mod[f] {
+            let t = &files[f].1;
+            let all_tests = t
+                .defs
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.name == *name && counts_as_def(s.kind))
+                .all(|(k, _)| in_test_module(t, k));
+            if all_tests {
+                *v *= 0.1;
+            }
+        }
     }
     if any_focus {
         // Mentioned identifiers defined in focus files rank first.
@@ -213,12 +277,19 @@ pub fn build_map(files: &[(String, Arc<FileTags>)], opts: &MapOptions) -> MapRes
         }
     }
     let mut ranked: Vec<((u32, &str), f64)> = def_rank.into_iter().collect();
-    ranked.sort_by(|a, b| {
+    let cmp = |a: &((u32, &str), f64), b: &((u32, &str), f64)| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(files[a.0 .0 as usize].0.cmp(&files[b.0 .0 as usize].0))
             .then(a.0 .1.cmp(b.0 .1))
-    });
+    };
+    // Only the head of the ranking can fit any budget: select, then sort it.
+    let keep = (opts.max_tokens / 2).max(2000);
+    if ranked.len() > keep {
+        ranked.select_nth_unstable_by(keep, cmp);
+        ranked.truncate(keep);
+    }
+    ranked.sort_by(cmp);
 
     // Greedy selection under the token budget.
     let budget = opts.max_tokens.max(100);
@@ -378,8 +449,8 @@ mod tests {
         assert!(m.text.starts_with("src/core.rs:\n"), "{}", m.text);
         let first = m.text.lines().nth(1).unwrap();
         assert!(first.contains("core_engine"), "{}", m.text);
-        assert!(m.edges >= 4);
-        // tiny budget: only the best symbol fits
+        assert_eq!(m.edges, 3); // a, b, c -> core (aggregated per file pair)
+                                // tiny budget: only the best symbol fits
         let small = build_map(
             &files,
             &MapOptions {

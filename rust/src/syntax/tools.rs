@@ -677,7 +677,16 @@ pub fn handle_repo_map(xg: &Xgrep, params: &Value) -> (String, bool) {
         Ok(v) => v,
         Err(e) => return (format!("Find error: {}", e), true),
     };
-    let unfiltered = !filters.is_active();
+    // Prune cache entries of files that left the index (code files only;
+    // vendored ones stay cached for find_definitions/find_references).
+    {
+        let indexed: HashSet<&str> = all
+            .iter()
+            .filter(|f| lang_for_path(f).is_some_and(|l| l.is_code()))
+            .map(|s| s.as_str())
+            .collect();
+        store_for(xg.index_path()).retain_code(&indexed);
+    }
     let code: Vec<String> = all
         .into_iter()
         .filter(|f| {
@@ -692,13 +701,7 @@ pub fn handle_repo_map(xg: &Xgrep, params: &Value) -> (String, bool) {
     let refs: Vec<&str> = code.iter().map(|s| s.as_str()).collect();
     let store = store_for(xg.index_path());
     let (tags, stats) = store.tags(xg.root(), &refs);
-    if unfiltered {
-        let keep: HashSet<&str> = refs.iter().copied().collect();
-        store.retain_code(&keep);
-    }
-    if stats.parsed > 0 || unfiltered {
-        let _ = store.save();
-    }
+    let _ = store.save();
     let parse_ms = t0.elapsed().as_millis();
     let files: Vec<(String, Arc<FileTags>)> = code
         .iter()

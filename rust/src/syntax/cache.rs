@@ -3,8 +3,11 @@
 //! mtime + size, filled lazily (only the files a tool asks about) and parsed
 //! in parallel. The main index format is not involved.
 //!
-//! The file is rewritten atomically (temp file + rename) when new entries were
-//! parsed. Any read error or version mismatch discards the cache.
+//! New entries are appended to a journal (`<index>.tags.log`) so a call that
+//! parses a handful of files does not rewrite a large cache; the journal is
+//! folded into the main file (atomic temp file + rename) once it grows past a
+//! quarter of the cache. Any read error or version mismatch discards the
+//! cache (a damaged journal tail is ignored).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -18,7 +21,7 @@ use super::{lang_for_path, tags_for_source, FileTags, Kind, Symbol, MAX_PARSE_BY
 
 const MAGIC: &[u8; 8] = b"XGTAGS\0\0";
 /// Bump when the extraction logic or the encoding changes.
-const VERSION: u32 = 1;
+const VERSION: u32 = 3;
 
 #[derive(Clone)]
 struct Entry {
@@ -31,7 +34,12 @@ struct Entry {
 struct State {
     loaded: bool,
     map: HashMap<String, Entry>,
-    dirty: bool,
+    /// Keys parsed since the last save (journal candidates).
+    pending: Vec<String>,
+    /// Entries were removed: the next save must rewrite the main file.
+    rewrite: bool,
+    /// Entries currently in the journal file.
+    journal_len: usize,
 }
 
 /// Tag cache for one index.
@@ -91,7 +99,9 @@ impl TagStore {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !st.loaded {
             st.loaded = true;
-            st.map = load(&self.file).unwrap_or_default();
+            let (map, journal_len) = load(&self.file).unwrap_or_default();
+            st.map = map;
+            st.journal_len = journal_len;
         }
         st
     }
@@ -155,7 +165,7 @@ impl TagStore {
             if let Some(e) = e {
                 out[i] = Some(e.tags.clone());
                 st.map.insert(files[i].to_string(), e);
-                st.dirty = true;
+                st.pending.push(files[i].to_string());
             }
         }
         (out, stats)
@@ -170,7 +180,7 @@ impl TagStore {
             keep.contains(k.as_str()) || !lang_for_path(k).is_some_and(|l| l.is_code())
         });
         if st.map.len() != before {
-            st.dirty = true;
+            st.rewrite = true;
         }
     }
 
@@ -178,10 +188,25 @@ impl TagStore {
     /// (the cache is an optimisation).
     pub fn save(&self) -> io::Result<()> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !st.dirty {
+        if st.pending.is_empty() && !st.rewrite {
             return Ok(());
         }
-        let buf = encode(&st.map);
+        let log = journal_path(&self.file);
+        let small = (st.journal_len + st.pending.len()) * 4 < st.map.len();
+        if !st.rewrite && small && self.file.exists() {
+            let mut keys = std::mem::take(&mut st.pending);
+            keys.sort();
+            keys.dedup();
+            let buf = encode(keys.iter().filter_map(|k| st.map.get_key_value(k)));
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)?;
+            f.write_all(&buf)?;
+            st.journal_len += keys.len();
+            return Ok(());
+        }
+        let buf = encode(st.map.iter());
         if let Some(dir) = self.file.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -189,7 +214,10 @@ impl TagStore {
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         tmp.write_all(&buf)?;
         tmp.persist(&self.file).map_err(|e| e.error)?;
-        st.dirty = false;
+        let _ = std::fs::remove_file(&log);
+        st.pending.clear();
+        st.rewrite = false;
+        st.journal_len = 0;
         Ok(())
     }
 
@@ -217,15 +245,22 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
     b.extend_from_slice(s.as_bytes());
 }
 
-fn encode(map: &HashMap<String, Entry>) -> Vec<u8> {
-    let mut b = Vec::with_capacity(map.len() * 512);
+fn journal_path(file: &Path) -> PathBuf {
+    let mut s = file.as_os_str().to_owned();
+    s.push(".log");
+    PathBuf::from(s)
+}
+
+/// One chunk: header + entries. The main file is one chunk; the journal is
+/// a sequence of chunks.
+fn encode<'a>(entries: impl Iterator<Item = (&'a String, &'a Entry)>) -> Vec<u8> {
+    let mut entries: Vec<(&String, &Entry)> = entries.collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut b = Vec::with_capacity(entries.len() * 512 + 16);
     b.extend_from_slice(MAGIC);
     put_u32(&mut b, VERSION);
-    put_u32(&mut b, map.len() as u32);
-    let mut keys: Vec<&String> = map.keys().collect();
-    keys.sort();
-    for k in keys {
-        let e = &map[k];
+    put_u32(&mut b, entries.len() as u32);
+    for (k, e) in entries {
         put_str(&mut b, k);
         put_u64(&mut b, e.mtime_ns);
         put_u64(&mut b, e.size);
@@ -276,13 +311,14 @@ impl Cur<'_> {
     }
 }
 
-fn decode(b: &[u8]) -> Option<HashMap<String, Entry>> {
-    let mut c = Cur { b, p: 0 };
+/// Decode one chunk at the cursor into `map`.
+fn decode_chunk(c: &mut Cur, map: &mut HashMap<String, Entry>) -> Option<usize> {
     if c.take(8)? != MAGIC || c.u32()? != VERSION {
         return None;
     }
     let n = c.u32()? as usize;
-    let mut map = HashMap::with_capacity(n.min(1 << 20));
+    map.reserve(n.min(1 << 20));
+    let mut staged = Vec::with_capacity(n.min(1 << 20));
     for _ in 0..n {
         let path = c.str()?;
         let mtime_ns = c.u64()?;
@@ -318,23 +354,43 @@ fn decode(b: &[u8]) -> Option<HashMap<String, Entry>> {
             let cnt = c.u32()?;
             refs.push((name, cnt));
         }
-        map.insert(
+        staged.push((
             path,
             Entry {
                 mtime_ns,
                 size,
                 tags: Arc::new(FileTags { defs, refs, lines }),
             },
-        );
+        ));
     }
-    Some(map)
+    // A chunk applies all-or-nothing (a torn journal append is ignored).
+    map.extend(staged);
+    Some(n)
 }
 
-fn load(file: &Path) -> Option<HashMap<String, Entry>> {
+fn read_all(file: &Path) -> Option<Vec<u8>> {
     let mut f = std::fs::File::open(file).ok()?;
     let mut b = Vec::new();
     f.read_to_end(&mut b).ok()?;
-    decode(&b)
+    Some(b)
+}
+
+/// Main file plus journal. Returns the map and the number of journal entries.
+fn load(file: &Path) -> Option<(HashMap<String, Entry>, usize)> {
+    let b = read_all(file)?;
+    let mut map = HashMap::new();
+    decode_chunk(&mut Cur { b: &b, p: 0 }, &mut map)?;
+    let mut journal = 0usize;
+    if let Some(j) = read_all(&journal_path(file)) {
+        let mut c = Cur { b: &j, p: 0 };
+        while c.p < j.len() {
+            match decode_chunk(&mut c, &mut map) {
+                Some(n) => journal += n,
+                None => break,
+            }
+        }
+    }
+    Some((map, journal))
 }
 
 #[cfg(test)]
@@ -373,6 +429,51 @@ mod tests {
         let (t3, s3) = again.tags(root, &["a.md"]);
         assert_eq!(s3.parsed, 1);
         assert_eq!(t3[0].as_ref().unwrap().defs.len(), 3);
+    }
+
+    #[test]
+    fn small_updates_go_to_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let names: Vec<String> = (0..10).map(|i| format!("d{}.md", i)).collect();
+        for n in &names {
+            std::fs::write(root.join(n), "# T\n").unwrap();
+        }
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let file = sidecar_path(&root.join("index"));
+        let store = TagStore {
+            file: file.clone(),
+            state: Mutex::new(State::default()),
+        };
+        store.tags(root, &refs);
+        store.save().unwrap();
+        assert!(!journal_path(&file).exists());
+        // one new file: appended to the journal, main file untouched
+        std::fs::write(root.join("new.md"), "# N\n## M\n").unwrap();
+        let before = std::fs::metadata(&file).unwrap().len();
+        store.tags(root, &["new.md"]);
+        store.save().unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), before);
+        assert!(journal_path(&file).exists());
+        // a new process sees both
+        let again = TagStore {
+            file: file.clone(),
+            state: Mutex::new(State::default()),
+        };
+        let (t, s) = again.tags(root, &["new.md", "d3.md"]);
+        assert_eq!(s.hits, 2);
+        assert_eq!(t[0].as_ref().unwrap().defs.len(), 2);
+        // a torn journal tail is ignored
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&file))
+            .unwrap();
+        j.write_all(b"XGTAGS\0\0\x03\0\0\0\x05").unwrap();
+        let third = TagStore {
+            file,
+            state: Mutex::new(State::default()),
+        };
+        assert_eq!(third.tags(root, &["new.md"]).1.hits, 1);
     }
 
     #[test]
