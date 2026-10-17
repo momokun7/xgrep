@@ -383,6 +383,14 @@ fn run() -> Result<()> {
             // with the process.
             crate::set_background_rebuild_process(true);
 
+            // --exclude is applied here, after the library search, so the
+            // --max-count limit must be applied after it (not inside search).
+            let lib_max_count = if cli.exclude.is_empty() {
+                cli.max_count
+            } else {
+                None
+            };
+
             let resolved = resolve_path(cli.path.as_deref())?;
             let (dir, results) = match resolved {
                 ResolvedPath::Dir(dir) => {
@@ -391,7 +399,7 @@ fn run() -> Result<()> {
                         case_insensitive,
                         regex: cli.regex,
                         file_type: cli.file_type,
-                        max_count: cli.max_count,
+                        max_count: lib_max_count,
                         changed_only: cli.changed,
                         since: cli.since,
                         path_pattern: None,
@@ -408,7 +416,7 @@ fn run() -> Result<()> {
                     let opts = SearchOptions {
                         case_insensitive,
                         regex: cli.regex,
-                        max_count: cli.max_count,
+                        max_count: lib_max_count,
                         word: cli.word_regexp,
                         globs: cli.globs.clone(),
                         ..Default::default()
@@ -418,8 +426,8 @@ fn run() -> Result<()> {
                 }
             };
 
-            // Apply --exclude filter
-            let results = if cli.exclude.is_empty() {
+            // Apply --exclude filter, then --max-count
+            let mut results: Vec<crate::SearchResult> = if cli.exclude.is_empty() {
                 results
             } else {
                 results
@@ -431,6 +439,10 @@ fn run() -> Result<()> {
                     })
                     .collect()
             };
+
+            if let Some(max) = cli.max_count {
+                results.truncate(max);
+            }
 
             if results.is_empty() {
                 std::process::exit(1);
