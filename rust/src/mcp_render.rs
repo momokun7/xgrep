@@ -329,17 +329,14 @@ pub fn render_content(items: &[SearchResult], cfg: &RenderCfg, session: &mut Ses
                 // Not even one match fits: show the first one, cut to budget.
                 p = 1;
                 best = r.render(&avail[..1]);
-                let max_chars = cfg.max_tokens.saturating_mul(4).max(200);
-                if best.text.len() > max_chars {
-                    let mut cut = max_chars;
-                    while !best.text.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    best.text.truncate(cut);
-                    best.text.push_str(&format!(
-                        "\n…[block cut at max_tokens={}; use read_file with start_line/end_line]\n",
-                        cfg.max_tokens
-                    ));
+                if let Some(emitted) = hard_cut(&mut best.text, cfg.max_tokens) {
+                    // Only the lines that survived the cut count as shown;
+                    // the rest must stay visible to follow-up searches.
+                    let file = avail[0].file.clone();
+                    best.marks = emitted
+                        .into_iter()
+                        .map(|(s, e)| (file.clone(), s, e))
+                        .collect();
                     page.hard_truncated = true;
                 }
             }
@@ -356,6 +353,61 @@ pub fn render_content(items: &[SearchResult], cfg: &RenderCfg, session: &mut Ses
         page.next_offset = Some(start + p);
     }
     page
+}
+
+/// Cut `text` to roughly `max_tokens` (appending a notice). Returns `None`
+/// when the text already fits, otherwise the line ranges whose numbered
+/// lines (`{n}> text` / `{n}  text`) were emitted in full before the cut, so
+/// only those are recorded in the session.
+fn hard_cut(text: &mut String, max_tokens: usize) -> Option<Vec<(usize, usize)>> {
+    let max_chars = max_tokens.saturating_mul(4).max(200);
+    if text.len() <= max_chars {
+        return None;
+    }
+    let mut cut = max_chars;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    let emitted = emitted_line_ranges(text);
+    text.push_str(&format!(
+        "\n…[block cut at max_tokens={}; use read_file with start_line/end_line]\n",
+        max_tokens
+    ));
+    Some(emitted)
+}
+
+/// Line numbers of the complete numbered lines in `text`, as merged ranges.
+/// A trailing line without its newline (cut mid-line) does not count.
+fn emitted_line_ranges(text: &str) -> Vec<(usize, usize)> {
+    let complete = match text.rfind('\n') {
+        Some(i) => &text[..i],
+        None => return Vec::new(),
+    };
+    let mut nums: Vec<usize> = complete
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim_start_matches(' ');
+            let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 {
+                return None;
+            }
+            match &t.as_bytes()[digits..] {
+                [b'>' | b' ', b' ', ..] => t[..digits].parse().ok(),
+                _ => None,
+            }
+        })
+        .collect();
+    nums.sort_unstable();
+    nums.dedup();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for n in nums {
+        match out.last_mut() {
+            Some(last) if n == last.1 + 1 => last.1 = n,
+            _ => out.push((n, n)),
+        }
+    }
+    out
 }
 
 /// Per-file aggregation in ranked order.
@@ -568,7 +620,7 @@ pub fn render_blocks(
             && session
                 .seen_range(&b.file, b.start)
                 .is_some_and(|(_, e)| e >= b.end);
-        let (mut text, marks) = if collapsed {
+        let (mut text, mut marks) = if collapsed {
             (
                 format!(
                     "already shown: {}:L{}-{} ({} match{})\n",
@@ -603,17 +655,11 @@ pub fn render_blocks(
             break;
         }
         if page.shown == 0 && t > cfg.max_tokens {
-            let max_chars = cfg.max_tokens.saturating_mul(4).max(200);
-            if text.len() > max_chars {
-                let mut cut = max_chars;
-                while !text.is_char_boundary(cut) {
-                    cut -= 1;
+            if let Some(emitted) = hard_cut(&mut text, cfg.max_tokens) {
+                if !collapsed {
+                    // Only the lines that survived the cut count as shown.
+                    marks = emitted;
                 }
-                text.truncate(cut);
-                text.push_str(&format!(
-                    "\n…[block cut at max_tokens={}; use read_file with start_line/end_line]\n",
-                    cfg.max_tokens
-                ));
                 page.hard_truncated = true;
             }
         }
@@ -729,5 +775,93 @@ mod tests {
             again.body
         );
         assert_eq!(again.collapsed_seen, 1);
+    }
+
+    fn padded_file(dir: &Path, n: usize) {
+        let content: String = (1..=n)
+            .map(|i| format!("line{:03} {}\n", i, "p".repeat(30)))
+            .collect();
+        std::fs::write(dir.join("a.rs"), content).unwrap();
+    }
+
+    #[test]
+    fn hard_cut_block_marks_only_emitted_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        padded_file(dir.path(), 60);
+        let blocks = vec![block(1, 60, vec![2])];
+        let dups = HashMap::new();
+        let cfg = RenderCfg {
+            root: dir.path(),
+            before: 0,
+            after: 0,
+            max_results: 1,
+            offset: 0,
+            max_tokens: 100,
+            include_seen: false,
+            highlight: None,
+            duplicates: &dups,
+        };
+        let mut session = Session::new();
+        let p = render_blocks(&blocks, &cfg, &mut session);
+        assert!(p.hard_truncated, "{}", p.body);
+        let (s, e) = session.seen_range("a.rs", 1).expect("head marked");
+        assert_eq!(s, 1);
+        assert!(e > 1 && e < 60, "marked up to {}", e);
+        // The last emitted line is complete in the body; the next one is not.
+        let full = |n: usize| format!("line{:03} {}\n", n, "p".repeat(30));
+        assert!(p.body.contains(&full(e)), "{}", p.body);
+        assert!(!p.body.contains(&full(e + 1)), "{}", p.body);
+        assert_eq!(session.seen_range("a.rs", 60), None);
+        // The block is not collapsed on a follow-up search.
+        let again = render_blocks(&blocks, &cfg, &mut session);
+        assert!(again.body.starts_with("## a.rs"), "{}", again.body);
+        assert_eq!(again.collapsed_seen, 0);
+    }
+
+    #[test]
+    fn hard_cut_content_marks_only_emitted_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        padded_file(dir.path(), 60);
+        let lines: Vec<String> = std::fs::read_to_string(dir.path().join("a.rs"))
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        let hit = |n: usize| SearchResult {
+            file: Arc::from("a.rs"),
+            line_number: n,
+            line: lines[n - 1].clone(),
+            column: 0,
+        };
+        let dups = HashMap::new();
+        let mut cfg = RenderCfg {
+            root: dir.path(),
+            before: 29,
+            after: 30,
+            max_results: 1,
+            offset: 0,
+            max_tokens: 100,
+            include_seen: false,
+            highlight: None,
+            duplicates: &dups,
+        };
+        let mut session = Session::new();
+        let p = render_content(&[hit(30)], &cfg, &mut session);
+        assert!(p.hard_truncated, "{}", p.body);
+        assert!(session.seen_range("a.rs", 1).is_some());
+        assert_eq!(session.seen_range("a.rs", 55), None);
+        cfg.before = 0;
+        cfg.after = 0;
+        cfg.max_tokens = 4000;
+        let again = render_content(&[hit(55)], &cfg, &mut session);
+        assert!(!again.body.contains("already shown"), "{}", again.body);
+        assert!(again.body.contains("line055"), "{}", again.body);
+    }
+
+    #[test]
+    fn emitted_line_ranges_skips_partial_tail() {
+        let t = "## a.rs:1-9\n\n```rust\n1  a\n2> b\n3  c\n4  cu";
+        assert_eq!(emitted_line_ranges(t), vec![(1, 3)]);
+        assert_eq!(emitted_line_ranges("no numbers\n"), Vec::new());
     }
 }
