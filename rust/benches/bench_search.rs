@@ -23,7 +23,7 @@ fn bench_literal_search(c: &mut Criterion) {
             let results = xg
                 .search("process_data", &SearchOptions::default())
                 .unwrap();
-            criterion::black_box(results);
+            std::hint::black_box(results);
         });
     });
 }
@@ -39,7 +39,7 @@ fn bench_regex_search(c: &mut Criterion) {
     c.bench_function("search_regex", |b| {
         b.iter(|| {
             let results = xg.search(r"fn\s+\w+_\d+", &opts).unwrap();
-            criterion::black_box(results);
+            std::hint::black_box(results);
         });
     });
 }
@@ -55,7 +55,7 @@ fn bench_case_insensitive_search(c: &mut Criterion) {
     c.bench_function("search_case_insensitive", |b| {
         b.iter(|| {
             let results = xg.search("Config", &opts).unwrap();
-            criterion::black_box(results);
+            std::hint::black_box(results);
         });
     });
 }

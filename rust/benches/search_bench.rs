@@ -76,7 +76,7 @@ fn bench_literal_search(c: &mut Criterion) {
             let results = xg
                 .search("process_data", &SearchOptions::default())
                 .expect("search");
-            criterion::black_box(results);
+            std::hint::black_box(results);
         });
     });
 }
@@ -96,7 +96,7 @@ fn bench_regex_search(c: &mut Criterion) {
             let results = xg
                 .search(r"pub fn \w+_\d+\(\)", &opts)
                 .expect("regex search");
-            criterion::black_box(results);
+            std::hint::black_box(results);
         });
     });
 }
@@ -111,7 +111,7 @@ fn bench_find_files(c: &mut Criterion) {
     c.bench_function("find/glob_rs", |b| {
         b.iter(|| {
             let files = xg.find_files("*.rs").expect("find_files");
-            criterion::black_box(files);
+            std::hint::black_box(files);
         });
     });
 }
