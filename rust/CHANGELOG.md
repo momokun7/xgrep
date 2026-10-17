@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.8.1](https://github.com/momokun7/xgrep/compare/v0.8.0...v0.8.1) (2026-10-17)
+
+
+### Features
+
+* **cli:** search standard input and exit quietly on a closed pipe ([#108](https://github.com/momokun7/xgrep/issues/108)) ([27b594d](https://github.com/momokun7/xgrep/commit/27b594d28eca8184a05bd48d4cb2758d8a42428d))
+
+
+### Bug Fixes
+
+* **cli:** search the directory when piped standard input is empty ([#108](https://github.com/momokun7/xgrep/issues/108)) ([0f560df](https://github.com/momokun7/xgrep/commit/0f560dfc4bdf327f9ec0695f4f1d0f0610c0db20))
+* **python:** build abi3 wheels so every CPython >= 3.8 can install them; 0.8.0 had wheels for Python 3.11 only ([#110](https://github.com/momokun7/xgrep/issues/110)) ([488c717](https://github.com/momokun7/xgrep/commit/488c717a7adc4c5a3969e6c87ff9029ca26b0ab3))
+* **docker:** build the xg binary with Rust 1.85 in the benchmark image ([#109](https://github.com/momokun7/xgrep/issues/109)) ([2cf7b35](https://github.com/momokun7/xgrep/commit/2cf7b3516747187ed3286d6b288a3018f818019f))
+
+
+### Miscellaneous
+
+* dual-license under MIT OR Apache-2.0 ([#111](https://github.com/momokun7/xgrep/issues/111)) ([6b42237](https://github.com/momokun7/xgrep/commit/6b422373aa485bb52b49e376b8b5aa22a60c35ea))
+
 ## [0.8.0](https://github.com/momokun7/xgrep/compare/v0.7.0...v0.8.0) (2026-10-17)
 
 
