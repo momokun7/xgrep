@@ -29,7 +29,8 @@ pub struct SearchOptions {
     pub since: Option<String>,
     /// Filter by path substring.
     pub path_pattern: Option<String>,
-    /// Check index freshness before searching.
+    /// Run the full freshness check and rebuild the index first if too many
+    /// files changed. Default searches already rescan edited files.
     pub fresh: Option<bool>,
     /// Match only at word boundaries (wraps the pattern in `\b(?:...)\b`).
     /// Enabling this always runs the regex engine, even for literal patterns.

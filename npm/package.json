@@ -45,6 +45,8 @@
     "index.js",
     "index.d.ts",
     "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
     "xgrep.*.node"
   ]
 }

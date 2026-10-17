@@ -132,8 +132,9 @@ pub struct SearchOptions {
     pub since: Option<String>,
     /// Filter results by path substring match (e.g., "src/auth", "tests/")
     pub path_pattern: Option<String>,
-    /// Check index freshness and use hybrid search for changed files.
-    /// When false (default), uses existing index as-is for maximum speed.
+    /// Run the full freshness check (not the watcher's change set, no time
+    /// budget) and rebuild the index first if too many files changed.
+    /// Default searches already rescan files edited since the last build.
     pub fresh: bool,
     /// Match only at word boundaries (wraps the pattern in `\b(?:...)\b`).
     /// Note: enabling this always runs the regex engine, even for literal patterns.
@@ -212,7 +213,9 @@ impl SearchOptions {
         self
     }
 
-    /// Check index freshness and use hybrid search for changed files.
+    /// Run the full freshness check (not the watcher's change set, no time
+    /// budget) and rebuild the index first if too many files changed.
+    /// Default searches already rescan files edited since the last build.
     pub fn with_fresh(mut self, value: bool) -> Self {
         self.fresh = value;
         self
