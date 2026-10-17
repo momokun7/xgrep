@@ -5,8 +5,12 @@
 
 ### Bug Fixes
 
-* **release:** ship license files; generate the npm README API section ([7cf8090](https://github.com/momokun7/xgrep/commit/7cf8090b93660c250a9a1ba7ce58ec28a67c2de3))
-* **release:** ship the license files in every package ([1ec22f4](https://github.com/momokun7/xgrep/commit/1ec22f485019953eb93f60d689b5bd6234b58f04))
+* **release:** ship the license files in every package: crate, npm package, PyPI wheels and release archives ([#115](https://github.com/momokun7/xgrep/issues/115)) ([1ec22f4](https://github.com/momokun7/xgrep/commit/1ec22f485019953eb93f60d689b5bd6234b58f04))
+
+
+### Documentation
+
+* **npm:** the README API section is generated from the type definitions; it now documents `indexStatus()` returning an `IndexStatus` object, the `word` and `globs` options, and what `fresh` does ([#115](https://github.com/momokun7/xgrep/issues/115)) ([9c378ba](https://github.com/momokun7/xgrep/commit/9c378baf625385fcffffaf1328eeb8c86bd52f7f))
 
 ## [0.8.1](https://github.com/momokun7/xgrep/compare/v0.8.0...v0.8.1) (2026-10-17)
 
