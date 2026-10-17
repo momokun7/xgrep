@@ -9,6 +9,7 @@ use crate::git::{bytes_to_path, find_toplevel_fs, git_cmd, split_nul};
 use crate::index::builder::is_xgrep_internal;
 use crate::index::format::FileEntry;
 use crate::index::reader::IndexReader;
+use crate::safefs;
 use ignore::WalkBuilder;
 
 /// Index freshness check result.
@@ -58,7 +59,12 @@ impl IndexMeta {
         let meta_path = Self::path_for(index_path);
         let content = fs::read_to_string(&meta_path).ok()?;
         let mut lines = content.lines();
-        let commit_hash = lines.next().map(|s| s.trim().to_string());
+        // The meta file sits next to the index and may be repo-local, so keep
+        // only a well-formed object id and paths that stay under the root.
+        let commit_hash = lines
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|h| is_object_id(h));
         let mut meta = IndexMeta {
             commit_hash,
             ..Default::default()
@@ -70,7 +76,9 @@ impl IndexMeta {
                     meta.verified_at = Some((start, end.flatten().unwrap_or(start)));
                 }
             } else if let Some(d) = line.strip_prefix("dir ") {
-                meta.dirs.push(d.to_string());
+                if safefs::is_safe_rel(Path::new(d)) {
+                    meta.dirs.push(d.to_string());
+                }
             }
         }
         Some(meta)
@@ -93,11 +101,14 @@ impl IndexMeta {
             let _ = write!(content, "\ndir {d}");
         }
         // Write atomically so concurrent readers never see a truncated file.
-        let tmp = meta_path.with_extension("meta.tmp");
-        fs::write(&tmp, content)?;
-        fs::rename(&tmp, &meta_path)?;
+        safefs::write_atomic(&meta_path, content.as_bytes())?;
         Ok(())
     }
+}
+
+/// True for a full hex object id (SHA-1 or SHA-256).
+fn is_object_id(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Build window `(start, end)` in nanoseconds since the UNIX epoch.
@@ -619,8 +630,12 @@ fn load_probe_cache(
     if now < start || now - start >= ttl.as_nanos() {
         return None;
     }
+    let changed: Vec<PathBuf> = lines.map(PathBuf::from).collect();
+    if !changed.iter().all(|p| safefs::is_safe_rel(p)) {
+        return None;
+    }
     Some(Overlay {
-        changed: lines.map(PathBuf::from).collect(),
+        changed,
         truncated: truncated != 0,
         meta_outdated: meta_outdated != 0,
     })
@@ -652,10 +667,7 @@ fn save_probe_cache(index_path: &Path, identity: (u128, u64, u128), start: u128,
             }
         }
     }
-    let tmp = index_path.with_extension(format!("probe.tmp{}", std::process::id()));
-    if fs::write(&tmp, out).is_ok() && fs::rename(&tmp, &path).is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
+    let _ = safefs::write_atomic(&path, out.as_bytes());
 }
 
 /// [`compute_overlay`] with a persisted result reused for `ttl`.
@@ -1458,36 +1470,78 @@ mod tests {
         let index_path = dir.path().join("test.xgrep");
         fs::write(&index_path, "dummy").unwrap();
 
-        IndexMeta::save(&index_path, Some("abc123"), None, &[]).unwrap();
+        IndexMeta::save(
+            &index_path,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            None,
+            &[],
+        )
+        .unwrap();
         let meta = IndexMeta::load(&index_path).unwrap();
-        assert_eq!(meta.commit_hash, Some("abc123".to_string()));
+        assert_eq!(
+            meta.commit_hash,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
         assert_eq!(meta.verified_at, None);
 
         let dirs = vec!["assets".to_string(), "src/empty dir".to_string()];
-        IndexMeta::save(&index_path, Some("def"), Some((10, 12)), &dirs).unwrap();
+        IndexMeta::save(
+            &index_path,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            Some((10, 12)),
+            &dirs,
+        )
+        .unwrap();
         let meta = IndexMeta::load(&index_path).unwrap();
-        assert_eq!(meta.commit_hash, Some("def".to_string()));
+        assert_eq!(
+            meta.commit_hash,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string())
+        );
         assert_eq!(meta.verified_at, Some((10, 12)));
         assert_eq!(meta.dirs, dirs);
 
         // Lines written by older versions are ignored.
         fs::write(
             index_path.with_extension("meta"),
-            "abc\nverified-ns 5 6\ndirty a.txt\ndirty-overflow\n",
+            "cccccccccccccccccccccccccccccccccccccccc\nverified-ns 5 6\ndirty a.txt\ndirty-overflow\n",
         )
         .unwrap();
         let meta = IndexMeta::load(&index_path).unwrap();
-        assert_eq!(meta.commit_hash, Some("abc".to_string()));
+        assert_eq!(
+            meta.commit_hash,
+            Some("cccccccccccccccccccccccccccccccccccccccc".to_string())
+        );
         assert_eq!(meta.verified_at, Some((5, 6)));
+
+        // A malformed commit id or a dir escaping the root is dropped.
+        fs::write(
+            index_path.with_extension("meta"),
+            "--output=x
+dir ../outside
+dir /abs
+dir ok
+",
+        )
+        .unwrap();
+        let meta = IndexMeta::load(&index_path).unwrap();
+        assert_eq!(meta.commit_hash, None);
+        assert_eq!(meta.dirs, vec!["ok".to_string()]);
     }
 
     #[test]
     fn test_meta_load_legacy_single_line() {
         let dir = tempdir().unwrap();
         let index_path = dir.path().join("test.xgrep");
-        fs::write(index_path.with_extension("meta"), "abc123").unwrap();
+        fs::write(
+            index_path.with_extension("meta"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
         let meta = IndexMeta::load(&index_path).unwrap();
-        assert_eq!(meta.commit_hash, Some("abc123".to_string()));
+        assert_eq!(
+            meta.commit_hash,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
         assert_eq!(meta.verified_at, None);
     }
 

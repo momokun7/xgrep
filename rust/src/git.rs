@@ -8,9 +8,15 @@ use std::process::Command;
 /// Pre-commit hooks set GIT_DIR and GIT_INDEX_FILE in the environment. Without
 /// this cleanup, git subprocesses spawned from tests during the hook would use
 /// the hook's repository instead of the test's own temp git repo.
+///
+/// The searched repository may not be trusted, so the fsmonitor hook, which
+/// read-only commands such as `git status` would otherwise run, is turned
+/// off. Diff commands also pass `--no-ext-diff` (and `--no-textconv` when
+/// they print content).
 pub(crate) fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
-    cmd.env_remove("GIT_DIR")
+    cmd.args(["-c", "core.fsmonitor=false"])
+        .env_remove("GIT_DIR")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR");
@@ -121,8 +127,9 @@ fn collect_git_paths(root: &Path, git_root: &Option<PathBuf>, out: &[u8]) -> Has
             },
             None => bytes_to_path(tok),
         };
-        let full = root.join(&rel);
-        if full.exists() {
+        // Only regular files under the root: a committed symlink must not
+        // pull in a file from outside it.
+        if crate::safefs::is_safe_rel(&rel) && crate::safefs::is_regular_file(&root.join(&rel)) {
             files.insert(rel);
         }
     }
@@ -140,14 +147,14 @@ pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>> {
 
     // unstaged changes
     let output = git_cmd()
-        .args(["diff", "--name-only", "-z"])
+        .args(["diff", "--no-ext-diff", "--name-only", "-z"])
         .current_dir(root)
         .output()?;
     files.extend(collect_git_paths(root, &gr, &output.stdout));
 
     // staged changes
     let output = git_cmd()
-        .args(["diff", "--cached", "--name-only", "-z"])
+        .args(["diff", "--no-ext-diff", "--cached", "--name-only", "-z"])
         .current_dir(root)
         .output()?;
     files.extend(collect_git_paths(root, &gr, &output.stdout));

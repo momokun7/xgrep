@@ -164,13 +164,13 @@ impl SidecarWriter {
         let count_u32 = u32::try_from(count)
             .map_err(|_| XgrepError::IndexError("too many files for the sidecar".into()))?;
         let parent = path.parent().unwrap_or(Path::new("."));
-        fs::create_dir_all(parent)?;
-        let temp_path = parent.join(format!(".xgrep_cache_tmp_{}", std::process::id()));
+        crate::safefs::create_real_dir(parent)?;
+        // Created exclusively under a random name; removed by `Drop` on error.
+        let (file, temp_path) = crate::safefs::temp_file_in(parent)?
+            .keep()
+            .map_err(|e| XgrepError::Io(e.error))?;
         let mut out = Self {
-            w: Some(BufWriter::with_capacity(
-                256 * 1024,
-                fs::File::create(&temp_path)?,
-            )),
+            w: Some(BufWriter::with_capacity(256 * 1024, file)),
             temp_path,
             path: path.to_path_buf(),
             remaining: count,

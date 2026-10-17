@@ -23,6 +23,8 @@ use std::time::UNIX_EPOCH;
 
 use rayon::prelude::*;
 
+use crate::safefs;
+
 use super::{lang_for_path, tags_for_source, FileTags, Kind, Symbol, MAX_PARSE_BYTES};
 
 const MAGIC: &[u8; 8] = b"XGTAGS\0\0";
@@ -109,8 +111,13 @@ pub fn store_for(index_path: &Path) -> Arc<TagStore> {
         .clone()
 }
 
-fn stat(path: &Path) -> Option<(u64, u64)> {
-    let m = std::fs::metadata(path).ok()?;
+/// `(mtime_ns, size)` of `root/rel` if it is a regular file under the root
+/// (`rel` may come from an index on disk; symlinks are not followed).
+fn stat(root: &Path, rel: &str) -> Option<(u64, u64)> {
+    if !safefs::is_safe_rel(Path::new(rel)) {
+        return None;
+    }
+    let m = std::fs::symlink_metadata(root.join(rel)).ok()?;
     if !m.is_file() {
         return None;
     }
@@ -142,7 +149,7 @@ impl TagStore {
             .par_iter()
             .map(|f| {
                 lang_for_path(f)?;
-                stat(&root.join(f))
+                stat(root, f)
             })
             .collect();
         let mut out: Vec<Option<Arc<FileTags>>> = vec![None; files.len()];
@@ -182,7 +189,11 @@ impl TagStore {
                     // Taken before reading: an edit after this instant in
                     // the same second keeps the entry racy.
                     let verified_ns = now_ns();
-                    let bytes = std::fs::read(root.join(files[i])).ok()?;
+                    let mut bytes = Vec::with_capacity(size as usize);
+                    safefs::open_regular_file(&root.join(files[i]))
+                        .ok()??
+                        .read_to_end(&mut bytes)
+                        .ok()?;
                     if memchr::memchr(0, &bytes).is_some() {
                         return None;
                     }
@@ -249,9 +260,7 @@ impl TagStore {
             keys.sort();
             keys.dedup();
             let buf = encode(keys.iter().filter_map(|k| st.map.get_key_value(k)));
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
+            let mut f = safefs::no_follow(std::fs::OpenOptions::new().create(true).append(true))
                 .open(&log)?;
             f.write_all(&buf)?;
             st.journal_len += keys.len();
@@ -259,7 +268,7 @@ impl TagStore {
         }
         let buf = encode(st.map.iter());
         if let Some(dir) = self.file.parent() {
-            std::fs::create_dir_all(dir)?;
+            safefs::create_real_dir(dir)?;
         }
         let dir = self.file.parent().unwrap_or(Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;

@@ -40,6 +40,7 @@ pub(crate) mod mcp_render;
 pub(crate) mod mcp_tools;
 pub mod output;
 pub(crate) mod rank;
+pub(crate) mod safefs;
 pub mod search;
 pub(crate) mod session;
 pub(crate) mod syntax;
@@ -509,9 +510,22 @@ impl Xgrep {
     }
 
     /// Open with a local index (.xgrep/) explicitly.
+    ///
+    /// This also records, in the user's cache directory, that the local
+    /// index of this root was created here, so later [`open`](Self::open)
+    /// calls use it. A `.xgrep/` that arrived with the files (for example
+    /// committed to a cloned repository) is never used without this record.
     pub fn open_local(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = root.join(".xgrep").join("index");
+        if let Some(marker) = local_trust_marker(&root) {
+            if !marker.exists() {
+                if let Some(dir) = marker.parent() {
+                    let _ = safefs::create_real_dir(dir);
+                }
+                let _ = safefs::write_atomic(&marker, b"");
+            }
+        }
         Ok(Self::with_paths(root, index_path))
     }
 
@@ -564,7 +578,7 @@ impl Xgrep {
     /// fingerprint matched and no rebuild was needed.
     pub fn build_index(&self) -> Result<bool> {
         if let Some(parent) = self.index_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            safefs::create_real_dir(parent)?;
         }
 
         // Older format (v2/v3) → current: emit a one-time message so users
@@ -891,7 +905,7 @@ impl Xgrep {
         let scan: Vec<PathBuf> = overlay
             .changed
             .into_iter()
-            .filter(|p| self.root.join(p).is_file())
+            .filter(|p| safefs::is_regular_file(&self.root.join(p)))
             .collect();
         // One merged, path-ordered scan of index candidates and changed files.
         let mut targets = search::index_targets(&reader, q, &index_filter, self.config.quiet);
@@ -963,7 +977,7 @@ impl Xgrep {
                 let _ = std::fs::remove_file(marker);
             }
         } else {
-            let _ = std::fs::write(marker, b"freshness probe timed out\n");
+            let _ = safefs::write_atomic(&marker, b"freshness probe timed out\n");
             if !self.config.quiet {
                 eprintln!(
                     "xgrep: note: index freshness check took over {}ms; skipping it for {} minutes \
@@ -1042,7 +1056,7 @@ impl Xgrep {
         let rebuild: watch::RebuildFn = Box::new(move || {
             let _serial = build_mutex.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(parent) = index_path.parent() {
-                std::fs::create_dir_all(parent)?;
+                safefs::create_real_dir(parent)?;
             }
             rebuild_index_files(&root, &index_path)
         });
@@ -1185,7 +1199,7 @@ impl Xgrep {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if std::fs::write(&stamp, now.to_string()).is_err() {
+        if safefs::write_atomic(&stamp, now.to_string().as_bytes()).is_err() {
             return;
         }
 
@@ -1263,6 +1277,8 @@ impl Xgrep {
     /// Search specific files directly without using the index.
     ///
     /// Useful when the caller already knows which files to search (e.g., a single file path).
+    /// Paths are relative to the root; absolute paths, `..` components and
+    /// symlinks are skipped, so a search never reads outside the root.
     pub fn search_files(
         &self,
         files: &[PathBuf],
@@ -1503,18 +1519,45 @@ fn current_exe_is_xg() -> bool {
 ///
 /// The root is canonicalized first so that relative paths, `..`
 /// components, and symlinked paths to the same directory share one index.
+///
+/// `<root>/.xgrep/index` is used only if [`Xgrep::open_local`] created it on
+/// this machine (see [`local_trust_marker`]); otherwise the index lives in
+/// the user's cache directory.
 fn resolve_index_path(root: &Path) -> Result<PathBuf> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let local = root.join(".xgrep").join("index");
-    if local.exists() {
+    let local_dir = root.join(".xgrep");
+    let local = local_dir.join("index");
+    let trusted = local_trust_marker(&root).is_some_and(|m| m.exists());
+    let real_dir = std::fs::symlink_metadata(&local_dir)
+        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
+    if trusted && real_dir && local.exists() {
         return Ok(local);
     }
-    let hash = xxhash_rust::xxh64::xxh64(root.to_string_lossy().as_bytes(), 0);
-    let cache_dir = dirs_next::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("xgrep")
-        .join(format!("{:016x}", hash));
+    let cache_dir = index_cache_dir(&root).ok_or_else(|| {
+        XgrepError::IndexError(
+            "cannot determine the user cache directory (set HOME or XDG_CACHE_HOME)".to_string(),
+        )
+    })?;
     Ok(cache_dir.join("index"))
+}
+
+/// Per-root directory in the user's cache directory. There is no fallback
+/// to a shared location such as `/tmp`, where other users could plant files.
+fn index_cache_dir(root: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let hash = xxhash_rust::xxh64::xxh64(root.to_string_lossy().as_bytes(), 0);
+    Some(
+        dirs_next::cache_dir()?
+            .join("xgrep")
+            .join(format!("{:016x}", hash)),
+    )
+}
+
+/// File whose presence records that this user created `<root>/.xgrep/` with
+/// [`Xgrep::open_local`]. It lives in the user's cache directory, which the
+/// searched tree cannot write to.
+fn local_trust_marker(root: &Path) -> Option<PathBuf> {
+    Some(index_cache_dir(root)?.join("local-index"))
 }
 
 #[cfg(test)]
@@ -1522,15 +1565,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_index_path_prefers_local() {
+    fn test_resolve_index_path_uses_local_only_after_open_local() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // Create .xgrep/index
+        // A .xgrep/index that came with the files (e.g. committed) is ignored.
         std::fs::create_dir_all(root.join(".xgrep")).unwrap();
         std::fs::write(root.join(".xgrep/index"), "dummy").unwrap();
+        assert!(!resolve_index_path(root).unwrap().ends_with(".xgrep/index"));
 
-        let path = resolve_index_path(root).unwrap();
-        assert!(path.ends_with(".xgrep/index"));
+        // Creating it with open_local records it as this user's.
+        Xgrep::open_local(root).unwrap();
+        assert!(resolve_index_path(root).unwrap().ends_with(".xgrep/index"));
+
+        let _ = std::fs::remove_dir_all(index_cache_dir(root).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_index_path_ignores_symlinked_local_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("index"), "dummy").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join(".xgrep")).unwrap();
+        Xgrep::open_local(&root).unwrap();
+        assert!(!resolve_index_path(&root).unwrap().ends_with(".xgrep/index"));
+
+        let _ = std::fs::remove_dir_all(index_cache_dir(&root).unwrap());
     }
 
     #[test]

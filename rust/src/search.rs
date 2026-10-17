@@ -10,6 +10,7 @@ use crate::candidates::{intersect_postings, resolve_literal_candidates, resolve_
 use crate::error::{Result, XgrepError};
 use crate::globfilter::GlobFilter;
 use crate::index::reader::IndexReader;
+use crate::safefs;
 use memchr::memmem;
 use regex::bytes::RegexBuilder;
 use std::borrow::Cow;
@@ -672,14 +673,21 @@ fn scan_one(
 ) -> Option<FileMatches> {
     use std::io::Read;
 
+    // Paths come from the index, git or the watcher; never read outside the
+    // root, and never follow a symlink or open a device or FIFO.
+    if !safefs::is_safe_rel(&target.path) {
+        return None;
+    }
     let full_path = root.join(&target.path);
     // Read into a reused per-thread buffer: allocating a fresh buffer per
     // file leaves freed memory cached in every worker's allocator heap.
     READ_BUF.with(|cell| {
         let mut content = cell.borrow_mut();
         content.clear();
-        let read = fs::File::open(&full_path).and_then(|mut f| f.read_to_end(&mut content));
+        let read = safefs::open_regular_file(&full_path)
+            .and_then(|f| f.map(|mut f| f.read_to_end(&mut content)).transpose());
         let result = match read {
+            Ok(None) => None,
             Err(e) => {
                 if !quiet {
                     eprintln!("xgrep: {}: {}", full_path.display(), e);
@@ -1239,6 +1247,43 @@ mod tests {
         let results = search_files(root, &files, "hello", false, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].file.contains("a.rs"));
+    }
+
+    #[test]
+    fn test_search_files_never_reads_outside_the_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(dir.path().join("secret.txt"), "needle outside").unwrap();
+        fs::write(root.join("a.txt"), "needle inside").unwrap();
+        let files = vec![
+            PathBuf::from("a.txt"),
+            PathBuf::from("../secret.txt"),
+            dir.path().join("secret.txt"),
+        ];
+        let results = search_files(&root, &files, "needle", false, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(&*results[0].file, "a.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_search_files_skips_symlinks_and_fifos() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(dir.path().join("secret.txt"), "needle outside").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret.txt"), root.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", root.join("zero.txt")).unwrap();
+        let fifo = std::ffi::CString::new(root.join("fifo.txt").to_str().unwrap()).unwrap();
+        // SAFETY: `fifo` is a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let files: Vec<PathBuf> = ["link.txt", "zero.txt", "fifo.txt"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let results = search_files(&root, &files, "needle", false, true).unwrap();
+        assert!(results.is_empty());
     }
 
     #[test]

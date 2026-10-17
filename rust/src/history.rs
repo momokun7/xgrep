@@ -147,6 +147,7 @@ pub(crate) fn search_diff(
             "--src-prefix=a/",
             "--dst-prefix=b/",
         ])
+        .arg("--end-of-options")
         .args(&revs)
         .arg("--")
         .current_dir(root)
