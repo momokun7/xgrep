@@ -495,7 +495,8 @@ pub fn save_meta(
 /// Detects modified, deleted, and new (including untracked) files using the
 /// same probe as the default search overlay.
 pub fn check_index_status(root: &Path, index_path: &Path) -> Result<IndexStatus> {
-    if !index_path.exists() {
+    // Missing, or in an older format version (rebuilt on next use).
+    if !index_path.exists() || crate::index::reader::needs_rebuild(index_path) {
         return Ok(IndexStatus::NeedsFullBuild);
     }
     let reader = IndexReader::open(index_path)?;

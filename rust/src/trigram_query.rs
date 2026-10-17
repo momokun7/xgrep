@@ -64,31 +64,82 @@ impl TrigramQuery {
         }
     }
 
-    /// Evaluate query against index reader, return candidate file IDs
+    /// Evaluate query against index reader, return candidate file IDs.
+    ///
+    /// The index stores ASCII-case-folded trigrams, so every trigram is
+    /// folded before lookup. A file containing trigram `t` byte-for-byte
+    /// contains `fold(t)` in the index, so folding never loses a match; it
+    /// also collapses case-variant alternatives (`Or(Hel, hel, ...)`) into a
+    /// single lookup.
+    ///
+    /// Planning: within an `And`, the trigram children are deduplicated,
+    /// checked for existence first (a missing one empties the result without
+    /// decoding anything) and intersected in order of posting byte length,
+    /// rarest first; composite children come last. Evaluation stops as soon
+    /// as the intersection is empty.
     pub fn evaluate(&self, reader: &crate::index::reader::IndexReader) -> Vec<u32> {
+        use crate::index::reader::IndexReader;
+        use crate::trigram::fold_trigram;
         match self {
             TrigramQuery::All => (0..reader.file_count()).collect(),
             TrigramQuery::None => vec![],
             TrigramQuery::Trigram(t) => reader.lookup_trigram(*t),
             TrigramQuery::And(qs) => {
-                let mut lists: Vec<Vec<u32>> = Vec::with_capacity(qs.len());
+                let mut seen: Vec<[u8; 3]> = Vec::new();
+                let mut leaves: Vec<&[u8]> = Vec::new();
+                let mut subs: Vec<&TrigramQuery> = Vec::new();
                 for q in qs {
-                    let list = q.evaluate(reader);
-                    if list.is_empty() {
-                        return vec![];
+                    match q {
+                        TrigramQuery::Trigram(t) => {
+                            let f = fold_trigram(*t);
+                            if seen.contains(&f) {
+                                continue;
+                            }
+                            seen.push(f);
+                            match reader.posting_raw(f) {
+                                Some(raw) => leaves.push(raw),
+                                None => return vec![],
+                            }
+                        }
+                        TrigramQuery::None => return vec![],
+                        TrigramQuery::All => {}
+                        other => subs.push(other),
                     }
-                    lists.push(list);
                 }
-                if lists.is_empty() {
-                    return (0..reader.file_count()).collect();
+                leaves.sort_by_key(|raw| raw.len());
+                let mut result: Option<Vec<u32>> = None;
+                let lists = leaves
+                    .into_iter()
+                    .map(IndexReader::decode_posting_list)
+                    .chain(subs.into_iter().map(|q| q.evaluate(reader)));
+                for list in lists {
+                    let next = match result {
+                        None => list,
+                        Some(r) => crate::candidates::intersect_postings(&[&r, &list]),
+                    };
+                    if next.is_empty() {
+                        return next;
+                    }
+                    result = Some(next);
                 }
-                let refs: Vec<&[u32]> = lists.iter().map(|v| v.as_slice()).collect();
-                crate::candidates::intersect_postings(&refs)
+                result.unwrap_or_else(|| (0..reader.file_count()).collect())
             }
             TrigramQuery::Or(qs) => {
+                let mut seen: Vec<[u8; 3]> = Vec::new();
                 let mut combined: Vec<u32> = Vec::new();
                 for q in qs {
-                    combined.extend(q.evaluate(reader));
+                    match q {
+                        TrigramQuery::Trigram(t) => {
+                            let f = fold_trigram(*t);
+                            if !seen.contains(&f) {
+                                seen.push(f);
+                                if let Some(raw) = reader.posting_raw(f) {
+                                    combined.extend(IndexReader::decode_posting_list(raw));
+                                }
+                            }
+                        }
+                        other => combined.extend(other.evaluate(reader)),
+                    }
                 }
                 combined.sort_unstable();
                 combined.dedup();
@@ -577,6 +628,27 @@ mod tests {
         eval_mem(&regex_to_query_with(pattern, ci), &tris)
     }
 
+    /// Like [`eval_mem`] but with the index's folded semantics: the set holds
+    /// the folded trigrams of the content (as the index stores them) and
+    /// every query trigram is folded before the lookup (as `evaluate` does).
+    fn eval_folded(q: &TrigramQuery, tris: &std::collections::HashSet<[u8; 3]>) -> bool {
+        match q {
+            TrigramQuery::All => true,
+            TrigramQuery::None => false,
+            TrigramQuery::Trigram(t) => tris.contains(&crate::trigram::fold_trigram(*t)),
+            TrigramQuery::And(qs) => qs.iter().all(|q| eval_folded(q, tris)),
+            TrigramQuery::Or(qs) => qs.iter().any(|q| eval_folded(q, tris)),
+        }
+    }
+
+    fn candidate_folded(pattern: &str, ci: bool, content: &[u8]) -> bool {
+        let tris = crate::trigram::extract_grams(content)
+            .into_iter()
+            .map(|g| g.tri)
+            .collect();
+        eval_folded(&regex_to_query_with(pattern, ci), &tris)
+    }
+
     fn is_match(pattern: &str, ci: bool, content: &[u8]) -> bool {
         regex::bytes::RegexBuilder::new(pattern)
             .case_insensitive(ci)
@@ -708,6 +780,37 @@ mod tests {
             );
         }
 
+        /// The same invariant under the index's ASCII case folding.
+        #[test]
+        fn prop_no_false_negatives_folded(
+            (re, sample) in regex_strategy(),
+            pre in "[a-cA-C \n]{0,4}",
+            post in "[a-cA-C \n]{0,4}",
+            ci in proptest::bool::ANY,
+        ) {
+            let content = format!("{pre}{sample}{post}");
+            proptest::prop_assume!(is_match(&re, ci, content.as_bytes()));
+            proptest::prop_assert!(
+                candidate_folded(&re, ci, content.as_bytes()),
+                "false negative (folded): regex={:?} ci={} content={:?}", re, ci, content
+            );
+        }
+
+        /// Folded invariant with arbitrary text.
+        #[test]
+        fn prop_no_false_negatives_folded_random_text(
+            (re, _) in regex_strategy(),
+            content in "[abckKsAB\u{212A}é \n-]{0,24}",
+            ci in proptest::bool::ANY,
+        ) {
+            if is_match(&re, ci, content.as_bytes()) {
+                proptest::prop_assert!(
+                    candidate_folded(&re, ci, content.as_bytes()),
+                    "false negative (folded): regex={:?} ci={} content={:?}", re, ci, content
+                );
+            }
+        }
+
         /// Same invariant with arbitrary text instead of constructed samples.
         #[test]
         fn prop_no_false_negatives_random_text(
@@ -748,5 +851,47 @@ mod tests {
         assert!(files_for("Vec<u(8|16)>").contains(&"c.rs".to_string()));
         let hm = files_for("(?i)hashmap");
         assert_eq!(hm, vec!["d.rs".to_string()]);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// End to end through a real (folded) index: `evaluate` must return
+        /// every file whose content matches the regex.
+        #[test]
+        fn prop_index_evaluate_no_false_negatives(
+            regexes in proptest::collection::vec(regex_strategy(), 1..4),
+            contents in proptest::collection::vec("[abckKsAB\u{212A}é \n-]{0,30}", 1..8),
+            ci in proptest::bool::ANY,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            // Also plant each regex's sample so that matches exist.
+            let mut all: Vec<String> = contents.clone();
+            all.extend(regexes.iter().map(|(_, s)| format!("x{s}y")));
+            for (i, c) in all.iter().enumerate() {
+                std::fs::write(root.join(format!("f{i}.txt")), c).unwrap();
+            }
+            let index_path = dir.path().join("index.xgrep");
+            crate::index::builder::build_index(&root, &index_path).unwrap();
+            let reader = crate::index::reader::IndexReader::open(&index_path).unwrap();
+            for (re, _) in &regexes {
+                let got: Vec<String> = regex_to_query_with(re, ci)
+                    .evaluate(&reader)
+                    .into_iter()
+                    .map(|id| reader.file_path(id).to_string())
+                    .collect();
+                for (i, c) in all.iter().enumerate() {
+                    if is_match(re, ci, c.as_bytes()) {
+                        let name = format!("f{i}.txt");
+                        proptest::prop_assert!(
+                            got.contains(&name),
+                            "false negative: regex={:?} ci={} content={:?}", re, ci, c
+                        );
+                    }
+                }
+            }
+        }
     }
 }
