@@ -11,10 +11,14 @@ const SMALL_INPUT: usize = 512;
 const SCAN_THRESHOLD: usize = BITSET_WORDS / 4;
 
 thread_local! {
-    /// Reusable per-thread bitset over the 2^24 trigram space. Always all-zero
-    /// between calls (every set bit is cleared before `extract_trigrams` returns).
-    static SEEN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    /// Reusable per-thread scratch: a bitset over the 2^24 trigram space (always
+    /// all-zero between calls) and a hit list. Reusing them avoids allocator
+    /// churn when many threads extract trigrams concurrently.
+    static SCRATCH: RefCell<(Vec<u64>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
+
+/// Scratch hit lists larger than this are released after use.
+const SCRATCH_KEEP: usize = 64 << 10;
 
 #[inline]
 fn window_u32(data: &[u8], i: usize) -> u32 {
@@ -24,64 +28,73 @@ fn window_u32(data: &[u8], i: usize) -> u32 {
 /// Extract trigrams from a byte sequence (deduplicated and sorted).
 ///
 /// Uses a reusable thread-local 2^24-bit bitset (2 MiB per thread) for
-/// deduplication instead of a hashed set, which is ~5x faster on source code.
+/// deduplication instead of a hashed set, which is several times faster.
 pub fn extract_trigrams(data: &[u8]) -> Vec<[u8; 3]> {
-    extract_trigrams_u32(data).into_iter().map(decode).collect()
+    with_sorted_trigrams(data, |ts| ts.iter().map(|&t| decode(t)).collect())
 }
 
 /// Same as [`extract_trigrams`] but returns trigrams encoded as u32
 /// (see [`encode`]), sorted ascending and deduplicated.
 pub fn extract_trigrams_u32(data: &[u8]) -> Vec<u32> {
+    with_sorted_trigrams(data, |ts| ts.to_vec())
+}
+
+/// Compute the sorted, deduplicated trigrams of `data` (as u32) into
+/// thread-local scratch space and pass them to `f`.
+fn with_sorted_trigrams<R>(data: &[u8], f: impl FnOnce(&[u32]) -> R) -> R {
     if data.len() < 3 {
-        return vec![];
+        return f(&[]);
     }
-    let n = data.len() - 2;
-    if data.len() < SMALL_INPUT {
-        let mut v: Vec<u32> = (0..n).map(|i| window_u32(data, i)).collect();
-        v.sort_unstable();
-        v.dedup();
-        return v;
-    }
-    SEEN.with(|cell| {
-        let mut bits = cell.borrow_mut();
-        if bits.len() != BITSET_WORDS {
-            *bits = vec![0u64; BITSET_WORDS];
-        }
-        let mut found: Vec<u32> = Vec::with_capacity(n.min(4096));
-        let mut t: u32 = (data[0] as u32) << 8 | data[1] as u32;
-        for &b in &data[2..] {
-            t = ((t << 8) | b as u32) & 0x00FF_FFFF;
-            let w = (t >> 6) as usize;
-            let bit = 1u64 << (t & 63);
-            // t < 2^24, so w < 2^18 == bits.len().
-            let word = &mut bits[w];
-            if *word & bit == 0 {
-                *word |= bit;
-                found.push(t);
-            }
-        }
-        if found.len() > SCAN_THRESHOLD {
-            // Dense: walk the bitset in order (already sorted), clearing as we go.
-            found.clear();
-            for (w, word) in bits.iter_mut().enumerate() {
-                let mut x = *word;
-                if x == 0 {
-                    continue;
-                }
-                *word = 0;
-                while x != 0 {
-                    let tz = x.trailing_zeros();
-                    found.push(((w as u32) << 6) | tz);
-                    x &= x - 1;
-                }
-            }
-        } else {
-            for &t in &found {
-                bits[(t >> 6) as usize] = 0;
-            }
+    SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let (bits, found) = &mut *guard;
+        found.clear();
+        let n = data.len() - 2;
+        if data.len() < SMALL_INPUT {
+            found.extend((0..n).map(|i| window_u32(data, i)));
             found.sort_unstable();
+            found.dedup();
+        } else {
+            if bits.len() != BITSET_WORDS {
+                *bits = vec![0u64; BITSET_WORDS];
+            }
+            let mut t: u32 = (data[0] as u32) << 8 | data[1] as u32;
+            for &b in &data[2..] {
+                t = ((t << 8) | b as u32) & 0x00FF_FFFF;
+                // t < 2^24, so the word index < 2^18 == bits.len().
+                let word = &mut bits[(t >> 6) as usize];
+                let bit = 1u64 << (t & 63);
+                if *word & bit == 0 {
+                    *word |= bit;
+                    found.push(t);
+                }
+            }
+            if found.len() > SCAN_THRESHOLD {
+                // Dense: walk the bitset in order (already sorted), clearing as we go.
+                found.clear();
+                for (w, word) in bits.iter_mut().enumerate() {
+                    let mut x = *word;
+                    if x == 0 {
+                        continue;
+                    }
+                    *word = 0;
+                    while x != 0 {
+                        found.push(((w as u32) << 6) | x.trailing_zeros());
+                        x &= x - 1;
+                    }
+                }
+            } else {
+                for &t in found.iter() {
+                    bits[(t >> 6) as usize] = 0;
+                }
+                found.sort_unstable();
+            }
         }
-        found
+        let r = f(found);
+        if found.capacity() > SCRATCH_KEEP {
+            *found = Vec::new();
+        }
+        r
     })
 }
 
