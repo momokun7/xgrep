@@ -93,6 +93,7 @@ impl Xgrep {
         word=false,
         globs=None
     ))]
+    #[allow(clippy::too_many_arguments)] // mirrors the Python keyword-only API
     pub fn search(
         &self,
         pattern: &str,

@@ -3,6 +3,10 @@ name = "xgrep-pyo3"
 version = "0.6.0"
 edition = "2021"
 publish = false
+# PyPI long description. Read via Cargo metadata (`dynamic = ["readme"]` in
+# pyproject.toml) because maturin >= 1.15 rejects `project.readme` paths
+# outside the pyproject directory.
+readme = "../README.md"
 
 [lib]
 name = "_xg"
@@ -19,7 +23,7 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 # Without the tree-sitter `syntax` feature: keeps cross builds C-compiler free.
 xgrep-search = { path = "../rust", default-features = false }
-pyo3 = "0.22"
+pyo3 = "0.29"
 mimalloc = { version = "0.1", default-features = false }
 libc = "0.2"
 
