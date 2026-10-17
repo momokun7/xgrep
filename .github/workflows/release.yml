@@ -126,14 +126,16 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: |
           cd rust/target/${{ matrix.target }}/release
-          tar czf ${{ matrix.artifact }}.tar.gz xg
+          cp ../../../../LICENSE-MIT ../../../../LICENSE-APACHE .
+          tar czf ${{ matrix.artifact }}.tar.gz xg LICENSE-MIT LICENSE-APACHE
           mv ${{ matrix.artifact }}.tar.gz ../../../../
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           cd rust/target/${{ matrix.target }}/release
-          Compress-Archive -Path xg.exe -DestinationPath ${{ matrix.artifact }}.zip
+          Copy-Item ../../../../LICENSE-MIT, ../../../../LICENSE-APACHE .
+          Compress-Archive -Path xg.exe, LICENSE-MIT, LICENSE-APACHE -DestinationPath ${{ matrix.artifact }}.zip
           Move-Item ${{ matrix.artifact }}.zip ../../../../
       - name: Upload to release (unix)
         if: matrix.os != 'windows-latest'
@@ -173,8 +175,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
         id: auth
-      - name: Copy README for crates.io
-        run: cp README.md rust/README.md
+      - name: Copy README and licenses for crates.io
+        run: cp README.md LICENSE-MIT LICENSE-APACHE rust/
       - name: Publish (idempotent)
         working-directory: rust
         env:
@@ -286,6 +288,8 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.create-release.outputs.version }}
         run: npm version "$RELEASE_VERSION" --no-git-tag-version
+      - name: Copy licenses
+        run: cp LICENSE-MIT LICENSE-APACHE npm/
       - name: Install dependencies
         working-directory: npm
         run: npm ci
@@ -375,6 +379,8 @@ jobs:
           if [[ "$TARGET" == *windows* ]]; then exe=xg.exe; fi
           mkdir -p python/wheel-data/scripts
           cp "rust/target/$TARGET/release/$exe" python/wheel-data/scripts/
+          # maturin adds LICENSE* files next to pyproject.toml to dist-info/licenses.
+          cp LICENSE-MIT LICENSE-APACHE python/
       - name: Build wheel
         working-directory: python
         run: maturin build --release --target ${{ matrix.target }} --features extension-module -i python3.11

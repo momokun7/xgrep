@@ -25,4 +25,9 @@ cd ../python
 run cargo fmt -- --check
 run cargo clippy -- -D warnings
 
+# npm bindings (napi-rs): lint only, like the CI npm-bindings job.
+cd ../npm
+run cargo fmt -- --check
+run cargo clippy -- -D warnings
+
 echo "All checks passed."
