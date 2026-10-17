@@ -12,10 +12,6 @@ readme = "../README.md"
 name = "_xg"
 crate-type = ["cdylib"]
 
-[[bin]]
-name = "xg"
-path = "src/main.rs"
-
 [features]
 default = []
 extension-module = ["pyo3/extension-module"]
@@ -24,8 +20,6 @@ extension-module = ["pyo3/extension-module"]
 # Without the tree-sitter `syntax` feature: keeps cross builds C-compiler free.
 xgrep-search = { path = "../rust", default-features = false }
 pyo3 = "0.29"
-mimalloc = { version = "0.1", default-features = false }
-libc = "0.2"
 
 [profile.release]
 lto = true

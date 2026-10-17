@@ -353,11 +353,52 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+      # maturin packages only the pyo3 extension, so the `xg` CLI (same build
+      # as the GitHub release binary) is staged into the wheel's `scripts`
+      # scheme via `[tool.maturin] data = "wheel-data"`; pip puts it on PATH.
+      - name: Build xg CLI
+        working-directory: rust
+        run: cargo build --release --target ${{ matrix.target }} --bin xg
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          # tree-sitter grammars (default `syntax` feature) compile C code.
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      - name: Stage xg CLI for the wheel
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          exe=xg
+          if [[ "$TARGET" == *windows* ]]; then exe=xg.exe; fi
+          mkdir -p python/wheel-data/scripts
+          cp "rust/target/$TARGET/release/$exe" python/wheel-data/scripts/
       - name: Build wheel
         working-directory: python
         run: maturin build --release --target ${{ matrix.target }} --features extension-module -i python3.11
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Verify wheel ships the xg CLI
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          exe=xg
+          if [[ "$TARGET" == *windows* ]]; then exe=xg.exe; fi
+          for whl in python/target/wheels/*.whl; do
+            python -c 'import sys, zipfile; names = zipfile.ZipFile(sys.argv[1]).namelist(); sys.exit(0 if any(n.endswith(".data/scripts/" + sys.argv[2]) for n in names) else f"{sys.argv[1]}: missing .data/scripts/{sys.argv[2]}")' "$whl" "$exe"
+          done
+      # Cross-built wheels (linux aarch64, macOS x86_64 on an arm64 runner)
+      # cannot be installed with the runner's Python, so only smoke-test the
+      # natively built ones.
+      - name: Smoke-test installed xg CLI
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          python -m venv .wheel-venv
+          if [[ -d .wheel-venv/Scripts ]]; then bin=.wheel-venv/Scripts; else bin=.wheel-venv/bin; fi
+          "$bin/python" -m pip install python/target/wheels/*.whl
+          "$bin/xg" --version
+          "$bin/python" -c "import xg; print(xg.Xgrep)"
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

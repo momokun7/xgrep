@@ -1,0 +1,2 @@
+# `xg` CLI staged here before `maturin build` (see pyproject.toml).
+/wheel-data/
