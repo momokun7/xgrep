@@ -262,7 +262,7 @@ jobs:
           maturin build --features extension-module -i python3.11
       - name: Install wheel and run xg
         env:
-          XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
+          XGREP_CACHE_DIR: ${{ runner.temp }}/xgrep-cache
         run: |
           python -m venv "$RUNNER_TEMP/wheel-venv"
           "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install python/target/wheels/*.whl
@@ -318,7 +318,7 @@ jobs:
           maturin build --features extension-module -i python
       - name: Install wheel and run xg
         env:
-          XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
+          XGREP_CACHE_DIR: ${{ runner.temp }}/xgrep-cache
         run: |
           python -m venv .wheel-venv
           bin=".wheel-venv/bin"; [ "$RUNNER_OS" = "Windows" ] && bin=".wheel-venv/Scripts"

@@ -34,8 +34,10 @@ DS_SMALL="$SCRIPT_DIR/../rust/src"
 ZOEKT_IDX_DIR_LARGE="$BENCH_DIR/.zoekt-idx-large"
 ZOEKT_IDX_DIR_MEDIUM="$BENCH_DIR/.zoekt-idx-medium"
 
-# xgrep cache (macOS: ~/Library/Caches, Linux: ~/.cache per XDG)
-if [[ "$(uname)" == "Darwin" ]]; then
+# xgrep cache (XGREP_CACHE_DIR if set; else macOS: ~/Library/Caches, Linux: ~/.cache per XDG)
+if [[ -n "${XGREP_CACHE_DIR:-}" ]]; then
+    XGREP_CACHE="$XGREP_CACHE_DIR"
+elif [[ "$(uname)" == "Darwin" ]]; then
     XGREP_CACHE="${HOME}/Library/Caches/xgrep"
 else
     XGREP_CACHE="${XDG_CACHE_HOME:-${HOME}/.cache}/xgrep"

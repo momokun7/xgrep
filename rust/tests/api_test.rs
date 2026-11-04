@@ -176,5 +176,7 @@ fn test_accessors() {
 
     let xg = Xgrep::open(root).unwrap();
     assert_eq!(xg.root(), root);
-    assert!(xg.index_path().to_string_lossy().contains("xgrep"));
+    // The base depends on XGREP_CACHE_DIR and the OS; only the file
+    // name is fixed.
+    assert!(xg.index_path().ends_with("index"), "{:?}", xg.index_path());
 }

@@ -14,7 +14,7 @@ fn test_oversize_files_in_status_and_zero_result_hint() {
         xg_bin()
             .args(args)
             .current_dir(dir.path())
-            .env("XDG_CACHE_HOME", cache.path())
+            .env("XGREP_CACHE_DIR", cache.path())
             .env("XGREP_MAX_FILESIZE", "100")
             .env_remove("XGREP_NO_HINTS")
             .output()

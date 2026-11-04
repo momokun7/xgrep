@@ -158,7 +158,7 @@ struct Cli {
 enum Commands {
     /// Build search index
     Init {
-        /// Store index in .xgrep/ instead of ~/.cache/xgrep/
+        /// Store index in .xgrep/ instead of the user cache directory (see XGREP_CACHE_DIR)
         #[arg(long)]
         local: bool,
 

@@ -469,6 +469,7 @@ fn overlay_disabled() -> bool {
 /// Metadata is saved even when the corpus fingerprint matched (no rebuild),
 /// so the "verified" timestamp advances and freshness checks stay cheap.
 fn rebuild_index_files(root: &Path, index_path: &Path) -> Result<bool> {
+    ensure_index_dir_writable(index_path)?;
     let started = std::time::SystemTime::now();
     let cache = index::cache::cache_path_for(index_path);
     let rebuilt = index::builder::build_index_with_cache(root, index_path, Some(&cache))?;
@@ -505,7 +506,8 @@ pub struct Xgrep {
 }
 
 impl Xgrep {
-    /// Open a directory. Index path is auto-resolved (`.xgrep/index` or `~/.cache/xgrep/<hash>/index`).
+    /// Open a directory. Index path is auto-resolved (`.xgrep/index`, or `<cache>/<hash>/index` where
+    /// `<cache>` is `$XGREP_CACHE_DIR` or the platform cache dir + `xgrep`).
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = resolve_index_path(&root)?;
@@ -521,13 +523,16 @@ impl Xgrep {
     pub fn open_local(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = root.join(".xgrep").join("index");
-        if let Some(marker) = local_trust_marker(&root) {
-            if !marker.exists() {
-                if let Some(dir) = marker.parent() {
-                    let _ = safefs::create_real_dir(dir);
-                }
-                let _ = safefs::write_atomic(&marker, b"");
-            }
+        // The local index works through this handle either way; a failure
+        // here only means later `open` calls will not trust it, so say so
+        // instead of failing.
+        if let Err(e) = record_local_trust(&root) {
+            eprintln!(
+                "warning: cannot record {} as trusted: {} \
+                 (later searches will not use it; set XGREP_CACHE_DIR to a writable location)",
+                root.join(".xgrep").display(),
+                e
+            );
         }
         Ok(Self::with_paths(root, index_path))
     }
@@ -580,10 +585,6 @@ impl Xgrep {
     /// Returns `true` if the index was (re)built, `false` if the corpus
     /// fingerprint matched and no rebuild was needed.
     pub fn build_index(&self) -> Result<bool> {
-        if let Some(parent) = self.index_path.parent() {
-            safefs::create_real_dir(parent)?;
-        }
-
         // Older format (v2/v3) → current: emit a one-time message so users
         // understand why the first run after upgrade is slower than usual.
         if !self.config.quiet {
@@ -1066,9 +1067,6 @@ impl Xgrep {
         let build_mutex = std::sync::Arc::clone(&self.build_mutex);
         let rebuild: watch::RebuildFn = Box::new(move || {
             let _serial = build_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(parent) = index_path.parent() {
-                safefs::create_real_dir(parent)?;
-            }
             rebuild_index_files(&root, &index_path)
         });
         *guard = Some(watch::WatchHandle::start(
@@ -1546,43 +1544,244 @@ fn current_exe_is_xg() -> bool {
 /// components, and symlinked paths to the same directory share one index.
 ///
 /// `<root>/.xgrep/index` is used only if [`Xgrep::open_local`] created it on
-/// this machine (see [`local_trust_marker`]); otherwise the index lives in
+/// this machine (see [`local_trusted`]); otherwise the index lives in
 /// the user's cache directory.
 fn resolve_index_path(root: &Path) -> Result<PathBuf> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let base = cache_base()?;
+    let cache_dir = base.dir_for(&root);
     let local_dir = root.join(".xgrep");
     let local = local_dir.join("index");
-    let trusted = local_trust_marker(&root).is_some_and(|m| m.exists());
     let real_dir = std::fs::symlink_metadata(&local_dir)
         .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
-    if trusted && real_dir && local.exists() {
+    if real_dir && local.exists() && local_trusted(&cache_dir, base.default_dir_for(&root)) {
         return Ok(local);
     }
-    let cache_dir = index_cache_dir(&root).ok_or_else(|| {
-        XgrepError::IndexError(
-            "cannot determine the user cache directory (set HOME or XDG_CACHE_HOME)".to_string(),
-        )
-    })?;
     Ok(cache_dir.join("index"))
 }
 
-/// Per-root directory in the user's cache directory. There is no fallback
-/// to a shared location such as `/tmp`, where other users could plant files.
-fn index_cache_dir(root: &Path) -> Option<PathBuf> {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let hash = xxhash_rust::xxh64::xxh64(root.to_string_lossy().as_bytes(), 0);
-    Some(
-        dirs_next::cache_dir()?
-            .join("xgrep")
-            .join(format!("{:016x}", hash)),
+/// Whether `<root>/.xgrep/` was created by this user with
+/// [`Xgrep::open_local`]: its trust marker is in the per-root cache
+/// directory, or, when `XGREP_CACHE_DIR` moved the cache, in the default one
+/// (so a local index set up before still counts; that directory is the
+/// user's own, so a marker there is as trustworthy).
+fn local_trusted(cache_dir: &Path, default_cache_dir: Option<PathBuf>) -> bool {
+    cache_dir.join(LOCAL_TRUST_MARKER).exists()
+        || default_cache_dir.is_some_and(|d| d.join(LOCAL_TRUST_MARKER).exists())
+}
+
+/// Base directory for per-root index directories.
+struct CacheBase {
+    dir: PathBuf,
+    /// Set by `XGREP_CACHE_DIR` (checked and created as a private directory).
+    from_env: bool,
+}
+
+impl CacheBase {
+    /// Per-root directory: `<base>/<hash of the canonical root>`.
+    fn dir_for(&self, root: &Path) -> PathBuf {
+        self.dir.join(root_hash(root))
+    }
+
+    /// The per-root directory in the platform cache, when `XGREP_CACHE_DIR`
+    /// replaced it (for [`local_trusted`]).
+    fn default_dir_for(&self, root: &Path) -> Option<PathBuf> {
+        if !self.from_env {
+            return None;
+        }
+        Some(platform_cache_dir()?.join("xgrep").join(root_hash(root)))
+    }
+
+    /// Create `dir` (a path under this base). An `XGREP_CACHE_DIR` base is
+    /// created with mode 0700 if missing and checked again afterwards, so a
+    /// directory another user slipped in before it was created is refused.
+    fn create(&self, dir: &Path) -> Result<()> {
+        if self.from_env && dir.starts_with(&self.dir) {
+            create_private_dir(&self.dir).map_err(|e| index_write_error(&self.dir, true, e))?;
+            check_private_dir(&self.dir)?;
+        }
+        safefs::create_real_dir(dir).map_err(|e| index_write_error(dir, self.from_env, e))
+    }
+}
+
+/// `$XGREP_CACHE_DIR` if set (used as is: `<XGREP_CACHE_DIR>/<hash>/index`),
+/// otherwise the platform cache directory + `xgrep` (`~/.cache/xgrep` or
+/// `$XDG_CACHE_HOME/xgrep` on Linux, `~/Library/Caches/xgrep` on macOS).
+///
+/// There is no fallback to a shared location such as `/tmp`, where other
+/// users could plant files.
+fn cache_base() -> Result<CacheBase> {
+    cache_base_from(std::env::var_os("XGREP_CACHE_DIR"), platform_cache_dir)
+}
+
+fn cache_base_from(
+    xgrep_cache_dir: Option<std::ffi::OsString>,
+    platform_cache_dir: impl FnOnce() -> Option<PathBuf>,
+) -> Result<CacheBase> {
+    if let Some(dir) = xgrep_cache_dir.filter(|d| !d.is_empty()) {
+        let dir = PathBuf::from(dir);
+        // A relative path would depend on the current directory and could
+        // put the index inside the tree being searched.
+        if !dir.is_absolute() {
+            return Err(XgrepError::IndexError(format!(
+                "XGREP_CACHE_DIR must be an absolute path (got {})",
+                dir.display()
+            )));
+        }
+        check_private_dir(&dir)?;
+        return Ok(CacheBase {
+            dir,
+            from_env: true,
+        });
+    }
+    platform_cache_dir()
+        .map(|d| CacheBase {
+            dir: d.join("xgrep"),
+            from_env: false,
+        })
+        .ok_or_else(|| {
+            XgrepError::IndexError(
+                "cannot determine the user cache directory (set XGREP_CACHE_DIR or HOME)"
+                    .to_string(),
+            )
+        })
+}
+
+#[cfg(not(test))]
+fn platform_cache_dir() -> Option<PathBuf> {
+    dirs_next::cache_dir()
+}
+
+/// Unit tests never touch the user's real cache (it may also be unwritable,
+/// e.g. in a sandbox).
+#[cfg(test)]
+fn platform_cache_dir() -> Option<PathBuf> {
+    Some(std::env::temp_dir().join("xgrep-unit-test-cache"))
+}
+
+fn root_hash(root: &Path) -> String {
+    format!(
+        "{:016x}",
+        xxhash_rust::xxh64::xxh64(root.to_string_lossy().as_bytes(), 0)
     )
 }
 
-/// File whose presence records that this user created `<root>/.xgrep/` with
-/// [`Xgrep::open_local`]. It lives in the user's cache directory, which the
-/// searched tree cannot write to.
-fn local_trust_marker(root: &Path) -> Option<PathBuf> {
-    Some(index_cache_dir(root)?.join("local-index"))
+/// The trust marker and indexes under `XGREP_CACHE_DIR` must not be
+/// writable by other users, so an existing directory there must be owned by
+/// this user and not group- or world-writable (on macOS every user shares
+/// the `staff` group). A missing directory is fine: [`CacheBase::create`]
+/// makes it with mode 0700.
+#[cfg(unix)]
+fn check_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return Ok(());
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !meta.is_dir() || meta.uid() != euid || meta.mode() & 0o022 != 0 {
+        return Err(XgrepError::IndexError(format!(
+            "XGREP_CACHE_DIR {} must be a directory owned by you and not writable by group or others \
+             (e.g. chmod 700)",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Create `dir` with mode 0700 (its missing parents get the usual mode).
+/// An existing directory is left as is, for [`check_private_dir`] to judge.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    match builder.create(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        r => r,
+    }
+}
+
+/// Per-root directory under [`cache_base`] (tests clean it up).
+#[cfg(test)]
+fn index_cache_dir(root: &Path) -> Result<PathBuf> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    Ok(cache_base()?.dir_for(&root))
+}
+
+const LOCAL_TRUST_MARKER: &str = "local-index";
+
+/// Record that this user created `<root>/.xgrep/` (see [`local_trusted`]).
+/// The marker lives in the cache directory, which the searched tree cannot
+/// write to (an `XGREP_CACHE_DIR` must be private; see [`check_private_dir`]).
+fn record_local_trust(root: &Path) -> Result<()> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let base = cache_base()?;
+    let dir = base.dir_for(&root);
+    let marker = dir.join(LOCAL_TRUST_MARKER);
+    if marker.exists() {
+        return Ok(());
+    }
+    base.create(&dir)?;
+    safefs::write_atomic(&marker, b"").map_err(|e| index_write_error(&dir, base.from_env, e))
+}
+
+/// Create the index directory and check that files can be created in it,
+/// so an unwritable location (e.g. a sandbox that blocks the user cache) is
+/// reported with its path instead of a bare OS error from deep in the build.
+fn ensure_index_dir_writable(index_path: &Path) -> Result<()> {
+    let Some(dir) = index_path.parent() else {
+        return Ok(());
+    };
+    let from_env = match cache_base() {
+        Ok(base) if dir.starts_with(&base.dir) => {
+            base.create(dir)?;
+            base.from_env
+        }
+        // A local `.xgrep/` index (or the environment changed since `open`).
+        _ => {
+            safefs::create_real_dir(dir).map_err(|e| index_write_error(dir, false, e))?;
+            false
+        }
+    };
+    safefs::temp_file_in(dir)
+        .map(drop)
+        .map_err(|e| index_write_error(dir, from_env, e))
+}
+
+/// Turn "permission denied" / "read-only file system" while writing under
+/// `dir` into an error that names the location and how to change it.
+fn index_write_error(dir: &Path, from_env: bool, err: std::io::Error) -> XgrepError {
+    if !matches!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    ) {
+        return err.into();
+    }
+    // XGREP_CACHE_DIR does not move a local `.xgrep/` index.
+    let hint = if dir.file_name() == Some(std::ffi::OsStr::new(".xgrep")) {
+        ""
+    } else if from_env {
+        " (check XGREP_CACHE_DIR)"
+    } else {
+        " (set XGREP_CACHE_DIR to use another location)"
+    };
+    XgrepError::IndexError(format!(
+        "cannot write index at {}: {}{}",
+        dir.display(),
+        err,
+        hint
+    ))
 }
 
 #[cfg(test)]
@@ -1622,13 +1821,111 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_base_prefers_xgrep_cache_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let platform = || Some(PathBuf::from("/platform"));
+        let base = cache_base_from(Some(dir.path().into()), platform).unwrap();
+        assert_eq!(base.dir, dir.path());
+        assert!(base.from_env);
+        // Not created yet: fine, it is created on first use.
+        let missing = dir.path().join("new");
+        assert_eq!(
+            cache_base_from(Some(missing.clone().into()), platform)
+                .unwrap()
+                .dir,
+            missing
+        );
+        // Unset or empty: the platform cache directory + `xgrep`.
+        for env in [None, Some("".into())] {
+            let base = cache_base_from(env, platform).unwrap();
+            assert_eq!(base.dir, PathBuf::from("/platform/xgrep"));
+            assert!(!base.from_env);
+        }
+        // No silent fallback when nothing is known.
+        assert!(cache_base_from(None, || None).is_err());
+    }
+
+    #[test]
+    fn test_cache_base_rejects_relative_xgrep_cache_dir() {
+        let err = cache_base_from(Some("xgcache".into()), || None)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("absolute"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cache_base_rejects_dir_writable_by_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o777, 0o775, 0o757] {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = cache_base_from(Some(dir.path().into()), || None)
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("not writable by group"), "{err}");
+        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(cache_base_from(Some(dir.path().into()), || None).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cache_base_creates_xgrep_cache_dir_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = dir.path().join("a/xgcache");
+        let base = cache_base_from(Some(base_dir.clone().into()), || None).unwrap();
+        let sub = base.dir_for(Path::new("/some/root"));
+        base.create(&sub).unwrap();
+        assert!(sub.is_dir());
+        let mode = std::fs::metadata(&base_dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        // ...and it passes the check on the next run.
+        assert!(cache_base_from(Some(base_dir.into()), || None).is_ok());
+    }
+
+    #[test]
+    fn test_local_trusted_also_reads_default_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let default = tempfile::tempdir().unwrap();
+        assert!(!local_trusted(cache.path(), Some(default.path().into())));
+        std::fs::write(default.path().join(LOCAL_TRUST_MARKER), "").unwrap();
+        assert!(local_trusted(cache.path(), Some(default.path().into())));
+        assert!(!local_trusted(cache.path(), None));
+        std::fs::write(cache.path().join(LOCAL_TRUST_MARKER), "").unwrap();
+        assert!(local_trusted(cache.path(), None));
+    }
+
+    #[test]
+    fn test_index_write_error_names_path_and_hint() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = index_write_error(Path::new("/c/abcd"), false, denied()).to_string();
+        assert!(msg.contains("cannot write index at /c/abcd"), "{msg}");
+        assert!(msg.contains("set XGREP_CACHE_DIR"), "{msg}");
+        let msg = index_write_error(Path::new("/c/abcd"), true, denied()).to_string();
+        assert!(msg.contains("check XGREP_CACHE_DIR"), "{msg}");
+        // XGREP_CACHE_DIR cannot help a local .xgrep/ index.
+        let msg = index_write_error(Path::new("/repo/.xgrep"), false, denied()).to_string();
+        assert!(msg.contains("/repo/.xgrep"), "{msg}");
+        assert!(!msg.contains("XGREP_CACHE_DIR"), "{msg}");
+        // Other errors pass through unchanged.
+        let other = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!index_write_error(Path::new("/x"), false, other)
+            .to_string()
+            .contains("cannot write index"));
+    }
+
+    #[test]
     fn test_resolve_index_path_falls_back_to_cache() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // No .xgrep/index exists
 
         let path = resolve_index_path(root).unwrap();
-        assert!(path.to_string_lossy().contains("xgrep"));
+        // Compare with the resolved base so the test holds whatever
+        // XGREP_CACHE_DIR the runner sets.
+        assert!(path.starts_with(cache_base().unwrap().dir), "{path:?}");
         assert!(path.ends_with("index"));
     }
 

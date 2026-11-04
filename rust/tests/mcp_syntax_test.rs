@@ -14,7 +14,7 @@ fn send(root: &std::path::Path, messages: &[String]) -> Vec<serde_json::Value> {
     let cache = root.join(".test-cache");
     let mut child = Command::new(binary)
         .args(["serve", "--root", &root.to_string_lossy()])
-        .env("XDG_CACHE_HOME", &cache)
+        .env("XGREP_CACHE_DIR", &cache)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -471,7 +471,7 @@ fn cli_outline_and_expand_block() {
     let out = Command::new(bin)
         .args(["check_password", "--expand", "block"])
         .current_dir(dir.path())
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
+        .env("XGREP_CACHE_DIR", dir.path().join(".test-cache"))
         .output()
         .unwrap();
     assert!(
@@ -504,8 +504,8 @@ fn tags_cache_is_written_next_to_index() {
         ],
     );
     assert!(!out[0].1);
-    // The index location is platform-specific (XDG_CACHE_HOME is ignored on
-    // macOS), so ask the server where it is.
+    // Ask the server where the index is rather than rebuilding the cache
+    // layout here.
     let status: serde_json::Value = serde_json::from_str(&out[1].0).unwrap();
     let index = std::path::PathBuf::from(status["index_path"].as_str().unwrap());
     let dir_of_index = index.parent().unwrap();

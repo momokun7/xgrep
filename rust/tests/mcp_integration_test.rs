@@ -19,7 +19,7 @@ fn send_mcp_messages_full(root: &std::path::Path, messages: &[&str]) -> McpOutpu
     let cache = root.join(".test-cache");
     let mut child = Command::new(binary)
         .args(["serve", "--root", &root.to_string_lossy()])
-        .env("XDG_CACHE_HOME", &cache)
+        .env("XGREP_CACHE_DIR", &cache)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
