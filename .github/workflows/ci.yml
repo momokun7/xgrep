@@ -216,7 +216,9 @@ jobs:
 
   python-bindings:
     name: Python bindings
-    runs-on: ubuntu-latest
+    # Pinned: actions/setup-python has no Python 3.8 (the abi3 floor checked
+    # below) for Ubuntu 26.04, which ubuntu-latest now points to.
+    runs-on: ubuntu-24.04
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
@@ -262,7 +264,7 @@ jobs:
           maturin build --features extension-module -i python3.11
       - name: Install wheel and run xg
         env:
-          XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
+          XGREP_CACHE_DIR: ${{ runner.temp }}/xgrep-cache
         run: |
           python -m venv "$RUNNER_TEMP/wheel-venv"
           "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install python/target/wheels/*.whl
@@ -318,7 +320,7 @@ jobs:
           maturin build --features extension-module -i python
       - name: Install wheel and run xg
         env:
-          XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
+          XGREP_CACHE_DIR: ${{ runner.temp }}/xgrep-cache
         run: |
           python -m venv .wheel-venv
           bin=".wheel-venv/bin"; [ "$RUNNER_OS" = "Windows" ] && bin=".wheel-venv/Scripts"

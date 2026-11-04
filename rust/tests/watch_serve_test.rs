@@ -18,7 +18,7 @@ impl Serve {
     fn start(root: &std::path::Path, cache: &std::path::Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_xg"))
             .args(["serve", "--root", &root.to_string_lossy()])
-            .env("XDG_CACHE_HOME", cache)
+            .env("XGREP_CACHE_DIR", cache)
             .env_remove("XGREP_NO_WATCH")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

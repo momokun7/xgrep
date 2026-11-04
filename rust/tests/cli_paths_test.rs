@@ -7,7 +7,7 @@ use std::process::Command;
 fn xg_bin(cache: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xg"));
     // Never touch the user's real index cache.
-    cmd.env("XDG_CACHE_HOME", cache).env("XGREP_NO_HINTS", "1");
+    cmd.env("XGREP_CACHE_DIR", cache).env("XGREP_NO_HINTS", "1");
     cmd
 }
 

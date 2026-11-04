@@ -18,7 +18,7 @@ if [ "$XC" = "$RC" ]; then echo "OK"; else echo "MISMATCH"; fi
 echo ""
 
 echo "=== Index Build ==="
-rm -rf ~/.cache/xgrep
+rm -rf "${XGREP_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/xgrep}"
 /usr/bin/time -v xg init 2>&1 | grep -E "(Index built|Maximum resident|wall clock)"
 echo ""
 

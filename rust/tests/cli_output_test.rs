@@ -6,7 +6,7 @@ fn xg(dir: &Path, cache: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_xg"))
         .args(args)
         .current_dir(dir)
-        .env("XDG_CACHE_HOME", cache)
+        .env("XGREP_CACHE_DIR", cache)
         .env("XGREP_NO_HINTS", "1")
         .output()
         .expect("failed to run xg")
