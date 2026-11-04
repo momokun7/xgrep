@@ -273,6 +273,15 @@ jobs:
           xg --version
           xg -c "fn run_cli" rust/src
           python -c "import xg; print(xg.Xgrep, xg.SearchResult, xg.IndexStatus)"
+      - name: Run Python tests
+        env:
+          XGREP_CACHE_DIR: ${{ runner.temp }}/xgrep-cache
+        # Run from outside python/ so the installed wheel is imported, not
+        # the python/xg/ source directory (which has no compiled module).
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install --require-hashes -r "$GITHUB_WORKSPACE/python/requirements-test.txt"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pytest -p no:cacheprovider "$GITHUB_WORKSPACE/python/tests"
       - name: Install the abi3 wheel on other Python versions
         run: |
           for v in 3.8 3.13; do
