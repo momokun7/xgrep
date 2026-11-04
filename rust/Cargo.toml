@@ -38,7 +38,7 @@ notify = "8"
 # Syntax-aware features (outline, tags-based definitions, block expansion,
 # references, repo map). Optional so `--no-default-features` builds stay
 # C-compiler free and small.
-tree-sitter = { version = "0.25", optional = true }
+tree-sitter = { version = "0.26", optional = true }
 streaming-iterator = { version = "0.1", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-python = { version = "0.25", optional = true }
