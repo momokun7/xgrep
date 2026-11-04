@@ -483,6 +483,13 @@ fn run() -> Result<()> {
                     || std::env::var("XGREP_ABSOLUTE_PATHS")
                         .map(|v| v == "1" || v == "true")
                         .unwrap_or(false));
+            // How each PATH prefixes its results (see `shown_path`); one
+            // empty entry when no PATH is given.
+            let shown: Vec<PathBuf> = if cli.paths.is_empty() {
+                vec![PathBuf::new()]
+            } else {
+                cli.paths.iter().map(|p| shown_path(p)).collect()
+            };
 
             // Regex hint detection (only in literal mode, not --find, not suppressed)
             let show_hints = !cli.regex
@@ -528,6 +535,12 @@ fn run() -> Result<()> {
                 } else {
                     xg.find_files(&pattern)?
                 };
+                // Filters below see the printed paths.
+                if !use_absolute {
+                    for f in &mut files {
+                        *f = shown_join(&shown[0], f);
+                    }
+                }
 
                 // Apply -t file type filter
                 if let Some(ref ft) = cli.file_type {
@@ -656,6 +669,12 @@ fn run() -> Result<()> {
                 let mut out = std::io::BufWriter::new(stdout.lock());
                 if let Some(range) = cli.in_diff.as_deref() {
                     let mut diffs = xg.search_diff(range, &pattern, &opts)?;
+                    // --exclude sees the printed paths.
+                    if !use_absolute {
+                        for d in &mut diffs {
+                            d.file = shown_join(&shown[0], &d.file).into();
+                        }
+                    }
                     diffs.retain(|d| !excluded(&d.file));
                     if let Some(max) = cli.max_count {
                         diffs.truncate(max);
@@ -714,6 +733,13 @@ fn run() -> Result<()> {
             } else {
                 cli.paths.iter().map(|p| Some(p.as_path())).collect()
             };
+            // Paths are shown ripgrep style: each PATH as written, joined
+            // with the file's path inside it. With --absolute-paths (and for
+            // stdin) they are joined with the common base below instead, as
+            // they are for a non-UTF-8 PATH: results are read back through
+            // the shown path, which must not be lossy.
+            let rg_style =
+                !stdin_mode && !use_absolute && shown.iter().all(|p| p.to_str().is_some());
             let resolved = targets
                 .into_iter()
                 .map(resolve_path)
@@ -733,6 +759,14 @@ fn run() -> Result<()> {
                 common_base(&dirs)
             };
             let multi = resolved.len() > 1;
+            // Root the emitters read files from: shown paths are relative to
+            // the current directory (or absolute, as the user wrote them).
+            let cwd = if rg_style {
+                env::current_dir()?
+            } else {
+                PathBuf::new()
+            };
+            let emit_base: &Path = if rg_style { &cwd } else { &base };
             let stdin_text = stdin_content
                 .as_deref()
                 .map(|b| String::from_utf8_lossy(b).into_owned());
@@ -762,15 +796,15 @@ fn run() -> Result<()> {
             } else if cli.files_only {
                 Emitter::Files
             } else if cli.json_output {
-                Emitter::Json(output::JsonLinesWriter::new(&base, use_absolute))
+                Emitter::Json(output::JsonLinesWriter::new(emit_base, use_absolute))
             } else if cli.format == "llm" {
-                let w = output::LlmWriter::new(&base, &llm_opts);
+                let w = output::LlmWriter::new(emit_base, &llm_opts);
                 Emitter::Llm(match stdin_text.clone() {
                     Some(t) => w.with_text(t),
                     None => w,
                 })
             } else if has_context {
-                let w = output::ContextWriter::new(&base, &ctx_opts);
+                let w = output::ContextWriter::new(emit_base, &ctx_opts);
                 Emitter::Context(match stdin_text.clone() {
                     Some(t) => w.with_text(t),
                     None => w,
@@ -803,14 +837,22 @@ fn run() -> Result<()> {
                     emitter.write(&mut out, &fm, &base, false)?;
                 }
             }
-            for (target, dir) in resolved.iter().zip(&dirs) {
+            for ((target, dir), shown) in resolved.iter().zip(&dirs).zip(&shown) {
                 if remaining == 0 {
                     break;
                 }
                 let prefix = dir.strip_prefix(&base).unwrap_or(Path::new(""));
-                // Results stream out file by file; --exclude, multi-PATH
-                // de-duplication and --max-count are applied here.
+                // Results stream out file by file; --exclude (on the printed
+                // path), multi-PATH de-duplication (on the path relative to
+                // `base`) and --max-count are applied here.
                 let mut sink = |mut fm: FileMatches| -> bool {
+                    let display: Option<Arc<str>> = rg_style.then(|| match target {
+                        ResolvedPath::File { .. } => shown.to_string_lossy().into(),
+                        ResolvedPath::Dir(_) if shown.as_os_str().is_empty() => {
+                            Arc::clone(&fm.file)
+                        }
+                        ResolvedPath::Dir(_) => shown_join(shown, &fm.file).into(),
+                    });
                     if !prefix.as_os_str().is_empty() {
                         let file: Arc<str> = prefix.join(&*fm.file).to_string_lossy().into();
                         for l in &mut fm.lines {
@@ -818,7 +860,9 @@ fn run() -> Result<()> {
                         }
                         fm.file = file;
                     }
-                    if excluded(&fm.file) || (multi && !seen.insert(Arc::clone(&fm.file))) {
+                    if excluded(display.as_deref().unwrap_or(&fm.file))
+                        || (multi && !seen.insert(Arc::clone(&fm.file)))
+                    {
                         return true;
                     }
                     fm.lines.truncate(remaining);
@@ -829,7 +873,13 @@ fn run() -> Result<()> {
                         collected.extend(fm.lines);
                         return remaining > 0;
                     }
-                    if let Err(e) = emitter.write(&mut out, &fm, &base, use_absolute) {
+                    if let Some(d) = display.filter(|d| !Arc::ptr_eq(d, &fm.file)) {
+                        for l in &mut fm.lines {
+                            l.file = Arc::clone(&d);
+                        }
+                        fm.file = d;
+                    }
+                    if let Err(e) = emitter.write(&mut out, &fm, emit_base, use_absolute) {
                         io_err = Some(e);
                         return false;
                     }
@@ -881,10 +931,20 @@ fn run() -> Result<()> {
             }
             if expand_block {
                 let xg = Xgrep::open(&base)?;
-                let (blocks, _) = crate::syntax::tools::expand_blocks(&xg, &collected);
+                let (mut blocks, _) = crate::syntax::tools::expand_blocks(&xg, &collected);
+                // Blocks hold paths inside the single PATH (tags are looked
+                // up under `base`); show them like the other output.
+                if rg_style {
+                    for b in &mut blocks {
+                        b.file = match &resolved[0] {
+                            ResolvedPath::File { .. } => shown[0].to_string_lossy().into(),
+                            ResolvedPath::Dir(_) => shown_join(&shown[0], &b.file).into(),
+                        };
+                    }
+                }
                 let dups = std::collections::HashMap::new();
                 let cfg = crate::mcp_render::RenderCfg {
-                    root: &base,
+                    root: emit_base,
                     before: 0,
                     after: 0,
                     max_results: usize::MAX,
@@ -942,6 +1002,33 @@ fn make_display_path(root: &Path, rel: &str, absolute: bool) -> String {
     } else {
         rel.to_string()
     }
+}
+
+/// How a PATH argument prefixes its results, as ripgrep prints them: as
+/// written, minus leading `./` (so `.` and no PATH both print paths like
+/// `src/main.rs`). Separators are kept as typed.
+fn shown_path(arg: &Path) -> PathBuf {
+    let Some(mut s) = arg.to_str() else {
+        return arg.to_path_buf();
+    };
+    let is_sep = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    loop {
+        if s == "." {
+            s = "";
+        }
+        let mut chars = s.chars();
+        if chars.next() == Some('.') && chars.next().is_some_and(is_sep) {
+            s = s[2..].trim_start_matches(is_sep);
+        } else {
+            break;
+        }
+    }
+    PathBuf::from(s)
+}
+
+/// `shown` joined with `rel`, a path inside it.
+fn shown_join(shown: &Path, rel: &str) -> String {
+    shown.join(rel).to_string_lossy().into_owned()
 }
 
 /// Deepest common ancestor of `dirs` (the directory itself for one PATH).
@@ -1012,6 +1099,26 @@ mod tests {
             line: String::new(),
             column: 0,
         }
+    }
+
+    #[test]
+    fn shown_path_drops_only_a_leading_dot_slash() {
+        let shown = |p: &str| shown_path(Path::new(p)).to_string_lossy().into_owned();
+        assert_eq!(shown("."), "");
+        assert_eq!(shown("./"), "");
+        assert_eq!(shown("./a"), "a");
+        assert_eq!(shown(".//a"), "a");
+        assert_eq!(shown("././a/./b"), "a/./b");
+        assert_eq!(shown("a//b/"), "a//b/");
+        assert_eq!(shown(".."), "..");
+        assert_eq!(shown("./../a"), "../a");
+        assert_eq!(shown(".hidden"), ".hidden");
+        assert_eq!(shown("/abs/a"), "/abs/a");
+        assert_eq!(shown_join(Path::new(""), "x.rs"), "x.rs");
+        assert_eq!(
+            shown_join(Path::new("a/"), "x.rs").replace('\\', "/"),
+            "a/x.rs"
+        );
     }
 
     #[test]
