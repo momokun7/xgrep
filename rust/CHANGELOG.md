@@ -5,8 +5,7 @@
 
 ### Features
 
-* add XGREP_CACHE_DIR to choose the index location ([b6b5431](https://github.com/momokun7/xgrep/commit/b6b54319881004a8ff0c7e20dcfc29c51d76d41f))
-* add XGREP_CACHE_DIR to choose the index location ([03fa6a2](https://github.com/momokun7/xgrep/commit/03fa6a27a95fd6c969fd2f3f8c30f44143594328)), refs [#136](https://github.com/momokun7/xgrep/issues/136)
+* add `XGREP_CACHE_DIR` to choose where indexes and the `.xgrep/` trust record are stored, for environments where the user cache directory is not writable (e.g. sandboxes). An unwritable index location is now reported with its path, and `xg init --local` warns when it cannot record the trust marker ([#136](https://github.com/momokun7/xgrep/issues/136)) ([03fa6a2](https://github.com/momokun7/xgrep/commit/03fa6a27a95fd6c969fd2f3f8c30f44143594328))
 
 ## [0.8.2](https://github.com/momokun7/xgrep/compare/v0.8.1...v0.8.2) (2026-10-17)
 
