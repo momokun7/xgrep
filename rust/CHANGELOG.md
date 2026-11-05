@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/momokun7/xgrep/compare/v0.8.3...v0.9.0) (2026-11-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* with a single PATH argument, CLI result paths now start with that PATH (`xg foo src/` prints `src/main.rs` instead of `main.rs`), and `--exclude` matches against these printed paths.
+
+### Features
+
+* print result paths as ripgrep does ([#140](https://github.com/momokun7/xgrep/issues/140)) ([570deee](https://github.com/momokun7/xgrep/commit/570deee686ca106e72f87195b7e8a189882a7233))
+
 ## [0.8.3](https://github.com/momokun7/xgrep/compare/v0.8.2...v0.8.3) (2026-11-04)
 
 
