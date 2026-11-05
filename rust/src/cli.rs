@@ -558,11 +558,7 @@ fn run() -> Result<()> {
 
                 // Apply --exclude filter
                 if !cli.exclude.is_empty() {
-                    files.retain(|f| {
-                        !cli.exclude
-                            .iter()
-                            .any(|ex| !ex.is_empty() && f.contains(ex.as_str()))
-                    });
+                    files.retain(|f| !is_excluded(&cli.exclude, f));
                 }
 
                 if files.is_empty() {
@@ -624,11 +620,7 @@ fn run() -> Result<()> {
                 not_patterns: cli.not_patterns.clone(),
                 ..Default::default()
             };
-            let excluded = |file: &str| {
-                cli.exclude
-                    .iter()
-                    .any(|ex| !ex.is_empty() && file.contains(ex.as_str()))
-            };
+            let excluded = |file: &str| is_excluded(&cli.exclude, file);
             // 0 means "no limit", like ripgrep's --max-columns.
             let max_columns = cli.max_columns.filter(|&n| n > 0);
             let text_opts = |base: usize| output::TextOptions {
@@ -1026,6 +1018,23 @@ fn shown_path(arg: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Whether `path` contains any non-empty `--exclude` pattern. On Windows,
+/// `/` and `\` match each other, so `--exclude src/gen` also matches the
+/// printed `src\gen\x.rs`.
+fn is_excluded(patterns: &[String], path: &str) -> bool {
+    fn norm(s: &str) -> std::borrow::Cow<'_, str> {
+        if cfg!(windows) {
+            s.replace('\\', "/").into()
+        } else {
+            s.into()
+        }
+    }
+    let path = norm(path);
+    patterns
+        .iter()
+        .any(|ex| !ex.is_empty() && path.contains(norm(ex).as_ref()))
+}
+
 /// `shown` joined with `rel`, a path inside it.
 fn shown_join(shown: &Path, rel: &str) -> String {
     shown.join(rel).to_string_lossy().into_owned()
@@ -1099,6 +1108,19 @@ mod tests {
             line: String::new(),
             column: 0,
         }
+    }
+
+    #[test]
+    fn exclude_matches_substrings_of_the_printed_path() {
+        let ex = |pats: &[&str], path: &str| {
+            let pats: Vec<String> = pats.iter().map(|p| p.to_string()).collect();
+            is_excluded(&pats, path)
+        };
+        assert!(ex(&["a/sub"], "a/sub/x.rs"));
+        assert!(!ex(&["a/sub"], "b/x.rs"));
+        assert!(!ex(&[""], "a/x.rs"));
+        assert_eq!(ex(&["a/sub"], "a\\sub\\x.rs"), cfg!(windows));
+        assert_eq!(ex(&["a\\sub"], "a/sub/x.rs"), cfg!(windows));
     }
 
     #[test]
